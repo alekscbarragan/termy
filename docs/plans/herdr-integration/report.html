@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Herdr Integration: local Agent loop, planning report</title>
+<style>
+  :root {
+    --ink: #16191d;
+    --muted: #5c646e;
+    --rule: #d7dbe0;
+    --bg: #ffffff;
+    --panel: #f6f7f9;
+    --accent: #1f4f8f;
+    --stop: #8a2222;
+    --go: #1d6b3a;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0 auto;
+    padding: 1.6rem 1.1rem 4rem;
+    max-width: 62rem;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  h1 { font-size: 1.5rem; line-height: 1.25; margin: 0 0 .3rem; }
+  h2 {
+    font-size: 1.05rem; margin: 2.1rem 0 .6rem; padding-bottom: .25rem;
+    border-bottom: 2px solid var(--rule); letter-spacing: .01em;
+  }
+  h3 { font-size: .95rem; margin: 1.3rem 0 .4rem; }
+  p, li { margin: .45rem 0; }
+  ul, ol { padding-left: 1.15rem; margin: .4rem 0; }
+  a { color: var(--accent); }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .87em; background: var(--panel); padding: .05em .3em; border-radius: 3px;
+  }
+  .sub { color: var(--muted); margin: 0 0 1rem; }
+  .tag {
+    display: inline-block; font-size: .72rem; font-weight: 700; letter-spacing: .06em;
+    text-transform: uppercase; padding: .16rem .45rem; border-radius: 3px;
+    border: 1px solid currentColor; margin-right: .35rem; vertical-align: .08em;
+  }
+  .tag.stop { color: var(--stop); }
+  .tag.go { color: var(--go); }
+  .panel {
+    background: var(--panel); border: 1px solid var(--rule); border-left: 4px solid var(--accent);
+    padding: .7rem .9rem; margin: .9rem 0; border-radius: 3px;
+  }
+  .panel.warn { border-left-color: var(--stop); }
+  .panel > :first-child { margin-top: 0; }
+  .panel > :last-child { margin-bottom: 0; }
+  .grid { display: flex; padding: 0; flex-wrap: wrap; gap: .7rem; margin: .9rem 0; }
+  .grid > div {
+    flex: 1 1 12rem; border: 1px solid var(--rule); border-radius: 3px; padding: .55rem .7rem;
+  }
+  .grid dt { font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .grid dd { margin: .2rem 0 0; font-weight: 600; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: .7rem 0; font-size: .9rem; }
+  caption { text-align: left; color: var(--muted); font-size: .8rem; padding-bottom: .3rem; }
+  th, td { border: 1px solid var(--rule); padding: .35rem .5rem; text-align: left; vertical-align: top; }
+  th { background: var(--panel); font-weight: 600; }
+  td.id, th.id { white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85em; }
+  .clauses { margin: 0; }
+  .clauses dt { font-weight: 600; margin-top: .55rem; }
+  .clauses dd { margin: .1rem 0 0 0; color: var(--ink); }
+  footer { margin-top: 2.5rem; padding-top: .6rem; border-top: 1px solid var(--rule); color: var(--muted); font-size: .85rem; }
+  @media (max-width: 34rem) {
+    body { padding: 1rem .7rem 3rem; }
+    table { font-size: .84rem; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Herdr Integration: local Agent loop</h1>
+  <p class="sub">Planning report for an optional, fork-only Termy capability. Documentation only. No implementation exists.</p>
+</header>
+
+<section id="status">
+  <h2>Status</h2>
+  <p><span class="tag stop">Blocked</span> Planning complete and verified. Implementation cannot start.</p>
+  <dl class="grid">
+    <div><dt>Scope</dt><dd>Locked, version 1, approved</dd></div>
+    <div><dt>Plan</dt><dd>P1&ndash;P13, T1&ndash;T34, reviewed with one post-review S4 correction folded into the existing tasks</dd></div>
+    <div><dt>Review</dt><dd>Approved, independently verified, then corrected for the disabled-selector edge</dd></div>
+    <div><dt>Code written</dt><dd>None</dd></div>
+    <div><dt>Blocker</dt><dd>GM ticket for NF1&ndash;NF3</dd></div>
+  </dl>
+  <div class="panel warn">
+    <p><strong>Gate.</strong> Three new production file groups are required, and this repository does not allow a new production file without a ticket. No ticket exists and no ticket ID is invented here. Only the two phases that touch existing files only (P1 and P5) may start before one is filed, and none of the gated logic may be relocated into existing files to get around the gate.</p>
+  </div>
+</section>
+
+<section id="recommendation">
+  <h2>Recommendation</h2>
+  <p>File the GM ticket covering NF1 to NF3, then execute in the phase order below, stopping at P9. P9 is the first shippable state and it delivers the whole locked behavior for a user whose preference is already saved. P10 through P13 each add exactly one scope clause and can land one at a time.</p>
+  <p>Two things to decide before starting rather than during: confirm the Herdr protocol facts named in gate 2, and grant explicit commit authorization, which the planning run deliberately did not have.</p>
+  <p>The locked scope already decides that the Workspaces / Herdr selector remains visible while the integration is disabled. The repository plan therefore uses a distinct persisted presentation marker for the one-time Herdr-first rule instead of overloading the stored sidebar choice. See <a href="#risks">Risks</a>.</p>
+</section>
+
+<section id="scope">
+  <h2>Locked scope</h2>
+  <p>A user with the integration enabled completes the entire local Agent loop without leaving Termy. Termy finds or starts a trusted local Herdr Service, the sidebar switches to a Herdr view listing local Spaces and Agents with live status, the user creates an Agent, works in its dedicated tab, detaches and reattaches freely, and stops the Agent only through an explicit confirmed action. With the integration disabled, Termy performs no Herdr work at all.</p>
+
+  <div class="panel">
+    <p><strong>Two words that are not interchangeable.</strong> A <em>Termy Workspace</em> is a persisted group of terminal tabs inside Termy. A <em>Herdr Space</em> is a project context managed by Herdr that contains Agents. They are never merged or cross-listed, and the sidebar holds exactly two mutually exclusive views.</p>
+  </div>
+
+  <dl class="clauses">
+    <dt>S1. One setting, detection only on a fresh configuration</dt>
+    <dd>With no saved preference, the integration starts enabled only when a trusted executable is found at an explicit absolute override or a documented install location. An executable reachable only through inherited PATH never triggers this and is never trusted. An explicitly saved preference wins on later launches. While disabled, no detection, no process start, no connection.</dd>
+
+    <dt>S2. Connect first, start only from a trusted absolute location</dt>
+    <dd>Termy connects to a running Service, and starts one only if none is running, only from the bundled location or operator-configured absolute paths. An untrusted path is never launched and the rejected path is shown. First start is silent and disclosed in the Herdr view.</dd>
+
+    <dt>S3. One sidebar, visible selector, two exclusive views</dt>
+    <dd>A visible Workspaces / Herdr selector over one sidebar. The Workspace view is unchanged from upstream.</dd>
+
+    <dt>S4. Herdr first exactly once, then view restore</dt>
+    <dd>After the initial auto-enable the Herdr view is shown first exactly once. Later launches restore the last selected view.</dd>
+
+    <dt>S5. Live local catalog</dt>
+    <dd>Spaces and Agents with status from exactly <code>starting</code>, <code>running</code>, <code>waiting-for-input</code>, <code>succeeded</code>, <code>failed</code>, updating with no manual refresh. Control ownership and connection loss are separate markers, never status values.</dd>
+
+    <dt>S6. Exact program and argument list</dt>
+    <dd>Created from a Space row with an exact program plus argv. No shell-string interpretation exists anywhere. A failed create leaves the form open with the error and adds no row.</dd>
+
+    <dt>S7. One Agent Tab per Agent per window, Native Runtime only</dt>
+    <dd>A second open focuses the existing tab, including one parked in an inactive Workspace. On the tmux runtime, opening an Agent shows a Native Runtime requirement and changes nothing.</dd>
+
+    <dt>S8. Close and quit detach only</dt>
+    <dd>The Agent keeps running. Reopening reattaches to the same session, shows output accumulated while detached, and continues live.</dd>
+
+    <dt>S9. Stopping is a distinct confirmed action</dt>
+    <dd>Only a confirmed Close Agent stops and removes an Agent. Ordinary close never stops. Quitting Termy never stops Agents or the Service, even one Termy started.</dd>
+
+    <dt>S10. Control conflicts are resolved explicitly</dt>
+    <dd>A contested Agent opens no tab and offers no input path until the user picks Take Over, Observe, or Cancel. Observe is read-only. Take Over requires its own confirmation and is fully functional in this slice.</dd>
+
+    <dt>S11. Explanatory failure, empty, and reconnect states</dt>
+    <dd>Unavailable, untrusted, incompatible, lost connection, and empty each get a clear state. A lost connection preserves the visible catalog and open-tab scrollback and recovers automatically.</dd>
+  </dl>
+
+  <h3>Preserved and excluded</h3>
+  <p><strong>Preserved.</strong> Ordinary Termy behavior is identical with the integration disabled and enabled. The change is fork-only and purely additive. The Service and its Agents outlive Termy.</p>
+  <p><strong>Out of scope.</strong> Remote Devices and every remote workflow, resource search in the command palette, attention surfacing and notifications, capability version gating, Space and Device management beyond listing, Agent Tabs on tmux, Agent Tab restart survival, and a working-directory input on create.</p>
+  <p>Full text: <a href="scope.md">scope.md</a>.</p>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <p>Two new homes plus narrow additive seam edits, so the fork stays cheap to merge with upstream.</p>
+  <div class="scroll">
+  <table>
+    <caption>Module ownership. The first three rows are the gated new files.</caption>
+    <thead><tr><th>Module</th><th class="id">Gate</th><th>Owns</th></tr></thead>
+    <tbody>
+      <tr><td><code>crates/herdr_core/</code></td><td class="id">NF1</td><td>Pure domain and protocol core. Branded ids, trust policy, service supervision, transport seam and its in-memory fake, background session thread, catalog mirror, controller facade. Zero GPUI and zero desktop dependencies, following the existing pure SSH core.</td></tr>
+      <tr><td><code>terminal_view/herdr/</code></td><td class="id">NF2</td><td>Desktop glue. Sidebar-view state, per-frame drain, Agent Tab creation and byte feed, detach-on-close hook, Native Runtime gate, window-local dedup, the map from Agent identity to pane.</td></tr>
+      <tr><td><code>tab_strip/render_herdr_sidebar.rs</code></td><td class="id">NF3</td><td>Herdr view rendering, beside the untouched Workspace sidebar renderer.</td></tr>
+      <tr><td><code>config_core</code></td><td class="id">edit</td><td>Four typed root settings, parse only, no filesystem work at parse time.</td></tr>
+      <tr><td><code>terminal_view</code></td><td class="id">edit</td><td>Tab identity and dedup, the optional runtime field, the drain call.</td></tr>
+      <tr><td>Herdr Service</td><td class="id">external</td><td>All Herdr state. Termy holds a derived mirror only.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Load-bearing decisions</h3>
+  <ul>
+    <li><strong>Typed writable attachment.</strong> Only a writable attach resolution yields a binding, and the binding is the only type exposing the transport's input operation. No binding means no input path exists to call.</li>
+    <li><strong>Observe has no input state to suppress.</strong> The Observe attachment type simply lacks the input operation, so read-only is structural rather than policed, and no later code path can restore input without changing the type.</li>
+    <li><strong>Catalog snapshots and events.</strong> The Service owns all state. Termy mirrors a whole snapshot plus a revision, with no delta index, following the existing whole-refresh precedent in the tmux runtime. Rendering is a pure function of the mirror.</li>
+    <li><strong>Per-frame drain.</strong> The view stays synchronous and drains controller events once per frame at the same call site that already drains tmux events. Disabled is absence: the runtime field is <code>None</code> and no Herdr code path exists.</li>
+    <li><strong>Agent Tab terminal.</strong> A third fork-only <code>Terminal</code> variant wrapping the existing PTY-less externally-fed pane terminal. Every exhaustive policy gains an explicit named arm and no catch-all, so the compiler is the sweep detector.</li>
+    <li><strong>Input routing.</strong> Keyboard, paste, and mouse for Agent tabs are patched at the two existing pane input seams rather than at their callers, which covers paste and plugin-directed input for free.</li>
+    <li><strong>Persistence.</strong> Preferences go through the existing atomic setting writer. Agent panes are excluded from the native workspace snapshot, so an Agent Tab never returns after relaunch as an ordinary dead terminal. The workspace store gets no schema change.</li>
+  </ul>
+
+  <h3>Exact existing seams</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>File</th><th>Edit</th></tr></thead>
+    <tbody>
+      <tr><td><code>config_core</code>: types, schema, parser, parser tests</td><td>Four typed root settings</td></tr>
+      <tr><td><code>terminal_view/render.rs</code></td><td>One sidebar-view branch where the Workspace sidebar is already gated</td></tr>
+      <tr><td><code>terminal_view/mod.rs</code></td><td>Optional runtime field, drain call beside the tmux drain, terminal policy arms</td></tr>
+      <tr><td><code>terminal_view/backend.rs</code></td><td>The new enum variant and a named arm in the engine label</td></tr>
+      <tr><td><code>terminal_view/tabs/lifecycle.rs</code></td><td>Agent Tab open and close hooks</td></tr>
+      <tr><td><code>interaction/input.rs</code>, <code>interaction/mouse_reporting.rs</code></td><td>Agent-tab branch writing to the binding instead of the terminal</td></tr>
+      <tr><td><code>terminal_view/persistence.rs</code></td><td>Exclude Agent panes from the native workspace snapshot</td></tr>
+      <tr><td><code>settings_view/sections.rs</code></td><td>Rows for enablement, service path, trusted paths</td></tr>
+      <tr><td><code>desktop_app/Cargo.toml</code></td><td>Path dependency on the new core crate</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Full detail, including invariants and the failure table: <a href="architecture.md">architecture.md</a>.</p>
+</section>
+
+<section id="roadmap">
+  <h2>Phase roadmap</h2>
+  <div class="scroll">
+  <table>
+    <caption>Thirteen phases, thirty-four tasks. Identifiers are stable and are never renumbered.</caption>
+    <thead><tr><th class="id">Phase</th><th class="id">Tasks</th><th>Delivers</th><th>Gated by</th></tr></thead>
+    <tbody>
+      <tr><td class="id">P1</td><td class="id">T1&ndash;T2</td><td>Config parse for four settings</td><td>none</td></tr>
+      <tr><td class="id">P2</td><td class="id">T3&ndash;T5</td><td>Core crate scaffold, domain types, trust gate</td><td>GM ticket (NF1)</td></tr>
+      <tr><td class="id">P3</td><td class="id">T6&ndash;T7</td><td>Transport seam, fake, catalog mirror</td><td>GM ticket (NF1)</td></tr>
+      <tr><td class="id">P4</td><td class="id">T8&ndash;T10</td><td>Controller mutations and attachment lifecycle</td><td>GM ticket (NF1)</td></tr>
+      <tr><td class="id">P5</td><td class="id">T11&ndash;T12</td><td>Agent terminal variant and its rendering proof</td><td>none</td></tr>
+      <tr><td class="id">P6</td><td class="id">T13&ndash;T15</td><td>Runtime field, drain, sidebar selector, Herdr view</td><td>GM ticket (NF2, NF3)</td></tr>
+      <tr><td class="id">P7</td><td class="id">T16&ndash;T18</td><td>Create form, open-or-focus, dedup, tmux gate</td><td>P6</td></tr>
+      <tr><td class="id">P8</td><td class="id">T19&ndash;T20</td><td>Detach on close, quit detach, confirmed Close Agent</td><td>P7</td></tr>
+      <tr><td class="id">P9</td><td class="id">T21&ndash;T23</td><td><strong>Milestone.</strong> Real transport, supervision, gated integration test</td><td>P8, gate 2</td></tr>
+      <tr><td class="id">P10</td><td class="id">T24&ndash;T26</td><td>Enablement detection, Herdr-first-once, view restore</td><td>P9</td></tr>
+      <tr><td class="id">P11</td><td class="id">T27&ndash;T28</td><td>Settings UI rows</td><td>P10</td></tr>
+      <tr><td class="id">P12</td><td class="id">T29&ndash;T30</td><td>Control-conflict flow</td><td>P9</td></tr>
+      <tr><td class="id">P13</td><td class="id">T31&ndash;T34</td><td>Failure, empty, reconnect states; preservation pass</td><td>P12</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>P1 through P8 end in safe stops because the integration is inert while unconfigured. P9 is the first shippable state. Task-by-task text is in <a href="implementation.md">implementation.md</a>.</p>
+  <div class="panel">
+    <p><strong>Honest caveat at the milestone.</strong> At P9 the enabling preference can only be set by editing the config file, because the settings row that writes it lands in P11. The config is a user-editable text file, so this is a slice ordering choice, not a hole. Do not read "first usable milestone" as shippable to a user who has never opened the config file.</p>
+  </div>
+</section>
+
+<section id="gates">
+  <h2>Gates</h2>
+  <ol>
+    <li><strong>GM ticket for NF1 to NF3.</strong> Blocks P2, P3, P4, P6, and everything downstream. P1 and P5 touch existing files only and are the only work available before it exists.</li>
+    <li><strong>Protocol contract confirmation before P9.</strong> Confirm replay-then-live as one ordered stream per attachment, the mutation idempotency key, and the controller identity string used in Take Over text. Divergence changes only the transport and session modules, which is exactly what the seam is for.</li>
+    <li><strong>Single implementation owner.</strong> One owner holds the diff across all phases. Parallel agents take whole phases in isolated worktrees and never share files. Four behavioral suites (the trust matrix, the controller verbs, the probe spy, and the conflict suite) are authored by a separate seat that never edits production code.</li>
+  </ol>
+  <p>The planning run itself made no commits and took no remote action. That constrained the planning run. A future implementation needs its own commit authorization before any per-phase committed checkpoint can be satisfied.</p>
+</section>
+
+<section id="verification">
+  <h2>Verification evidence</h2>
+  <p>The plan was reviewed to approve, then independently re-verified against live repository source by a reader who did not treat the first review as evidence. Result: pass, with six non-blocking observations.</p>
+  <div class="scroll">
+  <table>
+    <caption>Round-one defects and their confirmed dispositions.</caption>
+    <thead><tr><th>Defect</th><th>Disposition</th></tr></thead>
+    <tbody>
+      <tr><td>Terminal enum ownership and exhaustive policies</td><td>Corrected. The tasks now name the file that actually owns the enum, cover every exhaustive policy, and require a compile proof with no catch-all arm. An independent sweep confirmed the two named files are the complete set the compiler must cover.</td></tr>
+      <tr><td>Agent input had no typed binding</td><td>Corrected. The transport gained an input operation, a writable attach yields the only type exposing it, and the two desktop input seams route through it. An independent chokepoint sweep found one further input call site and confirmed it can only ever hold a native terminal.</td></tr>
+      <tr><td>One-time Herdr-first could repeat or be suppressed</td><td>Corrected. Sidebar choice and first-presentation history are separate persisted facts. Initial auto-enable forces Herdr and sets the presentation marker once; selector use while disabled cannot pre-empt it.</td></tr>
+      <tr><td>Exact argv and relaunch were untested at the real boundary</td><td>Corrected. Argv is asserted verbatim at both the fake seam and the real transport, confirmed close and survival use different Agents, and the desktop quit and relaunch boundary has its own task.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h3>Verification levels</h3>
+  <ol>
+    <li><strong>Unit against the fake transport.</strong> Trust rejection matrix, catalog snapshots and revisions, create idempotency, detach versus close verbs, conflict flow, reconnect replay. The fake is the standing double the repository does not otherwise have.</li>
+    <li><strong>Desktop state tests.</strong> Sidebar exclusivity, dedup across active and stashed Workspaces, tmux rejection with zero mutation, quit detaching only, persist-and-restore round trips, and a probe spy proving a disabled startup performs zero probes, launches, and connections.</li>
+    <li><strong>One gated real-service integration test plus manual passes.</strong> It skips when no Herdr binary is present, so it never turns a machine without one red. The manual passes are the end-to-end loop, the Service kill and restart, and the preservation pass on both runtimes with the integration disabled and enabled.</li>
+  </ol>
+</section>
+
+<section id="risks">
+  <h2>Risks</h2>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Risk</th><th>Handling</th></tr></thead>
+    <tbody>
+      <tr><td>Protocol contract facts are unconfirmed</td><td>The transport seam and its fake pin the assumed contract. Divergence changes only the transport and session modules. Confirm before P9.</td></tr>
+      <tr><td>The reused pane terminal carries tmux-specific interception that could misrender Agent output</td><td>Retired in P5 before any UI builds on it. Fallback is a construction flag, which is a seam edit and not a new file.</td></tr>
+      <tr><td>Workspace persistence would restore an Agent pane as an ordinary dead terminal</td><td>One exclusion point covers both the active strip and stashed Workspaces. The round-trip test must assert the restore <em>succeeds</em> with layout trees intact, not merely that no terminal stands in.</td></tr>
+      <tr><td>One-time Herdr-first while the selector is visible but disabled</td><td>Closed in the repository plan. A dedicated persisted presentation marker remains false when the user changes the sidebar while Herdr is disabled, then flips true only when initial auto-enable forces Herdr.</td></tr>
+      <tr><td>Agent identity read as a new struct field would need a file outside its phase's named set</td><td>It belongs in the glue runtime's identity-to-pane map. Both the input seams and persistence can discriminate on the terminal variant directly.</td></tr>
+      <tr><td>Merge drift with upstream</td><td>Seam edits are single additive branches in a small named set of files. Periodic upstream merges re-verify only those seams.</td></tr>
+      <tr><td>Install locations are not yet pinned</td><td>They are data constants owned by the trust module. No structure depends on their values.</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section id="next">
+  <h2>Next action</h2>
+  <p><span class="tag go">Owner</span> A maintainer files the GM ticket covering NF1 to NF3 and confirms the protocol facts in gate 2. Until then this packet stays reference material, and the only runnable work is P1 and P5, which touch existing files only.</p>
+</section>
+
+<footer>
+  <p>Packet: <a href="README.md">README</a> &middot; <a href="scope.md">scope</a> &middot; <a href="architecture.md">architecture</a> &middot; <a href="implementation.md">implementation</a>. Repository line references in the Markdown reflect the tree as read during planning and are starting points, not guarantees. This document contains no implementation.</p>
+</footer>
+
+</body>
+</html>

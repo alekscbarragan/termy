@@ -22,6 +22,14 @@ live under `website/content/`.
 The [engineering index](engineering/README.md) owns the quality roadmap,
 scorecard, testing strategy, and decomposition plans.
 
+## Plans
+
+Scoped, reviewed planning packets for work that has not been implemented yet.
+
+- [Herdr Integration: local Agent loop](plans/herdr-integration/README.md):
+  optional fork-only Herdr Service integration. Planning complete; execution
+  blocked on a GM ticket for its new production files.
+
 ## Reference documents
 
 - [Configuration](configuration.md) — generated; do not edit directly.
