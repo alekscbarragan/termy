@@ -1,6 +1,8 @@
 use crate::{AgentId, AgentKey, AgentPhase, SpaceId};
 
-use crate::transport::{AttachmentOutput, HerdrTransport, TransportError, TransportNotification};
+use crate::transport::{
+    AttachmentOutput, HerdrTransport, TransportAttachResult, TransportNotification,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CatalogRevision(u64);
@@ -30,6 +32,26 @@ pub enum ConnectionState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HerdrEvent {
+    CatalogChanged(CatalogRevision),
+    AttachmentOutput {
+        agent: AgentKey,
+        bytes: Vec<u8>,
+    },
+    ControlChanged {
+        agent: AgentKey,
+        ownership: ControlOwnership,
+    },
+    ConnectionChanged(ConnectionState),
+    CreateResolved {
+        request_id: crate::RequestId,
+        result: Result<AgentKey, crate::CreateAgentFailure>,
+    },
+    AttachmentChanged(crate::RequestId),
+    SessionFailed(SessionError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentCatalogEntry {
     id: AgentId,
     phase: AgentPhase,
@@ -37,6 +59,13 @@ pub struct AgentCatalogEntry {
 }
 
 impl AgentCatalogEntry {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the real transport constructs catalog entries in P9"
+        )
+    )]
     pub(crate) fn new(id: AgentId, phase: AgentPhase, control: ControlOwnership) -> Self {
         Self { id, phase, control }
     }
@@ -61,6 +90,13 @@ pub struct SpaceCatalogEntry {
 }
 
 impl SpaceCatalogEntry {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the real transport constructs catalog entries in P9"
+        )
+    )]
     pub(crate) fn new(id: SpaceId, agents: Vec<AgentCatalogEntry>) -> Self {
         Self { id, agents }
     }
@@ -80,12 +116,29 @@ pub struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the real transport constructs catalog snapshots in P9"
+        )
+    )]
     pub(crate) fn new(spaces: Vec<SpaceCatalogEntry>) -> Self {
         Self { spaces }
     }
 
     pub fn spaces(&self) -> &[SpaceCatalogEntry] {
         &self.spaces
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_agent(&mut self, key: &AgentKey) -> bool {
+        let Some(space) = self.spaces.iter_mut().find(|space| space.id == key.space) else {
+            return false;
+        };
+        let original_len = space.agents.len();
+        space.agents.retain(|agent| agent.id != key.agent);
+        space.agents.len() != original_len
     }
 }
 
@@ -112,14 +165,23 @@ impl CatalogMirror {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionError {
-    Transport(TransportError),
+    TransportUnavailable,
     RevisionExhausted,
 }
 
-impl From<TransportError> for SessionError {
-    fn from(error: TransportError) -> Self {
-        Self::Transport(error)
-    }
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum SessionUpdate {
+    Event(HerdrEvent),
+    AttachmentOutput(AttachmentOutput),
+    AttachResolved {
+        request_id: crate::RequestId,
+        result: TransportAttachResult,
+    },
+}
+
+pub(crate) struct SessionDrain {
+    pub updates: Vec<SessionUpdate>,
+    pub error: Option<SessionError>,
 }
 
 #[derive(Default)]
@@ -132,38 +194,70 @@ impl SessionState {
         &self.mirror
     }
 
-    pub fn drain(
-        &mut self,
-        transport: &mut dyn HerdrTransport,
-    ) -> Result<Vec<AttachmentOutput>, SessionError> {
-        let mut output = Vec::new();
-        while let Some(notification) = transport.try_recv()? {
-            if let Some(chunk) = self.apply(notification)? {
-                output.push(chunk);
+    pub fn drain(&mut self, transport: &mut dyn HerdrTransport) -> SessionDrain {
+        let mut updates = Vec::new();
+        loop {
+            let notification = match transport.try_recv() {
+                Ok(Some(notification)) => notification,
+                Ok(None) => break,
+                Err(_) => {
+                    return SessionDrain {
+                        updates,
+                        error: Some(SessionError::TransportUnavailable),
+                    };
+                }
+            };
+            match self.apply(notification) {
+                Ok(update) => updates.push(update),
+                Err(error) => {
+                    return SessionDrain {
+                        updates,
+                        error: Some(error),
+                    };
+                }
             }
         }
-        Ok(output)
+        SessionDrain {
+            updates,
+            error: None,
+        }
     }
 
     fn apply(
         &mut self,
         notification: TransportNotification,
-    ) -> Result<Option<AttachmentOutput>, SessionError> {
+    ) -> Result<SessionUpdate, SessionError> {
         match notification {
             TransportNotification::CatalogSnapshot(snapshot) => {
                 let revision = self.next_revision()?;
                 self.mirror.snapshot = snapshot;
                 self.mirror.revision = revision;
-                Ok(None)
+                Ok(SessionUpdate::Event(HerdrEvent::CatalogChanged(revision)))
             }
-            TransportNotification::AttachmentOutput(output) => Ok(Some(output)),
+            TransportNotification::AttachmentOutput(output) => {
+                Ok(SessionUpdate::AttachmentOutput(output))
+            }
             TransportNotification::ControlChanged { agent, ownership } => {
                 self.update_control(&agent, ownership)?;
-                Ok(None)
+                Ok(SessionUpdate::Event(HerdrEvent::ControlChanged {
+                    agent,
+                    ownership,
+                }))
             }
             TransportNotification::ConnectionChanged(connection) => {
                 self.mirror.connection = connection;
-                Ok(None)
+                Ok(SessionUpdate::Event(HerdrEvent::ConnectionChanged(
+                    connection,
+                )))
+            }
+            TransportNotification::CreateResolved { request_id, result } => {
+                Ok(SessionUpdate::Event(HerdrEvent::CreateResolved {
+                    request_id,
+                    result,
+                }))
+            }
+            TransportNotification::AttachResolved { request_id, result } => {
+                Ok(SessionUpdate::AttachResolved { request_id, result })
             }
         }
     }
@@ -210,7 +304,7 @@ impl SessionState {
 
 #[cfg(test)]
 mod tests {
-    use crate::{AgentCommand, AgentId, RequestId};
+    use crate::AgentId;
 
     use crate::fake::FakeHerdrTransport;
     use crate::transport::{AttachmentId, AttachmentInput, TransportCommand};
@@ -250,9 +344,16 @@ mod tests {
         )));
         let mut session = SessionState::default();
 
-        let output = session.drain(&mut transport).expect("drain snapshots");
+        let drain = session.drain(&mut transport);
 
-        assert!(output.is_empty());
+        assert_eq!(drain.error, None);
+        assert_eq!(
+            drain.updates,
+            [
+                SessionUpdate::Event(HerdrEvent::CatalogChanged(CatalogRevision(1))),
+                SessionUpdate::Event(HerdrEvent::CatalogChanged(CatalogRevision(2))),
+            ]
+        );
         assert_eq!(session.catalog().revision().get(), 2);
         assert_eq!(
             session.catalog().snapshot(),
@@ -281,7 +382,7 @@ mod tests {
         ));
         let mut session = SessionState::default();
 
-        session.drain(&mut transport).expect("drain state changes");
+        assert_eq!(session.drain(&mut transport).error, None);
 
         let catalog_agent = &session.catalog().snapshot().spaces()[0].agents()[0];
         assert_eq!(catalog_agent.phase(), AgentPhase::WaitingForInput);
@@ -329,19 +430,20 @@ mod tests {
         }));
         let mut session = SessionState::default();
 
-        let output = session.drain(&mut transport).expect("drain output");
+        let drain = session.drain(&mut transport);
 
+        assert_eq!(drain.error, None);
         assert_eq!(
-            output,
+            drain.updates,
             [
-                AttachmentOutput {
+                SessionUpdate::AttachmentOutput(AttachmentOutput {
                     attachment,
                     bytes: b"replay\r\n".to_vec(),
-                },
-                AttachmentOutput {
+                }),
+                SessionUpdate::AttachmentOutput(AttachmentOutput {
                     attachment,
                     bytes: b"live\0\xff".to_vec(),
-                },
+                }),
             ]
         );
     }
@@ -354,87 +456,23 @@ mod tests {
         let mut transport = FakeHerdrTransport::default();
 
         transport
-            .send(TransportCommand::WriteInput(AttachmentInput {
+            .send(TransportCommand::AttachmentInput(AttachmentInput {
                 attachment,
                 bytes: bytes.clone(),
             }))
             .expect("record input");
         transport
-            .send(TransportCommand::WriteInput(AttachmentInput {
+            .send(TransportCommand::AttachmentInput(AttachmentInput {
                 attachment: other_attachment,
                 bytes: b"other".to_vec(),
             }))
             .expect("record other input");
 
-        assert_eq!(transport.inputs_for(attachment), [bytes]);
-        assert_eq!(transport.inputs_for(other_attachment), [b"other".to_vec()]);
-    }
-
-    #[test]
-    fn session_transport_commands_keep_typed_payloads() {
-        let request_id = RequestId::new();
-        let agent = key("space", "agent");
-        let attachment = AttachmentId::new(11);
-        let commands = [
-            TransportCommand::CreateAgent {
-                request_id,
-                space: SpaceId::new("space"),
-                command: AgentCommand {
-                    program: "printf".to_string(),
-                    argv: vec!["a b".to_string()],
-                },
-            },
-            TransportCommand::Attach {
-                request_id,
-                agent: agent.clone(),
-            },
-            TransportCommand::WriteInput(AttachmentInput {
-                attachment,
-                bytes: vec![0, 0xff],
-            }),
-            TransportCommand::Detach {
-                request_id,
-                agent: agent.clone(),
-            },
-            TransportCommand::CloseAgent {
-                request_id,
-                agent: agent.clone(),
-            },
-        ];
-
-        for command in commands {
-            match command {
-                TransportCommand::CreateAgent {
-                    request_id: actual_request,
-                    space,
-                    command,
-                } => {
-                    assert_eq!(actual_request, request_id);
-                    assert_eq!(space, SpaceId::new("space"));
-                    assert_eq!(command.program, "printf");
-                    assert_eq!(command.argv, ["a b"]);
-                }
-                TransportCommand::Attach {
-                    request_id: actual_request,
-                    agent: actual_agent,
-                }
-                | TransportCommand::Detach {
-                    request_id: actual_request,
-                    agent: actual_agent,
-                }
-                | TransportCommand::CloseAgent {
-                    request_id: actual_request,
-                    agent: actual_agent,
-                } => {
-                    assert_eq!(actual_request, request_id);
-                    assert_eq!(actual_agent, agent);
-                }
-                TransportCommand::WriteInput(input) => {
-                    assert_eq!(input.attachment, attachment);
-                    assert_eq!(input.bytes, [0, 0xff]);
-                }
-            }
-        }
+        assert_eq!(transport.inputs_for_id(attachment), [bytes]);
+        assert_eq!(
+            transport.inputs_for_id(other_attachment),
+            [b"other".to_vec()]
+        );
     }
 
     #[test]
@@ -454,11 +492,10 @@ mod tests {
             },
         };
 
-        let error = session
-            .drain(&mut transport)
-            .expect_err("revision exhaustion must fail");
+        let drain = session.drain(&mut transport);
 
-        assert_eq!(error, SessionError::RevisionExhausted);
+        assert_eq!(drain.error, Some(SessionError::RevisionExhausted));
+        assert!(drain.updates.is_empty());
         assert_eq!(session.catalog().snapshot(), &original);
         assert_eq!(session.catalog().revision(), CatalogRevision(u64::MAX));
     }
