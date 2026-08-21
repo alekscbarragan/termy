@@ -1,14 +1,41 @@
 use crate::{
-    AgentCommand, AgentKey, CatalogSnapshot, ConnectionState, ControlOwnership, RequestId, SpaceId,
+    AgentCommand, AgentKey, AttachmentConflict, CatalogSnapshot, ConnectionState, ControlOwnership,
+    CreateAgentFailure, RequestId, SpaceId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AttachmentId(u64);
 
 impl AttachmentId {
+    #[cfg(test)]
     pub fn new(value: u64) -> Self {
         Self(value)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateAgentRequest {
+    pub request_id: RequestId,
+    pub space: SpaceId,
+    pub command: AgentCommand,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachAgentRequest {
+    pub request_id: RequestId,
+    pub agent: AgentKey,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DetachAgentRequest {
+    pub request_id: RequestId,
+    pub agent: AgentKey,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloseAgentRequest {
+    pub request_id: RequestId,
+    pub agent: AgentKey,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,27 +52,35 @@ pub struct AttachmentOutput {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransportCommand {
-    CreateAgent {
-        request_id: RequestId,
-        space: SpaceId,
-        command: AgentCommand,
-    },
-    Attach {
-        request_id: RequestId,
-        agent: AgentKey,
-    },
-    WriteInput(AttachmentInput),
-    Detach {
-        request_id: RequestId,
-        agent: AgentKey,
-    },
-    CloseAgent {
-        request_id: RequestId,
-        agent: AgentKey,
-    },
+    CreateAgent(CreateAgentRequest),
+    RequestAttach(AttachAgentRequest),
+    AttachmentInput(AttachmentInput),
+    Detach(DetachAgentRequest),
+    CloseAgent(CloseAgentRequest),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the real transport constructs attachment results in P9"
+    )
+)]
+pub enum TransportAttachResult {
+    Writable(AttachmentId),
+    Conflict(AttachmentConflict),
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the real transport constructs notifications in P9"
+    )
+)]
 pub enum TransportNotification {
     CatalogSnapshot(CatalogSnapshot),
     AttachmentOutput(AttachmentOutput),
@@ -54,6 +89,14 @@ pub enum TransportNotification {
         ownership: ControlOwnership,
     },
     ConnectionChanged(ConnectionState),
+    CreateResolved {
+        request_id: RequestId,
+        result: Result<AgentKey, CreateAgentFailure>,
+    },
+    AttachResolved {
+        request_id: RequestId,
+        result: TransportAttachResult,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
