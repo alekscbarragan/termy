@@ -7,4 +7,5 @@ edition = "2024"
 workspace = true
 
 [dependencies]
+serde_json = { workspace = true }
 termy_theme_core = { path = "../theme_core" }

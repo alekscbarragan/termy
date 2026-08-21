@@ -1,6 +1,6 @@
 use crate::types::{
-    AppConfig, AppIcon, AppearanceMode, CursorStyle, PaneFocusEffect, TabBarPosition,
-    TabCloseVisibility, TabTitleMode, TabWidthMode, TerminalScrollbarStyle,
+    AppConfig, AppIcon, AppearanceMode, CursorStyle, HerdrSidebarView, PaneFocusEffect,
+    TabBarPosition, TabCloseVisibility, TabTitleMode, TabWidthMode, TerminalScrollbarStyle,
     TerminalScrollbarVisibility, WindowsShell, WorkingDirFallback,
 };
 
@@ -303,6 +303,17 @@ pub const TAB_BAR_POSITION_ENUM_CHOICES: &[EnumChoice] = &[
     },
 ];
 
+pub const HERDR_SIDEBAR_VIEW_ENUM_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        value: "workspaces",
+        label: "Workspaces",
+    },
+    EnumChoice {
+        value: "herdr",
+        label: "Herdr",
+    },
+];
+
 pub const WORKING_DIR_FALLBACK_ENUM_CHOICES: &[EnumChoice] = &[
     EnumChoice {
         value: "home",
@@ -363,6 +374,11 @@ define_root_settings! {
     (TmuxEnabled, "tmux_enabled", [], Terminal, "TMUX", "Tmux Enabled", "Enable tmux runtime integration", ["tmux", "runtime", "integration", "enabled"], RootSettingValueKind::Boolean, false),
     (TmuxPersistence, "tmux_persistence", [], Terminal, "TMUX", "Tmux Persistence", "Reuse tmux tabs and panes across app restarts", ["tmux", "session", "persistence", "restart"], RootSettingValueKind::Boolean, false),
     (TmuxExclusive, "tmux_exclusive", [], Terminal, "TMUX", "Tmux Exclusive", "Stay in tmux control mode; restart it instead of falling back to a classic terminal when control mode exits", ["tmux", "exclusive", "control", "mode", "restart", "fallback"], RootSettingValueKind::Boolean, false),
+    (HerdrEnabled, "herdr_enabled", [], Advanced, "HERDR", "Herdr Enabled", "Saved Herdr integration preference; unset allows documented-location detection", ["herdr", "integration", "enabled", "detection"], RootSettingValueKind::Boolean, false),
+    (HerdrServicePath, "herdr_service_path", [], Advanced, "HERDR", "Herdr Service Path", "Optional absolute path override for the Herdr executable", ["herdr", "service", "path", "executable"], RootSettingValueKind::Text, false),
+    (HerdrTrustedPaths, "herdr_trusted_paths", [], Advanced, "HERDR", "Herdr Trusted Paths", "JSON string list of paths trusted for Herdr executable launch", ["herdr", "trusted", "paths", "security"], RootSettingValueKind::Special, false),
+    (HerdrSidebarView, "herdr_sidebar_view", [], Tabs, "SIDEBAR", "Herdr Sidebar View", "Saved Workspaces or Herdr sidebar view", ["herdr", "sidebar", "view", "workspaces"], RootSettingValueKind::Enum, false),
+    (HerdrInitialViewPresented, "herdr_initial_view_presented", [], Advanced, "HERDR", "Herdr Initial View Presented", "Whether the one-time Herdr-first sidebar presentation has occurred", ["herdr", "sidebar", "initial", "presentation"], RootSettingValueKind::Boolean, false),
     (NativeTabPersistence, "native_tab_persistence", [], Advanced, "STARTUP", "Native Tab Persistence", "Restore native tabs and pane splits across app restarts", ["native", "tabs", "panes", "split", "restore", "startup"], RootSettingValueKind::Boolean, false),
     (NativeLayoutAutosave, "native_layout_autosave", [], Advanced, "STARTUP", "Native Layout Autosave", "Auto-save changes back into the currently loaded named layout", ["native", "layout", "autosave", "saved", "snapshot"], RootSettingValueKind::Boolean, false),
     (NativeBufferPersistence, "native_buffer_persistence", [], Advanced, "STARTUP", "Native Buffer Persistence", "Replay saved buffer text when restoring native layouts", ["native", "buffer", "scrollback", "history", "restore"], RootSettingValueKind::Boolean, false),
@@ -459,6 +475,17 @@ pub fn root_setting_value_kind(id: RootSettingId) -> RootSettingValueKind {
     root_setting_spec(id).value_kind
 }
 
+pub fn root_setting_is_user_facing(id: RootSettingId) -> bool {
+    !matches!(
+        id,
+        RootSettingId::HerdrEnabled
+            | RootSettingId::HerdrServicePath
+            | RootSettingId::HerdrTrustedPaths
+            | RootSettingId::HerdrSidebarView
+            | RootSettingId::HerdrInitialViewPresented
+    )
+}
+
 pub fn root_setting_enum_choices(id: RootSettingId) -> Option<&'static [EnumChoice]> {
     match id {
         RootSettingId::WorkingDirFallback => Some(WORKING_DIR_FALLBACK_ENUM_CHOICES),
@@ -466,6 +493,7 @@ pub fn root_setting_enum_choices(id: RootSettingId) -> Option<&'static [EnumChoi
         RootSettingId::TabCloseVisibility => Some(TAB_CLOSE_VISIBILITY_ENUM_CHOICES),
         RootSettingId::TabWidthMode => Some(TAB_WIDTH_MODE_ENUM_CHOICES),
         RootSettingId::TabBarPosition => Some(TAB_BAR_POSITION_ENUM_CHOICES),
+        RootSettingId::HerdrSidebarView => Some(HERDR_SIDEBAR_VIEW_ENUM_CHOICES),
         RootSettingId::ThemeMode => Some(THEME_MODE_ENUM_CHOICES),
         RootSettingId::AppIcon => Some(APP_ICON_ENUM_CHOICES),
         RootSettingId::WindowsShell => Some(WINDOWS_SHELL_ENUM_CHOICES),
@@ -496,6 +524,16 @@ pub fn root_setting_default_value(config: &AppConfig, id: RootSettingId) -> Opti
         RootSettingId::TmuxEnabled => Some(config.tmux_enabled.to_string()),
         RootSettingId::TmuxPersistence => Some(config.tmux_persistence.to_string()),
         RootSettingId::TmuxExclusive => Some(config.tmux_exclusive.to_string()),
+        RootSettingId::HerdrEnabled => config.herdr_enabled.map(|value| value.to_string()),
+        RootSettingId::HerdrServicePath => config.herdr_service_path.clone(),
+        RootSettingId::HerdrTrustedPaths => serde_json::to_string(&config.herdr_trusted_paths).ok(),
+        RootSettingId::HerdrSidebarView => config.herdr_sidebar_view.map(|view| match view {
+            HerdrSidebarView::Workspaces => "workspaces".to_string(),
+            HerdrSidebarView::Herdr => "herdr".to_string(),
+        }),
+        RootSettingId::HerdrInitialViewPresented => {
+            Some(config.herdr_initial_view_presented.to_string())
+        }
         RootSettingId::NativeTabPersistence => Some(config.native_tab_persistence.to_string()),
         RootSettingId::NativeLayoutAutosave => Some(config.native_layout_autosave.to_string()),
         RootSettingId::NativeBufferPersistence => {
@@ -768,6 +806,19 @@ mod tests {
             root_setting_default_value(&defaults, RootSettingId::ChromeContrast),
             Some("false".to_string())
         );
+    }
+
+    #[test]
+    fn herdr_settings_remain_non_user_facing_until_their_ui_phase() {
+        for id in [
+            RootSettingId::HerdrEnabled,
+            RootSettingId::HerdrServicePath,
+            RootSettingId::HerdrTrustedPaths,
+            RootSettingId::HerdrSidebarView,
+            RootSettingId::HerdrInitialViewPresented,
+        ] {
+            assert!(!root_setting_is_user_facing(id));
+        }
     }
 
     #[test]

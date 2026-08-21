@@ -180,6 +180,22 @@ pub enum TabBarPosition {
     Right,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrSidebarView {
+    Workspaces,
+    Herdr,
+}
+
+impl HerdrSidebarView {
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "workspaces" => Some(Self::Workspaces),
+            "herdr" => Some(Self::Herdr),
+            _ => None,
+        }
+    }
+}
+
 impl TabBarPosition {
     pub(crate) fn from_str(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -333,6 +349,11 @@ pub struct AppConfig {
     pub tmux_enabled: bool,
     pub tmux_persistence: bool,
     pub tmux_exclusive: bool,
+    pub herdr_enabled: Option<bool>,
+    pub herdr_service_path: Option<String>,
+    pub herdr_trusted_paths: Vec<String>,
+    pub herdr_sidebar_view: Option<HerdrSidebarView>,
+    pub herdr_initial_view_presented: bool,
     pub native_tab_persistence: bool,
     pub native_layout_autosave: bool,
     pub native_buffer_persistence: bool,
@@ -433,6 +454,11 @@ impl Default for AppConfig {
             tmux_enabled: DEFAULT_TMUX_ENABLED,
             tmux_persistence: DEFAULT_TMUX_PERSISTENCE,
             tmux_exclusive: DEFAULT_TMUX_EXCLUSIVE,
+            herdr_enabled: None,
+            herdr_service_path: None,
+            herdr_trusted_paths: Vec::new(),
+            herdr_sidebar_view: None,
+            herdr_initial_view_presented: false,
             native_tab_persistence: false,
             native_layout_autosave: false,
             native_buffer_persistence: false,

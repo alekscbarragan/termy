@@ -28,12 +28,13 @@ pub use schema::{
     RootSettingValueKind, SettingsSection, canonical_color_key as schema_canonical_color_key,
     canonical_root_key as schema_canonical_root_key, color_setting_from_key, color_setting_spec,
     color_setting_specs, root_setting_default_value, root_setting_enum_choices,
-    root_setting_from_key, root_setting_spec, root_setting_specs, root_setting_value_kind,
+    root_setting_from_key, root_setting_is_user_facing, root_setting_spec, root_setting_specs,
+    root_setting_value_kind,
 };
 pub use types::{
-    AppConfig, AppIcon, AppearanceMode, CursorStyle, CustomColors, KeybindConfigLine,
-    PaneFocusEffect, Rgb8, SystemAppearance, TabBarPosition, TabCloseVisibility, TabTitleConfig,
-    TabTitleMode, TabTitleSource, TabWidthMode, TaskConfig, TerminalScrollbarStyle,
+    AppConfig, AppIcon, AppearanceMode, CursorStyle, CustomColors, HerdrSidebarView,
+    KeybindConfigLine, PaneFocusEffect, Rgb8, SystemAppearance, TabBarPosition, TabCloseVisibility,
+    TabTitleConfig, TabTitleMode, TabTitleSource, TabWidthMode, TaskConfig, TerminalScrollbarStyle,
     TerminalScrollbarVisibility, ThemeId, WindowsShell, WorkingDirFallback, resolve_active_theme,
 };
 
