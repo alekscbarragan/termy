@@ -1,10 +1,10 @@
 # termy_herdr_core
 
-Pure Herdr integration domain and trust policy.
+Pure Herdr integration domain, trust policy, transport seam, and catalog mirror.
 
 ## Owner
 
-This crate owns Herdr identities, lifecycle vocabulary, exact tokenized commands, confirmation evidence, trusted executable vetting, and the future transport and service-supervision boundary. T3–T5 implement only the pure domain and trust modules; desktop state and UI remain outside this crate.
+This crate owns Herdr identities, lifecycle vocabulary, exact tokenized commands, confirmation evidence, trusted executable vetting, the private transport seam, and the derived catalog mirror. Service supervision is deferred to a later phase; desktop state and UI remain outside this crate.
 
 ## Validation
 
