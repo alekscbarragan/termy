@@ -219,6 +219,11 @@ impl TerminalView {
                 let Some(terminal) = self.pane_terminal_by_id(pane_id) else {
                     return false;
                 };
+                if let Some(sent) =
+                    herdr::route_agent_input(terminal, self.herdr.as_ref(), pane_id, packet)
+                {
+                    return sent;
+                }
                 terminal.write_input(packet);
                 true
             }
@@ -236,6 +241,11 @@ impl TerminalView {
                 let Some(terminal) = self.pane_terminal_by_id(pane_id) else {
                     return false;
                 };
+                if let Some(sent) =
+                    herdr::route_agent_input(terminal, self.herdr.as_ref(), pane_id, &packet)
+                {
+                    return sent;
+                }
                 terminal.write_input_owned(packet);
                 true
             }
