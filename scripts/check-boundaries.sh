@@ -126,6 +126,40 @@ require_crate_readme_metadata() {
     "$readme must document forbidden dependencies"
 }
 
+require_herdr_core_direct_dependency_allowlist() {
+  local unexpected_dependencies
+
+  if unexpected_dependencies="$(cargo metadata --format-version=1 --no-deps | python3 -c '
+import json
+import sys
+
+metadata = json.load(sys.stdin)
+package = next(
+    package
+    for package in metadata["packages"]
+    if package["name"] == "termy_herdr_core"
+)
+allowed_dependencies = {("normal", "uuid"), ("dev", "tempfile")}
+unexpected_dependencies = []
+
+for dependency in package["dependencies"]:
+    kind = dependency["kind"] or "normal"
+    dependency_key = (kind, dependency["name"])
+    if dependency_key not in allowed_dependencies:
+        unexpected_dependencies.append("{} {}".format(kind, dependency["name"]))
+
+if unexpected_dependencies:
+    print("\n".join(sorted(unexpected_dependencies)))
+    sys.exit(1)
+')" ; then
+    return
+  fi
+
+  echo "Boundary check failed: termy_herdr_core direct dependencies must be normal uuid or dev tempfile; build dependencies are forbidden" >&2
+  printf '%s\n' "$unexpected_dependencies" >&2
+  exit 1
+}
+
 require_path "crates/desktop_app/Cargo.toml"
 require_path "scripts/build-dmg.sh"
 require_path "scripts/build-setup.ps1"
@@ -229,6 +263,7 @@ check_forbidden_all_target_dep "termy_herdr_core" "gpui"
 check_forbidden_all_target_dep "termy_herdr_core" "termy"
 check_forbidden_all_target_dep "termy_herdr_core" "termy_config_core"
 check_forbidden_all_target_dep "termy_herdr_core" "termy_terminal_ui"
+require_herdr_core_direct_dependency_allowlist
 check_forbidden_dep "termy_ui" "termy_terminal_ui"
 check_forbidden_dep "termy_ui" "termy_config_core"
 check_forbidden_dep "termy_ui" "termy_command_core"

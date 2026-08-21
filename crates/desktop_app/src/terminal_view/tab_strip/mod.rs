@@ -3,6 +3,7 @@ pub(super) mod gestures;
 pub(super) mod hints;
 pub(super) mod hit_test;
 pub(super) mod layout;
+pub(super) mod render_herdr_sidebar;
 pub(super) mod render_horizontal;
 pub(super) mod render_palette;
 pub(super) mod render_shared;
