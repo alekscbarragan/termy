@@ -6,6 +6,7 @@ use std::ops::Deref;
 #[allow(clippy::large_enum_variant)]
 pub(super) enum Terminal {
     Tmux(PaneTerminal),
+    HerdrAgent(PaneTerminal),
     Native(NativeTerminalInstance),
 }
 
@@ -161,6 +162,7 @@ pub(super) fn terminal_engine_label(terminal: Option<&Terminal>) -> &'static str
             .lock()
             .map_or("unknown", |terminal| terminal.engine_label()),
         Some(Terminal::Tmux(_)) => "alacritty",
+        Some(Terminal::HerdrAgent(_)) => "alacritty-herdr",
         None => "-",
     }
 }
