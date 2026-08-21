@@ -6483,6 +6483,7 @@ dependencies = [
  "termy_command_core",
  "termy_config_core",
  "termy_core",
+ "termy_herdr_core",
  "termy_native_sdk",
  "termy_plugin_runtime",
  "termy_search",
@@ -6600,6 +6601,14 @@ dependencies = [
  "termy_themes",
  "termy_tmux_control_core",
  "ureq",
+]
+
+[[package]]
+name = "termy_herdr_core"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
