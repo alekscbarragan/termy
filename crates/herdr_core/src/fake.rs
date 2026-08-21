@@ -124,8 +124,8 @@ impl FakeHerdrHandle {
         ));
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_create_outcome(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_create_outcome(
         &self,
         request_id: RequestId,
         outcome: Result<AgentKey, CreateAgentFailure>,
@@ -133,9 +133,18 @@ impl FakeHerdrHandle {
         self.state().create_outcomes.insert(request_id, outcome);
     }
 
-    #[cfg(test)]
-    pub(crate) fn create_effects(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn create_effects(&self) -> usize {
         self.state().create_effects
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn created_commands(&self) -> Vec<(crate::SpaceId, crate::AgentCommand)> {
+        self.state()
+            .create_requests
+            .iter()
+            .map(|request| (request.space.clone(), request.command.clone()))
+            .collect()
     }
 
     #[cfg(test)]
@@ -157,18 +166,18 @@ impl FakeHerdrHandle {
             .insert(agent, TransportAttachResult::Conflict(conflict));
     }
 
-    #[cfg(test)]
-    pub(crate) fn attach_requests(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn attach_requests(&self) -> usize {
         self.state().attach_requests
     }
 
-    #[cfg(test)]
-    pub(crate) fn attach_effects(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn attach_effects(&self) -> usize {
         self.state().attach_effects
     }
 
-    #[cfg(test)]
-    pub(crate) fn inputs_for(&self, attachment: u64) -> Vec<Vec<u8>> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inputs_for(&self, attachment: u64) -> Vec<Vec<u8>> {
         self.state()
             .input_by_attachment
             .get(&AttachmentId::new(attachment))
@@ -185,13 +194,13 @@ impl FakeHerdrHandle {
             }));
     }
 
-    #[cfg(test)]
-    pub(crate) fn detach_effects(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn detach_effects(&self) -> usize {
         self.state().detach_effects
     }
 
-    #[cfg(test)]
-    pub(crate) fn close_effects(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn close_effects(&self) -> usize {
         self.state().close_effects
     }
 

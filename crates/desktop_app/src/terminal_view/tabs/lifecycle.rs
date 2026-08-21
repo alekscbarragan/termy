@@ -573,6 +573,27 @@ impl TerminalView {
         predicted_title: Option<String>,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.insert_terminal_tab(terminal, size, predicted_title, true, cx);
+        true
+    }
+
+    pub(in crate::terminal_view) fn insert_herdr_agent_tab(
+        &mut self,
+        terminal: Terminal,
+        size: TerminalSize,
+        cx: &mut Context<Self>,
+    ) -> String {
+        self.insert_terminal_tab(terminal, size, Some("Herdr Agent".to_string()), false, cx)
+    }
+
+    fn insert_terminal_tab(
+        &mut self,
+        terminal: Terminal,
+        size: TerminalSize,
+        predicted_title: Option<String>,
+        persist_workspace: bool,
+        cx: &mut Context<Self>,
+    ) -> String {
         let tab_id = self.allocate_tab_id();
         let old_active_tab = self.session.active_tab;
         let new_tab_index = self
@@ -584,6 +605,7 @@ impl TerminalView {
             new_tab_index,
             Self::create_native_tab(tab_id, terminal, size.cols, size.rows, predicted_title),
         );
+        let pane_id = self.session.tabs[new_tab_index].active_pane_id.clone();
         self.refresh_tab_title(new_tab_index);
         self.session.active_tab = new_tab_index;
         if let Some(inactive_scrollback) = self.inactive_tab_scrollback {
@@ -604,10 +626,12 @@ impl TerminalView {
         self.reset_tab_interaction_state();
         self.sync_tab_strip_for_active_tab();
         self.sync_plugin_lifecycle_state(false, cx);
-        self.schedule_persist_native_workspace(cx);
+        if persist_workspace {
+            self.schedule_persist_native_workspace(cx);
+        }
         self.start_new_tab_animation(tab_id, cx);
         cx.notify();
-        true
+        pane_id
     }
 
     pub(crate) fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
