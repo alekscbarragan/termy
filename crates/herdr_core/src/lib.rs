@@ -1,10 +1,13 @@
 mod controller;
 mod domain;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod fake;
 mod session;
 mod transport;
 mod trust;
+
+#[cfg(feature = "test-support")]
+pub use fake::{FakeAgentCatalogRow, FakeHerdrHandle, FakeSpaceCatalogRow, fake_controller};
 
 pub use controller::{
     AttachResult, AttachTicket, AttachmentConflict, AttachmentUnavailable, CreateAgentFailure,
