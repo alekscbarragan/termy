@@ -474,13 +474,6 @@ impl Terminal {
         Self::Tmux(PaneTerminal::new(size, options))
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Herdr Agent tabs are first constructed by the P6 controller"
-        )
-    )]
     fn new_herdr_agent(size: TerminalSize, options: TerminalOptions) -> Self {
         Self::HerdrAgent(PaneTerminal::new(size, options))
     }
@@ -1307,6 +1300,8 @@ pub struct TerminalView {
     child_working_dir_lookup_pending: HashSet<u32>,
     terminal_runtime: TerminalRuntimeConfig,
     runtime: RuntimeState,
+    #[cfg(test)]
+    agent_open_runtime_kind_override: Option<RuntimeKind>,
     tmux_enabled_config: bool,
     native_tab_persistence: bool,
     native_layout_autosave: bool,
@@ -3827,6 +3822,8 @@ impl TerminalView {
             child_working_dir_lookup_pending: HashSet::new(),
             terminal_runtime,
             runtime,
+            #[cfg(test)]
+            agent_open_runtime_kind_override: None,
             tmux_enabled_config: config.tmux_enabled,
             native_tab_persistence: config.native_tab_persistence,
             native_layout_autosave: config.native_layout_autosave,
@@ -4542,7 +4539,7 @@ impl TerminalView {
             self.native_terminal_wakeup_batch = ready_terminal_ids;
             should_redraw
         };
-        should_redraw |= self.process_herdr_events();
+        should_redraw |= self.process_herdr_events(cx);
         self.sync_plugin_lifecycle_state(self.runtime_uses_tmux(), cx);
 
         if self.clear_stale_kitty_image_state() {

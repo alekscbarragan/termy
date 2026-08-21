@@ -1,10 +1,11 @@
 use super::super::*;
 use super::render_palette::TabStripPalette;
 use crate::terminal_view::herdr::{
-    HerdrCatalogRenderInput, HerdrSidebarRenderInput, ServiceOrigin, SidebarContent, SidebarView,
+    CreateAgentFormRenderInput, HerdrCatalogRenderInput, HerdrSidebarRenderInput, ServiceOrigin,
+    SidebarContent, SidebarView,
 };
 use termy_herdr_core::{AgentPhase, ConnectionState, ControlOwnership};
-use termy_ui::SegmentedControl;
+use termy_ui::{Input, SegmentedControl};
 
 impl TerminalView {
     pub(crate) fn render_sidebar(
@@ -20,6 +21,10 @@ impl TerminalView {
             self.workspace_sidebar_width()
         };
         let selected = self.selected_sidebar_view();
+        let create_form = self
+            .herdr
+            .as_ref()
+            .and_then(crate::terminal_view::herdr::HerdrRuntime::create_form_input);
         let selector = SegmentedControl::new("sidebar-view-selector")
             .width(px((sidebar_width - 16.0).max(0.0)))
             .option("Workspaces", selected == SidebarView::Workspaces)
@@ -35,7 +40,7 @@ impl TerminalView {
                 self.render_workspace_sidebar(colors, font_family, sidebar_bg, cx)
             }
             SidebarContent::Herdr(input) => {
-                self.render_herdr_sidebar(input, colors, font_family, sidebar_bg)
+                self.render_herdr_sidebar(input, create_form, colors, font_family, sidebar_bg, cx)
             }
         };
 
@@ -68,11 +73,13 @@ impl TerminalView {
     }
 
     fn render_herdr_sidebar(
-        &self,
+        &mut self,
         input: HerdrSidebarRenderInput,
+        create_form: Option<CreateAgentFormRenderInput>,
         colors: &TerminalColors,
         font_family: &SharedString,
         sidebar_bg: gpui::Rgba,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let palette = self.resolve_tab_strip_palette(colors, sidebar_bg);
         let content = match input {
@@ -85,7 +92,7 @@ impl TerminalView {
                 &palette,
             ),
             HerdrSidebarRenderInput::Catalog(input) => {
-                self.render_herdr_catalog(input, colors, font_family, &palette)
+                self.render_herdr_catalog(input, create_form, colors, font_family, &palette, cx)
             }
         };
 
@@ -103,11 +110,13 @@ impl TerminalView {
     }
 
     fn render_herdr_catalog(
-        &self,
+        &mut self,
         input: HerdrCatalogRenderInput,
+        create_form: Option<CreateAgentFormRenderInput>,
         colors: &TerminalColors,
         font_family: &SharedString,
         palette: &TabStripPalette,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let connection = (input.connection == ConnectionState::Disconnected).then(|| {
             self.render_herdr_marker(
@@ -142,6 +151,8 @@ impl TerminalView {
         }
 
         for (space_index, space) in input.spaces.into_iter().enumerate() {
+            let space_id = space.id.clone();
+            let create_space = space_id.clone();
             let mut space_rows = div()
                 .id(("herdr-space", space_index))
                 .w_full()
@@ -151,14 +162,51 @@ impl TerminalView {
                 .mb(px(10.0))
                 .child(
                     div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
                         .font_family(font_family.clone())
                         .text_size(px(11.0))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(palette.active_tab_text)
-                        .child(space.id),
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(space_id.as_str().to_string()),
+                        )
+                        .child(
+                            div()
+                                .id(("herdr-create-agent", space_index))
+                                .cursor_pointer()
+                                .px(px(6.0))
+                                .py(px(3.0))
+                                .rounded(px(4.0))
+                                .text_size(px(10.0))
+                                .text_color(palette.inactive_tab_text)
+                                .hover(|style| style.bg(palette.inactive_tab_bg))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.begin_herdr_create(create_space.clone(), cx);
+                                }))
+                                .child("+ Agent"),
+                        ),
                 );
 
+            if let Some(form) = create_form
+                .as_ref()
+                .filter(|form| form.space == space.id)
+                .cloned()
+            {
+                space_rows =
+                    space_rows.child(self.render_herdr_create_form(form, font_family, palette, cx));
+            }
+
             for (agent_index, agent) in space.agents.into_iter().enumerate() {
+                let agent_key = agent.key.clone();
                 let phase_color = Self::herdr_phase_color(agent.phase, colors);
                 let mut secondary_text = palette.inactive_tab_text;
                 secondary_text.a = secondary_text.a.max(0.58);
@@ -173,6 +221,11 @@ impl TerminalView {
                         .py(px(6.0))
                         .rounded(px(TAB_ITEM_RADIUS))
                         .bg(palette.inactive_tab_bg)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(palette.active_tab_bg))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_or_focus_agent(agent_key.clone(), cx);
+                        }))
                         .child(
                             div()
                                 .w_full()
@@ -190,7 +243,7 @@ impl TerminalView {
                                         .font_family(font_family.clone())
                                         .text_size(px(12.0))
                                         .text_color(palette.active_tab_text)
-                                        .child(agent.id),
+                                        .child(agent.key.agent.as_str().to_string()),
                                 )
                                 .child(
                                     div()
@@ -213,6 +266,135 @@ impl TerminalView {
         }
 
         rows.into_any_element()
+    }
+
+    fn render_herdr_create_form(
+        &mut self,
+        form: CreateAgentFormRenderInput,
+        font_family: &SharedString,
+        palette: &TabStripPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let view = cx.entity();
+        let mut fields = div().w_full().flex().flex_col().gap(px(5.0)).child(
+            Input::new(format!("herdr-program-{}", form.space.as_str()))
+                .placeholder("Program")
+                .value(form.program)
+                .disabled(form.pending)
+                .invalid(form.error.is_some())
+                .on_change(move |value, _, cx| {
+                    view.update(cx, |this, cx| {
+                        this.update_herdr_create_program(value.to_string(), cx);
+                    });
+                }),
+        );
+
+        for (index, argument) in form.argv.into_iter().enumerate() {
+            let input_view = cx.entity();
+            let remove_view = cx.entity();
+            fields = fields.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        div().flex_1().min_w(px(0.0)).child(
+                            Input::new(format!("herdr-argument-{}-{index}", form.space.as_str()))
+                                .placeholder(format!("Argument {}", index + 1))
+                                .value(argument)
+                                .disabled(form.pending)
+                                .on_change(move |value, _, cx| {
+                                    input_view.update(cx, |this, cx| {
+                                        this.update_herdr_create_argument(
+                                            index,
+                                            value.to_string(),
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id(("herdr-remove-argument", index))
+                            .cursor_pointer()
+                            .px(px(5.0))
+                            .text_color(palette.inactive_tab_text)
+                            .on_click(move |_, _, cx| {
+                                remove_view.update(cx, |this, cx| {
+                                    this.remove_herdr_create_argument(index, cx);
+                                });
+                            })
+                            .child("−"),
+                    ),
+            );
+        }
+
+        let add_view = cx.entity();
+        let cancel_view = cx.entity();
+        let submit_view = cx.entity();
+        let error = form.error.map(|message| {
+            div()
+                .font_family(font_family.clone())
+                .text_size(px(10.0))
+                .text_color(palette.active_tab_text)
+                .child(message)
+        });
+        fields
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .font_family(font_family.clone())
+                    .text_size(px(10.0))
+                    .text_color(palette.inactive_tab_text)
+                    .child(
+                        div()
+                            .id("herdr-add-argument")
+                            .cursor_pointer()
+                            .on_click(move |_, _, cx| {
+                                add_view.update(cx, |this, cx| {
+                                    this.add_herdr_create_argument(cx);
+                                });
+                            })
+                            .child("+ Argument"),
+                    )
+                    .child(
+                        div()
+                            .id("herdr-cancel-create")
+                            .cursor_pointer()
+                            .on_click(move |_, _, cx| {
+                                cancel_view.update(cx, |this, cx| {
+                                    this.cancel_herdr_create(cx);
+                                });
+                            })
+                            .child("Cancel"),
+                    )
+                    .child(
+                        div()
+                            .id("herdr-submit-create")
+                            .cursor_pointer()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(palette.active_tab_text)
+                            .on_click(move |_, _, cx| {
+                                submit_view.update(cx, |this, cx| {
+                                    this.submit_herdr_create(cx);
+                                });
+                            })
+                            .child(if form.pending {
+                                "Creating…"
+                            } else {
+                                "Create"
+                            }),
+                    ),
+            )
+            .children(error)
+            .px(px(4.0))
+            .py(px(5.0))
+            .into_any_element()
     }
 
     fn render_herdr_marker(
