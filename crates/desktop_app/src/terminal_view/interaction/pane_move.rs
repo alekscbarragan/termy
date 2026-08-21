@@ -484,12 +484,17 @@ impl TerminalView {
         let Some(target_index) = self.tab_index_by_id(target_tab_id) else {
             return false;
         };
+        let target_contains_herdr_agent = self.session.tabs[target_index]
+            .panes
+            .iter()
+            .any(|pane| matches!(pane.terminal(), Terminal::HerdrAgent(_)));
         if source_index == target_index
             || self
                 .session
                 .tabs
                 .get(source_index)
                 .is_none_or(|tab| tab.panes.len() <= 1)
+            || target_contains_herdr_agent
         {
             return false;
         }

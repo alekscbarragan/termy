@@ -399,9 +399,18 @@ impl TerminalView {
                 }
 
                 match target {
-                    CloseRequestTarget::Application => cx.quit(),
+                    CloseRequestTarget::Application => {
+                        let _ = this.update(cx, |view, cx| {
+                            view.follow_through_close_request(target, cx);
+                        });
+                    }
                     CloseRequestTarget::WindowClose => {
-                        let _ = window_handle.update(cx, |_, window, _| window.remove_window());
+                        let should_close = this
+                            .update(cx, |view, cx| view.follow_through_close_request(target, cx))
+                            .unwrap_or(false);
+                        if should_close {
+                            let _ = window_handle.update(cx, |_, window, _| window.remove_window());
+                        }
                     }
                     CloseRequestTarget::TabClose { tab_id } => {
                         let _ = this.update(cx, |view, cx| view.close_tab_by_id(tab_id, cx));

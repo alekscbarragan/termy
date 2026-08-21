@@ -655,6 +655,10 @@ impl TerminalView {
             RuntimeKind::Native => {}
         };
 
+        if !self.detach_herdr_panes(&removed_pane_ids, cx) {
+            return;
+        }
+
         self.session.tabs.remove(index);
         self.session
             .native_pane_zoom_snapshots
@@ -1380,26 +1384,32 @@ impl TerminalView {
         launch: Option<&TerminalLaunch>,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.clear_native_zoom_snapshot_for_active_tab();
-        let Some((active_pane_id, left, top, width, height, pane_zoom_steps)) = self
-            .session
-            .tabs
-            .get(self.session.active_tab)
-            .and_then(|tab| {
-                let index = tab.active_pane_index()?;
-                let pane = tab.panes.get(index)?;
-                Some((
-                    pane.id.clone(),
-                    pane.left,
-                    pane.top,
-                    pane.width,
-                    pane.height,
-                    pane.pane_zoom_steps,
-                ))
-            })
+        let Some((active_pane_id, left, top, width, height, pane_zoom_steps, is_herdr_agent)) =
+            self.session
+                .tabs
+                .get(self.session.active_tab)
+                .and_then(|tab| {
+                    let index = tab.active_pane_index()?;
+                    let pane = tab.panes.get(index)?;
+                    Some((
+                        pane.id.clone(),
+                        pane.left,
+                        pane.top,
+                        pane.width,
+                        pane.height,
+                        pane.pane_zoom_steps,
+                        matches!(pane.terminal(), Terminal::HerdrAgent(_)),
+                    ))
+                })
         else {
             return false;
         };
+        if is_herdr_agent {
+            crate::ui::toast::info("Herdr Agent tabs cannot be split");
+            self.notify_overlay(cx);
+            return false;
+        }
+        self.clear_native_zoom_snapshot_for_active_tab();
 
         let (current_size, split_size) = match axis {
             NativeSplitAxis::Vertical => {

@@ -1437,6 +1437,52 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
+    #[cfg(test)]
+    fn open_test_window(cx: &mut gpui::TestAppContext) -> gpui::WindowHandle<Self> {
+        cx.update(|app| {
+            app.open_window(gpui::WindowOptions::default(), |window, cx| {
+                cx.new(|cx| {
+                    Self::new(
+                        window,
+                        cx,
+                        AppConfig {
+                            native_tab_persistence: false,
+                            herdr_enabled: Some(true),
+                            ..AppConfig::default()
+                        },
+                    )
+                })
+            })
+            .expect("test terminal window should open");
+        });
+        cx.windows()
+            .into_iter()
+            .find_map(|handle| handle.downcast::<Self>())
+            .expect("test terminal window should exist")
+    }
+
+    #[cfg(test)]
+    fn native_test_tab(tab_id: TabId) -> TerminalTab {
+        Self::create_native_tab(
+            tab_id,
+            Terminal::new_test_display(TerminalSize::default()),
+            80,
+            24,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn agent_test_tab(tab_id: TabId) -> TerminalTab {
+        Self::create_native_tab(
+            tab_id,
+            Terminal::new_herdr_agent(TerminalSize::default(), TerminalOptions::default()),
+            80,
+            24,
+            None,
+        )
+    }
+
     fn native_leaf_rect(
         node: &NativePaneLayoutNode,
         target_pane_id: &str,
