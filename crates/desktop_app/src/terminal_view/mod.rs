@@ -473,6 +473,17 @@ impl Terminal {
         Self::Tmux(PaneTerminal::new(size, options))
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Herdr Agent tabs are first constructed by the P6 controller"
+        )
+    )]
+    fn new_herdr_agent(size: TerminalSize, options: TerminalOptions) -> Self {
+        Self::HerdrAgent(PaneTerminal::new(size, options))
+    }
+
     #[cfg(test)]
     fn new_test_display(size: TerminalSize) -> Self {
         Self::Native(NativeTerminalInstance {
@@ -530,19 +541,23 @@ impl Terminal {
     fn wakeup_id(&self) -> Option<NativeTerminalWakeupId> {
         match self {
             Self::Tmux(_) => None,
+            Self::HerdrAgent(_) => None,
             Self::Native(terminal) => Some(terminal.wakeup_id),
         }
     }
 
     fn feed_output(&self, bytes: &[u8]) {
-        if let Self::Tmux(terminal) = self {
-            terminal.feed_output(bytes);
+        match self {
+            Self::Tmux(terminal) => terminal.feed_output(bytes),
+            Self::HerdrAgent(terminal) => terminal.feed_output(bytes),
+            Self::Native(_) => {}
         }
     }
 
     fn hydrate_output(&self, bytes: &[u8]) {
         match self {
             Self::Tmux(terminal) => terminal.feed_output(bytes),
+            Self::HerdrAgent(terminal) => terminal.feed_output(bytes),
             Self::Native(terminal) => {
                 if let Ok(terminal) = terminal.lock() {
                     terminal.hydrate_output(bytes);
@@ -559,6 +574,7 @@ impl Terminal {
                 }
             }
             Self::Tmux(_) => {}
+            Self::HerdrAgent(_) => {}
         }
     }
 
@@ -570,6 +586,7 @@ impl Terminal {
                 }
             }
             Self::Tmux(_) => {}
+            Self::HerdrAgent(_) => {}
         }
     }
 
@@ -581,6 +598,7 @@ impl Terminal {
                 }
             }
             Self::Tmux(_) => {}
+            Self::HerdrAgent(_) => {}
         }
     }
 
@@ -588,6 +606,7 @@ impl Terminal {
     fn drain_events(&self, host: &mut impl TerminalReplyHost) -> (Vec<TerminalEvent>, bool) {
         match self {
             Self::Tmux(_) => (Vec::new(), false),
+            Self::HerdrAgent(_) => (Vec::new(), false),
             Self::Native(terminal) => terminal
                 .lock()
                 .map(|terminal| terminal.drain_events(host))
@@ -598,6 +617,7 @@ impl Terminal {
     fn resize(&self, new_size: TerminalSize) {
         match self {
             Self::Tmux(terminal) => terminal.resize(new_size),
+            Self::HerdrAgent(terminal) => terminal.resize(new_size),
             Self::Native(terminal) => {
                 if let Ok(mut terminal) = terminal.lock() {
                     terminal.resize(new_size);
@@ -615,12 +635,14 @@ impl Terminal {
                 }
             }
             Self::Tmux(_) => {}
+            Self::HerdrAgent(_) => {}
         }
     }
 
     fn size(&self) -> TerminalSize {
         match self {
             Self::Tmux(terminal) => terminal.size(),
+            Self::HerdrAgent(terminal) => terminal.size(),
             Self::Native(terminal) => terminal
                 .lock()
                 .map(|terminal| terminal.size())
@@ -631,6 +653,7 @@ impl Terminal {
     fn child_pid(&self) -> Option<u32> {
         match self {
             Self::Tmux(_) => None,
+            Self::HerdrAgent(_) => None,
             Self::Native(terminal) => terminal
                 .lock()
                 .ok()
@@ -641,6 +664,7 @@ impl Terminal {
     fn scroll_display(&self, delta_lines: i32) -> bool {
         match self {
             Self::Tmux(terminal) => terminal.scroll_display(delta_lines),
+            Self::HerdrAgent(terminal) => terminal.scroll_display(delta_lines),
             Self::Native(terminal) => terminal
                 .lock()
                 .is_ok_and(|terminal| terminal.scroll_display(delta_lines)),
@@ -650,6 +674,7 @@ impl Terminal {
     fn scroll_to_bottom(&self) -> bool {
         match self {
             Self::Tmux(terminal) => terminal.scroll_to_bottom(),
+            Self::HerdrAgent(terminal) => terminal.scroll_to_bottom(),
             Self::Native(terminal) => terminal
                 .lock()
                 .is_ok_and(|terminal| terminal.scroll_to_bottom()),
@@ -659,6 +684,7 @@ impl Terminal {
     fn scroll_state(&self) -> (usize, usize) {
         match self {
             Self::Tmux(terminal) => terminal.scroll_state(),
+            Self::HerdrAgent(terminal) => terminal.scroll_state(),
             Self::Native(terminal) => terminal
                 .lock()
                 .map_or((0, 0), |terminal| terminal.scroll_state()),
@@ -668,6 +694,7 @@ impl Terminal {
     fn cursor_state(&self) -> Option<TerminalCursorState> {
         match self {
             Self::Tmux(terminal) => terminal.cursor_state(),
+            Self::HerdrAgent(terminal) => terminal.cursor_state(),
             Self::Native(terminal) => terminal
                 .lock()
                 .map_or(None, |terminal| terminal.cursor_state()),
@@ -677,6 +704,7 @@ impl Terminal {
     fn cursor_position(&self) -> (usize, usize) {
         match self {
             Self::Tmux(terminal) => terminal.cursor_position(),
+            Self::HerdrAgent(terminal) => terminal.cursor_position(),
             Self::Native(terminal) => terminal
                 .lock()
                 .map_or((0, 0), |terminal| terminal.cursor_position()),
@@ -686,6 +714,7 @@ impl Terminal {
     fn set_term_options(&self, options: TerminalOptions) {
         match self {
             Self::Tmux(terminal) => terminal.set_term_options(options),
+            Self::HerdrAgent(terminal) => terminal.set_term_options(options),
             Self::Native(terminal) => {
                 if let Ok(terminal) = terminal.lock() {
                     terminal.set_term_options(options);
@@ -702,6 +731,7 @@ impl Terminal {
                 }
             }
             Self::Tmux(_) => {}
+            Self::HerdrAgent(_) => {}
         }
     }
 
@@ -709,12 +739,14 @@ impl Terminal {
         match self {
             Self::Native(terminal) => terminal.lock().ok().map(|terminal| terminal.palette()),
             Self::Tmux(_) => None,
+            Self::HerdrAgent(_) => None,
         }
     }
 
     fn bracketed_paste_mode(&self) -> bool {
         match self {
             Self::Tmux(terminal) => terminal.bracketed_paste_mode(),
+            Self::HerdrAgent(terminal) => terminal.bracketed_paste_mode(),
             Self::Native(terminal) => terminal
                 .lock()
                 .is_ok_and(|terminal| terminal.bracketed_paste_mode()),
@@ -724,6 +756,7 @@ impl Terminal {
     fn alternate_screen_mode(&self) -> bool {
         match self {
             Self::Tmux(terminal) => terminal.alternate_screen_mode(),
+            Self::HerdrAgent(terminal) => terminal.alternate_screen_mode(),
             Self::Native(terminal) => terminal
                 .lock()
                 .is_ok_and(|terminal| terminal.alternate_screen_mode()),
@@ -733,6 +766,7 @@ impl Terminal {
     fn mouse_mode(&self) -> TerminalMouseMode {
         match self {
             Self::Tmux(terminal) => terminal.mouse_mode(),
+            Self::HerdrAgent(terminal) => terminal.mouse_mode(),
             Self::Native(terminal) => terminal
                 .lock()
                 .map(|terminal| terminal.mouse_mode())
@@ -743,6 +777,7 @@ impl Terminal {
     fn keyboard_mode(&self) -> TerminalKeyboardMode {
         match self {
             Self::Tmux(terminal) => terminal.keyboard_mode(),
+            Self::HerdrAgent(terminal) => terminal.keyboard_mode(),
             Self::Native(terminal) => terminal
                 .lock()
                 .map(|terminal| terminal.keyboard_mode())
@@ -757,6 +792,7 @@ impl Terminal {
     ) -> Option<R> {
         match self {
             Self::Tmux(terminal) => Some(terminal.with_term(|term| f(term.grid()))),
+            Self::HerdrAgent(terminal) => Some(terminal.with_term(|term| f(term.grid()))),
             Self::Native(_) => None,
         }
     }
@@ -764,6 +800,9 @@ impl Terminal {
     fn take_render_damage_snapshot(&self) -> TerminalRenderDamageSnapshot {
         match self {
             Self::Tmux(terminal) => {
+                TerminalRenderDamageSnapshot::from_damage(terminal.take_damage_snapshot())
+            }
+            Self::HerdrAgent(terminal) => {
                 TerminalRenderDamageSnapshot::from_damage(terminal.take_damage_snapshot())
             }
             Self::Native(terminal) => terminal.lock().map_or_else(
@@ -778,6 +817,7 @@ impl Terminal {
     fn try_kitty_graphics_placements(&self) -> Option<Vec<KittyGraphicsRenderPlacement>> {
         match self {
             Self::Tmux(terminal) => Some(terminal.kitty_graphics_placements()),
+            Self::HerdrAgent(terminal) => Some(terminal.kitty_graphics_placements()),
             Self::Native(terminal) => terminal
                 .lock()
                 .ok()
@@ -793,6 +833,7 @@ impl Terminal {
     fn hyperlink_at(&self, row: usize, col: usize) -> Option<termy_core::DetectedLink> {
         match self {
             Self::Tmux(terminal) => terminal.hyperlink_at(row, col),
+            Self::HerdrAgent(terminal) => terminal.hyperlink_at(row, col),
             Self::Native(terminal) => terminal
                 .lock()
                 .ok()
@@ -805,6 +846,7 @@ impl Terminal {
     fn link_at(&self, row: usize, col: usize) -> Option<termy_core::DetectedViewportLink> {
         match self {
             Self::Tmux(terminal) => terminal.link_at(row, col),
+            Self::HerdrAgent(terminal) => terminal.link_at(row, col),
             Self::Native(terminal) => terminal
                 .lock()
                 .ok()
@@ -834,6 +876,7 @@ impl Terminal {
 
         match self {
             Self::Tmux(terminal) => Some(terminal.with_term(|term| visit_term_cells!(term))),
+            Self::HerdrAgent(terminal) => Some(terminal.with_term(|term| visit_term_cells!(term))),
             Self::Native(terminal) => terminal.lock().ok().map(|terminal| {
                 terminal
                     .visit_viewport_cells(|display_offset, line, col, cell| {
@@ -850,6 +893,7 @@ impl Terminal {
     ) -> Option<usize> {
         match self {
             Self::Tmux(_) => self.for_each_renderable_cell(visitor),
+            Self::HerdrAgent(_) => self.for_each_renderable_cell(visitor),
             Self::Native(terminal) => {
                 let read = terminal.lock().ok()?.render_read(true);
                 let display_offset = read.metadata.display_offset;
@@ -895,7 +939,7 @@ impl Terminal {
                     )
                 })
             }
-            Self::Tmux(terminal) => terminal.with_term(|term| {
+            Self::Tmux(terminal) | Self::HerdrAgent(terminal) => terminal.with_term(|term| {
                 let grid = term.grid();
                 let display_offset = grid.display_offset();
                 let screen_lines = grid.screen_lines();
@@ -925,7 +969,7 @@ impl Terminal {
     fn line_bounds(&self) -> Option<(i32, i32)> {
         match self {
             Self::Native(terminal) => terminal.lock().ok().map(|terminal| terminal.line_bounds()),
-            Self::Tmux(terminal) => Some(terminal.with_term(|term| {
+            Self::Tmux(terminal) | Self::HerdrAgent(terminal) => Some(terminal.with_term(|term| {
                 let grid = term.grid();
                 let history = grid.total_lines().saturating_sub(grid.screen_lines());
                 (
@@ -966,7 +1010,7 @@ impl Terminal {
                     columns: range.2,
                 })
             }),
-            Self::Tmux(terminal) => Some(terminal.with_term(|term| {
+            Self::Tmux(terminal) | Self::HerdrAgent(terminal) => Some(terminal.with_term(|term| {
                 let grid = term.grid();
                 let history = grid.total_lines().saturating_sub(grid.screen_lines());
                 let range = TerminalLineRange {
@@ -4907,11 +4951,67 @@ mod tests {
         let size = TerminalSize::default();
         let options = TerminalOptions::default();
         let tmux = Terminal::new_tmux(size, options);
+        let herdr = Terminal::new_herdr_agent(size, options);
         let native = Terminal::new_test_display(size);
 
         assert_eq!(terminal_engine_label(Some(&tmux)), "alacritty");
+        assert_eq!(terminal_engine_label(Some(&herdr)), "alacritty-herdr");
         assert_eq!(terminal_engine_label(Some(&native)), "tmon");
         assert_eq!(terminal_engine_label(None), "-");
+    }
+
+    #[test]
+    fn herdr_agent_reuses_pane_terminal_rendering() {
+        let terminal = Terminal::new_herdr_agent(
+            TerminalSize {
+                cols: 80,
+                rows: 12,
+                cell_width: 10.0,
+                cell_height: 20.0,
+            },
+            TerminalOptions::default(),
+        );
+
+        terminal.feed_output(b"\x1b[31mred\x1b[0m\r\n");
+        terminal.feed_output(b"progress 10%\rprogress 20%\r\n");
+        terminal.feed_output(
+            b"c\x08cd Desk\x08\x08\x08\x08\x08\x08\x08\x1b[32mc\x1b[32md\x1b[39m\x1b[5C\r\r\n",
+        );
+        terminal.feed_output(b"cd: no such file or directory: Desk\r\n");
+        terminal.feed_output(b"\x1b_Ga=T,f=32,s=1,v=1,i=91,c=2,r=2;AQID/w==\x1b\\");
+
+        let (visible, red) = terminal
+            .with_tmux_grid(|grid| {
+                let visible = (0..grid.screen_lines())
+                    .map(|line| {
+                        let row = &grid[alacritty_terminal::index::Line(line as i32)];
+                        (0..grid.columns())
+                            .map(|col| row[alacritty_terminal::index::Column(col)].c)
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let red = grid[alacritty_terminal::index::Line(0)]
+                    [alacritty_terminal::index::Column(0)]
+                .fg;
+                (visible, red)
+            })
+            .expect("Herdr Agent grid");
+
+        assert_eq!(
+            red,
+            alacritty_terminal::vte::ansi::Color::Named(
+                alacritty_terminal::vte::ansi::NamedColor::Red
+            )
+        );
+        assert!(visible.contains("progress 20%"));
+        assert!(!visible.contains("progress 10%"));
+        assert!(visible.contains("cd: no such file or directory: Desk"));
+        assert!(visible.lines().any(|line| line.trim_end() == "cd Desk"));
+        assert!(!visible.contains("cdcd:"));
+        let placements = terminal.kitty_graphics_placements();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].image_id, 91);
     }
 
     #[test]
