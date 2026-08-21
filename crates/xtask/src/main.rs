@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use termy_command_core::{CommandId, KeybindPlatform, default_keybinds_for_platform};
 use termy_config_core::{
     AppConfig, ColorSettingId, RootSettingId, SettingsSection, color_setting_specs,
-    root_setting_default_value, root_setting_specs,
+    root_setting_default_value, root_setting_is_user_facing, root_setting_specs,
 };
 
 mod benchmark;
@@ -214,7 +214,7 @@ fn render_configuration_doc() -> String {
         output.push_str(&format!("## {}\n\n", section.label()));
         for spec in root_setting_specs()
             .iter()
-            .filter(|spec| spec.section == section)
+            .filter(|spec| spec.section == section && root_setting_is_user_facing(spec.id))
         {
             output.push_str(&format!("`{}`\n", spec.key));
             output.push_str(&format!(
@@ -263,7 +263,10 @@ fn render_default_config_template() -> String {
     let mut output = String::new();
     output.push_str("# Main settings\n");
 
-    for spec in root_setting_specs() {
+    for spec in root_setting_specs()
+        .iter()
+        .filter(|spec| root_setting_is_user_facing(spec.id))
+    {
         if spec.id == RootSettingId::Keybind {
             continue;
         }

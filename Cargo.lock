@@ -6554,6 +6554,7 @@ version = "0.1.0"
 name = "termy_config_core"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "termy_theme_core",
 ]
 

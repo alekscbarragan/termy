@@ -1,8 +1,9 @@
 use crate::{
     AppConfig, AppIcon, AppearanceMode, ConfigDiagnosticKind, ConfigParseReport, CursorStyle,
-    DEFAULT_LINE_HEIGHT, PaneFocusEffect, Rgb8, RootSettingId, RootSettingValueKind,
-    TabCloseVisibility, TabTitleMode, TabTitleSource, TabWidthMode, TerminalScrollbarStyle,
-    TerminalScrollbarVisibility, WindowsShell, WorkingDirFallback, root_setting_specs,
+    DEFAULT_LINE_HEIGHT, HerdrSidebarView, PaneFocusEffect, Rgb8, RootSettingId,
+    RootSettingValueKind, TabCloseVisibility, TabTitleMode, TabTitleSource, TabWidthMode,
+    TerminalScrollbarStyle, TerminalScrollbarVisibility, WindowsShell, WorkingDirFallback,
+    root_setting_default_value, root_setting_specs,
 };
 
 fn parse(input: &str) -> AppConfig {
@@ -28,6 +29,103 @@ fn defaults_enable_tmux_persistence_and_raise_pane_focus_strength() {
 fn native_tab_persistence_parses_as_boolean() {
     assert!(parse("native_tab_persistence = true\n").native_tab_persistence);
     assert!(!parse("native_tab_persistence = false\n").native_tab_persistence);
+}
+
+#[test]
+fn herdr_settings_preserve_absence_and_explicit_values() {
+    let defaults = parse("");
+    assert_eq!(defaults.herdr_enabled, None);
+    assert_eq!(defaults.herdr_service_path, None);
+    assert!(defaults.herdr_trusted_paths.is_empty());
+    assert_eq!(defaults.herdr_sidebar_view, None);
+    assert!(!defaults.herdr_initial_view_presented);
+
+    let config = parse(
+        "herdr_enabled = false\n\
+         herdr_service_path = /opt/herdr/bin/herdr\n\
+         herdr_trusted_paths = [\"/opt/herdr/bin\", \"/Applications/Herdr.app/Contents/MacOS\"]\n\
+         herdr_sidebar_view = herdr\n\
+         herdr_initial_view_presented = true\n",
+    );
+    assert_eq!(config.herdr_enabled, Some(false));
+    assert_eq!(
+        config.herdr_service_path.as_deref(),
+        Some("/opt/herdr/bin/herdr")
+    );
+    assert_eq!(
+        config.herdr_trusted_paths,
+        vec![
+            "/opt/herdr/bin".to_string(),
+            "/Applications/Herdr.app/Contents/MacOS".to_string(),
+        ]
+    );
+    assert_eq!(config.herdr_sidebar_view, Some(HerdrSidebarView::Herdr));
+    assert!(config.herdr_initial_view_presented);
+}
+
+#[test]
+fn herdr_sidebar_view_preserves_choices_and_falls_back_on_invalid_value() {
+    assert_eq!(parse("").herdr_sidebar_view, None);
+    assert_eq!(
+        parse("herdr_sidebar_view = workspaces\n").herdr_sidebar_view,
+        Some(HerdrSidebarView::Workspaces)
+    );
+    assert_eq!(
+        parse("herdr_sidebar_view = herdr\n").herdr_sidebar_view,
+        Some(HerdrSidebarView::Herdr)
+    );
+    assert_eq!(
+        parse("herdr_sidebar_view = unknown\n").herdr_sidebar_view,
+        Some(HerdrSidebarView::Workspaces)
+    );
+}
+
+#[test]
+fn invalid_herdr_enablement_preserves_no_saved_preference() {
+    let report = parse_report("herdr_enabled = maybe\n");
+
+    assert_eq!(report.config.herdr_enabled, None);
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(
+        report.diagnostics[0].kind,
+        ConfigDiagnosticKind::InvalidValue
+    );
+}
+
+#[test]
+fn herdr_settings_round_trip_through_root_values() {
+    let parsed = parse(
+        "herdr_enabled = true\n\
+         herdr_service_path = /opt/herdr/bin/herdr\n\
+         herdr_trusted_paths = [\"/opt/herdr/bin\", \"/tmp/path,with,commas\"]\n\
+         herdr_sidebar_view = herdr\n\
+         herdr_initial_view_presented = true\n",
+    );
+    let ids = [
+        RootSettingId::HerdrEnabled,
+        RootSettingId::HerdrServicePath,
+        RootSettingId::HerdrTrustedPaths,
+        RootSettingId::HerdrSidebarView,
+        RootSettingId::HerdrInitialViewPresented,
+    ];
+    let serialized = ids
+        .into_iter()
+        .map(|id| {
+            let spec = crate::root_setting_spec(id);
+            let value = root_setting_default_value(&parsed, id).expect("configured root value");
+            format!("{} = {}\n", spec.key, value)
+        })
+        .collect::<String>();
+
+    let reparsed = parse(&serialized);
+    assert_eq!(reparsed.herdr_enabled, parsed.herdr_enabled);
+    assert_eq!(reparsed.herdr_service_path, parsed.herdr_service_path);
+    assert_eq!(reparsed.herdr_trusted_paths, parsed.herdr_trusted_paths);
+    assert_eq!(reparsed.herdr_sidebar_view, parsed.herdr_sidebar_view);
+    assert_eq!(
+        reparsed.herdr_initial_view_presented,
+        parsed.herdr_initial_view_presented
+    );
 }
 
 #[test]
@@ -369,6 +467,7 @@ fn bool_root_setting_value(config: &AppConfig, setting: RootSettingId) -> Option
         RootSettingId::TmuxEnabled => Some(config.tmux_enabled),
         RootSettingId::TmuxPersistence => Some(config.tmux_persistence),
         RootSettingId::TmuxExclusive => Some(config.tmux_exclusive),
+        RootSettingId::HerdrInitialViewPresented => Some(config.herdr_initial_view_presented),
         RootSettingId::NativeTabPersistence => Some(config.native_tab_persistence),
         RootSettingId::NativeLayoutAutosave => Some(config.native_layout_autosave),
         RootSettingId::NativeBufferPersistence => Some(config.native_buffer_persistence),
@@ -405,7 +504,11 @@ fn bool_root_settings_parse_table_driven_from_schema() {
     let defaults = AppConfig::default();
     let bool_specs = root_setting_specs()
         .iter()
-        .filter(|spec| spec.value_kind == RootSettingValueKind::Boolean && !spec.repeatable)
+        .filter(|spec| {
+            spec.value_kind == RootSettingValueKind::Boolean
+                && !spec.repeatable
+                && spec.id != RootSettingId::HerdrEnabled
+        })
         .collect::<Vec<_>>();
 
     for spec in bool_specs {

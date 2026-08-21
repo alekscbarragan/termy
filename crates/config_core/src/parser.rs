@@ -9,8 +9,8 @@ use crate::constants::{
 use crate::diagnostics::{ConfigDiagnostic, ConfigDiagnosticKind, ConfigParseReport};
 use crate::schema::{RootSettingId, root_setting_from_key, root_setting_spec};
 use crate::types::{
-    AppConfig, AppearanceMode, CursorStyle, KeybindConfigLine, PaneFocusEffect, TabBarPosition,
-    TabCloseVisibility, TabTitleMode, TabTitleSource, TabWidthMode, TaskConfig,
+    AppConfig, AppearanceMode, CursorStyle, HerdrSidebarView, KeybindConfigLine, PaneFocusEffect,
+    TabBarPosition, TabCloseVisibility, TabTitleMode, TabTitleSource, TabWidthMode, TaskConfig,
     TerminalScrollbarStyle, TerminalScrollbarVisibility, ThemeId, WindowsShell, WorkingDirFallback,
 };
 
@@ -291,6 +291,42 @@ impl AppConfig {
                         parse_bool_field(&mut diagnostics, line_number, key, value)
                     {
                         config.tmux_exclusive = parsed;
+                    }
+                }
+                RootSettingId::HerdrEnabled => {
+                    if value.trim().eq_ignore_ascii_case("none") {
+                        config.herdr_enabled = None;
+                    } else if let Some(parsed) =
+                        parse_bool_field(&mut diagnostics, line_number, key, value)
+                    {
+                        config.herdr_enabled = Some(parsed);
+                    }
+                }
+                RootSettingId::HerdrServicePath => {
+                    config.herdr_service_path = parse_optional_string_value(value);
+                }
+                RootSettingId::HerdrTrustedPaths => {
+                    if let Some(paths) =
+                        parse_string_list_field(&mut diagnostics, line_number, key, value)
+                    {
+                        config.herdr_trusted_paths = paths;
+                    }
+                }
+                RootSettingId::HerdrSidebarView => {
+                    if value.trim().eq_ignore_ascii_case("none") {
+                        config.herdr_sidebar_view = None;
+                    } else {
+                        config.herdr_sidebar_view = Some(
+                            HerdrSidebarView::from_str(value)
+                                .unwrap_or(HerdrSidebarView::Workspaces),
+                        );
+                    }
+                }
+                RootSettingId::HerdrInitialViewPresented => {
+                    if let Some(parsed) =
+                        parse_bool_field(&mut diagnostics, line_number, key, value)
+                    {
+                        config.herdr_initial_view_presented = parsed;
                     }
                 }
                 RootSettingId::NativeTabPersistence => {
@@ -1112,6 +1148,25 @@ fn parse_optional_string_value(value: &str) -> Option<String> {
         return None;
     }
     Some(parsed)
+}
+
+fn parse_string_list_field(
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    line_number: usize,
+    key: &str,
+    value: &str,
+) -> Option<Vec<String>> {
+    if value.trim().eq_ignore_ascii_case("none") {
+        return Some(Vec::new());
+    }
+
+    serde_json::from_str(value).map_or_else(
+        |_| {
+            push_invalid_value(diagnostics, line_number, key, value, "a JSON string list");
+            None
+        },
+        Some,
+    )
 }
 
 fn parse_tab_title_priority(value: &str) -> Option<Vec<TabTitleSource>> {

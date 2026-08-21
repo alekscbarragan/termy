@@ -233,6 +233,10 @@ impl SettingsWindow {
     }
 
     pub(super) fn root_setting_visible_in_current_settings(setting: RootSettingId) -> bool {
+        if !termy_config_core::root_setting_is_user_facing(setting) {
+            return false;
+        }
+
         if matches!(setting, RootSettingId::AppIcon) {
             return cfg!(target_os = "macos");
         }
