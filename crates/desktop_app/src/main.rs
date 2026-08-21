@@ -527,6 +527,11 @@ fn main() {
             log::warn!("Failed to load Glassy UI assets: {error}");
         }
         spawn_deeplink_listener(cx, deeplink_rx);
+        cx.on_app_quit(|cx| {
+            TerminalView::detach_all_open_herdr_agents(cx);
+            async {}
+        })
+        .detach();
 
         cx.on_action(|_: &OpenConfig, _cx| {
             if let Err(error) = app_actions::open_config_file() {

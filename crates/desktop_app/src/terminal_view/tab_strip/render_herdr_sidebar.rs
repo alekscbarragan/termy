@@ -207,6 +207,7 @@ impl TerminalView {
 
             for (agent_index, agent) in space.agents.into_iter().enumerate() {
                 let agent_key = agent.key.clone();
+                let close_agent_key = agent.key.clone();
                 let phase_color = Self::herdr_phase_color(agent.phase, colors);
                 let mut secondary_text = palette.inactive_tab_text;
                 secondary_text.a = secondary_text.a.max(0.58);
@@ -255,10 +256,33 @@ impl TerminalView {
                         )
                         .child(
                             div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
                                 .font_family(font_family.clone())
                                 .text_size(px(10.0))
                                 .text_color(secondary_text)
-                                .child(Self::herdr_ownership_label(agent.control)),
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .child(Self::herdr_ownership_label(agent.control)),
+                                )
+                                .child(
+                                    div()
+                                        .id((
+                                            "herdr-close-agent",
+                                            space_index * 10_000 + agent_index,
+                                        ))
+                                        .cursor_pointer()
+                                        .text_color(palette.inactive_tab_text)
+                                        .hover(|style| style.text_color(palette.active_tab_text))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.confirm_close_agent(close_agent_key.clone(), cx);
+                                        }))
+                                        .child("Close Agent"),
+                                ),
                         ),
                 );
             }

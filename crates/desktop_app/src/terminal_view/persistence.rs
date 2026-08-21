@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
 
+mod herdr;
+
 /// Legacy JSON state file; read once to seed a fresh SQLite store.
 const NATIVE_WORKSPACE_STATE_FILE: &str = "native-tabs.json";
 
@@ -541,54 +543,12 @@ impl TerminalView {
         source_tabs: &[TerminalTab],
         active_tab: usize,
     ) -> PersistedNativeWorkspace {
-        let tabs = source_tabs
-            .iter()
-            .map(|tab| {
-                let panes = tab
-                    .panes
-                    .iter()
-                    .map(|pane| PersistedNativePane {
-                        left: pane.left,
-                        top: pane.top,
-                        width: pane.width.max(1),
-                        height: pane.height.max(1),
-                        buffer: self.extract_persisted_buffer_text(&pane.terminal),
-                    })
-                    .collect::<Vec<_>>();
-                let pane_indices = tab
-                    .panes
-                    .iter()
-                    .enumerate()
-                    .map(|(index, pane)| (pane.id.clone(), index))
-                    .collect::<HashMap<_, _>>();
-                let layout_tree = self
-                    .session
-                    .native_pane_layout_trees
-                    .get(&tab.id)
-                    .and_then(|tree| {
-                        Self::persisted_layout_tree_from_native(&tree.root, &pane_indices)
-                    })
-                    .or_else(|| {
-                        Self::native_layout_tree_from_panes(&tab.panes).and_then(|tree| {
-                            Self::persisted_layout_tree_from_native(&tree.root, &pane_indices)
-                        })
-                    });
-                PersistedNativeTab {
-                    panes,
-                    layout_tree,
-                    active_pane: tab.active_pane_index().unwrap_or(0),
-                    pinned: tab.pinned,
-                    manual_title: tab.manual_title.clone(),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let active_tab = if source_tabs.is_empty() {
-            0
-        } else {
-            active_tab.min(source_tabs.len().saturating_sub(1))
-        };
-        PersistedNativeWorkspace { tabs, active_tab }
+        Self::persisted_workspace_from_tabs(
+            source_tabs,
+            active_tab,
+            &self.session.native_pane_layout_trees,
+            |terminal| self.extract_persisted_buffer_text(terminal),
+        )
     }
 
     fn persisted_workspace_to_value(workspace: PersistedNativeWorkspace) -> Value {

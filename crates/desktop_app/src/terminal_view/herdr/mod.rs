@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use termy_herdr_core::{
-    AgentCommand, AgentKey, AgentPhase, AttachResult, AttachTicket, CatalogMirror, ConnectionState,
-    ControlOwnership, CreateAgentFailure, HerdrController, HerdrEvent, RequestId, SpaceId,
-    WritableAttachment,
+    AgentCommand, AgentKey, AgentPhase, AttachResult, AttachTicket, CatalogMirror, Confirmed,
+    ConnectionState, ControlOwnership, CreateAgentFailure, HerdrController, HerdrEvent, RequestId,
+    SpaceId, WritableAttachment,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -19,6 +19,18 @@ pub(super) enum ServiceOrigin {
 }
 
 impl super::TerminalView {
+    pub(crate) fn detach_all_open_herdr_agents(cx: &mut gpui::App) {
+        for terminal_window in cx
+            .windows()
+            .into_iter()
+            .filter_map(|handle| handle.downcast::<Self>())
+        {
+            let _ = terminal_window.update(cx, |view, _window, cx| {
+                view.detach_all_herdr_agents(cx);
+            });
+        }
+    }
+
     pub(super) fn selected_sidebar_view(&self) -> SidebarView {
         self.herdr_sidebar_view
     }
@@ -196,6 +208,106 @@ impl super::TerminalView {
             self.notify_overlay(cx);
         }
     }
+
+    pub(super) fn detach_herdr_panes(
+        &mut self,
+        pane_ids: &[String],
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let result = self
+            .herdr
+            .as_mut()
+            .map_or(Ok(()), |runtime| runtime.detach_panes(pane_ids));
+        if let Err(message) = result {
+            crate::ui::toast::error(message);
+            self.notify_overlay(cx);
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn detach_all_herdr_agents(&mut self, cx: &mut gpui::Context<Self>) {
+        let result = self.herdr.as_mut().map_or(Ok(()), HerdrRuntime::detach_all);
+        if let Err(message) = result {
+            crate::ui::toast::error(message);
+            self.notify_overlay(cx);
+        }
+    }
+
+    pub(super) fn confirm_close_agent(&mut self, key: AgentKey, cx: &mut gpui::Context<Self>) {
+        let message = format!(
+            "Close Agent \"{}\" in Space \"{}\"? This stops the Agent instead of detaching it.",
+            key.agent.as_str(),
+            key.space.as_str()
+        );
+        cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
+            if !termy_native_sdk::confirm("Close Agent", &message) {
+                return;
+            }
+            let _ = cx.update(|cx| {
+                this.update(cx, |view, cx| {
+                    view.close_agent_after_confirmation(
+                        key,
+                        &Confirmed::after_user_confirmation(),
+                        cx,
+                    );
+                })
+            });
+        })
+        .detach();
+    }
+
+    fn close_agent_after_confirmation(
+        &mut self,
+        key: AgentKey,
+        confirmation: &Confirmed,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let result = self
+            .herdr
+            .as_mut()
+            .ok_or("Herdr integration is disabled")
+            .and_then(|runtime| runtime.close_agent(&key, confirmation));
+        match result {
+            Ok(Some(pane_id)) => self.remove_herdr_tab_without_detach(&pane_id, cx),
+            Ok(None) => cx.notify(),
+            Err(message) => {
+                crate::ui::toast::error(message);
+                self.notify_overlay(cx);
+            }
+        }
+    }
+
+    fn remove_herdr_tab_without_detach(&mut self, pane_id: &str, cx: &mut gpui::Context<Self>) {
+        match find_agent_tab(&self.session, pane_id) {
+            Some(AgentTabLocation::Active(tab)) => {
+                self.session.tabs[tab].pinned = false;
+                self.close_tab(tab, cx);
+            }
+            Some(AgentTabLocation::Stashed { workspace, tab }) => {
+                let removed_tab_id = self.session.workspaces[workspace].tabs[tab].id;
+                self.session.workspaces[workspace].tabs.remove(tab);
+                let remaining = self.session.workspaces[workspace].tabs.len();
+                self.session.workspaces[workspace].active_tab = if remaining == 0 {
+                    0
+                } else {
+                    self.session.workspaces[workspace]
+                        .active_tab
+                        .min(remaining - 1)
+                };
+                self.session
+                    .native_pane_zoom_snapshots
+                    .remove(&removed_tab_id);
+                self.session
+                    .native_pane_layout_trees
+                    .remove(&removed_tab_id);
+                self.mark_tab_strip_layout_dirty();
+                self.schedule_persist_native_workspace(cx);
+                cx.notify();
+            }
+            None => {}
+        }
+    }
 }
 
 fn agent_open_gate(runtime_kind: super::RuntimeKind) -> Result<(), &'static str> {
@@ -209,6 +321,24 @@ fn agent_open_gate(runtime_kind: super::RuntimeKind) -> Result<(), &'static str>
 enum AgentTabLocation {
     Active(usize),
     Stashed { workspace: usize, tab: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WorkspaceDeletePolicy {
+    Allow,
+    RequireAgentTabClose,
+}
+
+pub(super) fn workspace_delete_policy(tabs: &[super::TerminalTab]) -> WorkspaceDeletePolicy {
+    if tabs.iter().any(|tab| {
+        tab.panes
+            .iter()
+            .any(|pane| matches!(pane.terminal(), super::Terminal::HerdrAgent(_)))
+    }) {
+        WorkspaceDeletePolicy::RequireAgentTabClose
+    } else {
+        WorkspaceDeletePolicy::Allow
+    }
 }
 
 fn find_agent_tab(session: &super::SessionState, pane_id: &str) -> Option<AgentTabLocation> {
@@ -575,6 +705,61 @@ impl HerdrRuntime {
         self.agent_panes.remove(key);
     }
 
+    fn detach_panes(&mut self, pane_ids: &[String]) -> Result<(), &'static str> {
+        let keys = self
+            .agent_panes
+            .iter()
+            .filter(|(_, pane)| pane_ids.contains(&pane.pane_id))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        if keys.len() > 1 {
+            return Err("Close Herdr Agent tabs individually");
+        }
+        for key in keys {
+            self.detach_agent(&key)?;
+        }
+        Ok(())
+    }
+
+    fn detach_all(&mut self) -> Result<(), &'static str> {
+        let keys = self.agent_panes.keys().cloned().collect::<Vec<_>>();
+        let mut failed = false;
+        for key in keys {
+            failed |= self.detach_agent(&key).is_err();
+        }
+        if failed {
+            Err("Could not detach every Herdr Agent")
+        } else {
+            Ok(())
+        }
+    }
+
+    fn detach_agent(&mut self, key: &AgentKey) -> Result<(), &'static str> {
+        let Some(controller) = self.controller.as_mut() else {
+            return Err("Herdr service connection is unavailable");
+        };
+        controller
+            .detach(RequestId::new(), key.clone())
+            .map_err(|_| "Could not detach Herdr Agent")?;
+        self.agent_panes.remove(key);
+        Ok(())
+    }
+
+    fn close_agent(
+        &mut self,
+        key: &AgentKey,
+        confirmation: &Confirmed,
+    ) -> Result<Option<String>, &'static str> {
+        let Some(controller) = self.controller.as_mut() else {
+            return Err("Herdr service connection is unavailable");
+        };
+        controller
+            .close_agent(RequestId::new(), key.clone(), confirmation)
+            .map_err(|_| "Could not close Herdr Agent")?;
+        self.pending_opens.retain(|_, pending| pending.key != *key);
+        Ok(self.agent_panes.remove(key).map(|pane| pane.pane_id))
+    }
+
     pub(super) fn drain(&mut self) -> HerdrDrain {
         let Some(controller) = self.controller.as_mut() else {
             return HerdrDrain::default();
@@ -682,64 +867,17 @@ pub(super) fn sidebar_content(view: SidebarView, runtime: Option<&HerdrRuntime>)
 }
 
 #[cfg(test)]
+mod pane_move_tests;
+#[cfg(test)]
 mod tests {
-    use crate::config::AppConfig;
     use crate::workspace_store::{StoredTab, StoredWorkspace};
-    use gpui::{AppContext, TestAppContext, WindowOptions};
+    use gpui::TestAppContext;
     use termy_core::{TerminalOptions, TerminalSize};
     use termy_herdr_core::{
         AgentId, AgentKey, AgentPhase, ControlOwnership, RequestId, SpaceId, fake_controller,
     };
 
     use super::*;
-
-    fn open_test_terminal_view(
-        cx: &mut TestAppContext,
-    ) -> gpui::WindowHandle<super::super::TerminalView> {
-        cx.update(|app| {
-            app.open_window(WindowOptions::default(), |window, cx| {
-                cx.new(|cx| {
-                    super::super::TerminalView::new(
-                        window,
-                        cx,
-                        AppConfig {
-                            native_tab_persistence: false,
-                            herdr_enabled: Some(true),
-                            ..AppConfig::default()
-                        },
-                    )
-                })
-            })
-            .expect("test terminal window should open");
-        });
-        cx.windows()
-            .into_iter()
-            .find_map(|handle| handle.downcast::<super::super::TerminalView>())
-            .expect("test terminal window should exist")
-    }
-
-    fn native_test_tab(tab_id: super::super::TabId) -> super::super::TerminalTab {
-        super::super::TerminalView::create_native_tab(
-            tab_id,
-            super::super::Terminal::new_test_display(TerminalSize::default()),
-            80,
-            24,
-            None,
-        )
-    }
-
-    fn agent_test_tab(tab_id: super::super::TabId) -> super::super::TerminalTab {
-        super::super::TerminalView::create_native_tab(
-            tab_id,
-            super::super::Terminal::new_herdr_agent(
-                TerminalSize::default(),
-                TerminalOptions::default(),
-            ),
-            80,
-            24,
-            None,
-        )
-    }
 
     #[test]
     fn herdr_sidebar_views_are_mutually_exclusive() {
@@ -888,7 +1026,7 @@ mod tests {
         handle.set_writable(key.clone(), 7);
         let mut runtime = HerdrRuntime::with_controller(controller);
         runtime
-            .request_open_with_id(request_id, key.clone())
+            .request_open_with_id(request_id, key)
             .expect("request fake attach");
         let mut attached = runtime.drain();
         assert_eq!(attached.ready_tabs.len(), 1);
@@ -936,6 +1074,186 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_agent_tab_close_detaches_without_stopping() {
+        let key = AgentKey {
+            space: SpaceId::new("space-a"),
+            agent: AgentId::new("agent-a"),
+        };
+        let (controller, handle) = fake_controller();
+        handle.set_writable(key.clone(), 7);
+        let mut runtime = HerdrRuntime::with_controller(controller);
+        runtime
+            .request_open_with_id(RequestId::new(), key)
+            .expect("request fake attach");
+        let ready = runtime.drain().ready_tabs.remove(0);
+        runtime.register_agent_tab(ready.key, "pane-a".to_string(), ready.attachment);
+
+        runtime
+            .detach_panes(&["pane-a".to_string()])
+            .expect("detach Agent tab");
+
+        assert_eq!(handle.detach_effects(), 1);
+        assert_eq!(handle.close_effects(), 0);
+        assert!(runtime.agent_panes.is_empty());
+    }
+
+    #[test]
+    fn multi_agent_detach_rejects_before_changing_any_binding() {
+        let first = AgentKey {
+            space: SpaceId::new("space-a"),
+            agent: AgentId::new("agent-a"),
+        };
+        let second = AgentKey {
+            space: SpaceId::new("space-b"),
+            agent: AgentId::new("agent-b"),
+        };
+        let (controller, handle) = fake_controller();
+        handle.set_writable(first.clone(), 7);
+        handle.set_writable(second.clone(), 8);
+        let mut runtime = HerdrRuntime::with_controller(controller);
+        runtime
+            .request_open_with_id(RequestId::new(), first)
+            .expect("request first attach");
+        runtime
+            .request_open_with_id(RequestId::new(), second)
+            .expect("request second attach");
+        for (index, ready) in runtime.drain().ready_tabs.into_iter().enumerate() {
+            runtime.register_agent_tab(ready.key, format!("pane-{index}"), ready.attachment);
+        }
+
+        let result = runtime.detach_panes(&["pane-0".to_string(), "pane-1".to_string()]);
+
+        assert_eq!(result, Err("Close Herdr Agent tabs individually"));
+        assert_eq!(handle.detach_effects(), 0);
+        assert_eq!(handle.close_effects(), 0);
+        assert_eq!(runtime.agent_panes.len(), 2);
+    }
+
+    #[gpui::test]
+    fn app_quit_helper_detaches_every_open_agent_without_stopping_any(cx: &mut TestAppContext) {
+        let first = AgentKey {
+            space: SpaceId::new("space-a"),
+            agent: AgentId::new("agent-a"),
+        };
+        let second = AgentKey {
+            space: SpaceId::new("space-b"),
+            agent: AgentId::new("agent-b"),
+        };
+        let (controller, handle) = fake_controller();
+        handle.set_writable(first.clone(), 7);
+        handle.set_writable(second.clone(), 8);
+        let mut runtime = HerdrRuntime::with_controller(controller);
+        runtime
+            .request_open_with_id(RequestId::new(), first)
+            .expect("request first attach");
+        runtime
+            .request_open_with_id(RequestId::new(), second)
+            .expect("request second attach");
+        for (index, ready) in runtime.drain().ready_tabs.into_iter().enumerate() {
+            runtime.register_agent_tab(ready.key, format!("pane-{index}"), ready.attachment);
+        }
+
+        let terminal_view = super::super::TerminalView::open_test_window(cx);
+        terminal_view
+            .update(cx, |view, _window, _cx| view.herdr = Some(runtime))
+            .expect("install fake-backed Herdr runtime");
+
+        cx.update(super::super::TerminalView::detach_all_open_herdr_agents);
+
+        assert_eq!(handle.detach_effects(), 2);
+        assert_eq!(handle.close_effects(), 0);
+        terminal_view
+            .update(cx, |view, _window, _cx| {
+                assert!(view.herdr.as_ref().unwrap().agent_panes.is_empty());
+            })
+            .expect("inspect detached Herdr runtime");
+    }
+
+    #[gpui::test]
+    fn agent_pane_split_entry_is_refused_without_mutation_or_controller_effect(
+        cx: &mut TestAppContext,
+    ) {
+        let key = AgentKey {
+            space: SpaceId::new("space-a"),
+            agent: AgentId::new("agent-a"),
+        };
+        let (controller, handle) = fake_controller();
+        handle.set_writable(key.clone(), 7);
+        let mut runtime = HerdrRuntime::with_controller(controller);
+        runtime
+            .request_open_with_id(RequestId::new(), key)
+            .expect("request fake attach");
+        let ready = runtime.drain().ready_tabs.remove(0);
+        let agent_tab = super::super::TerminalView::agent_test_tab(30);
+        let pane_id = agent_tab.active_pane_id.clone();
+        runtime.register_agent_tab(ready.key, pane_id.clone(), ready.attachment);
+        let terminal_view = super::super::TerminalView::open_test_window(cx);
+        let _ = crate::ui::toast::drain_pending();
+        let effects_before = (
+            handle.create_effects(),
+            handle.attach_effects(),
+            handle.detach_effects(),
+            handle.close_effects(),
+        );
+
+        terminal_view
+            .update(cx, |view, _window, cx| {
+                view.herdr = Some(runtime);
+                view.session.tabs = vec![agent_tab];
+                view.session.active_tab = 0;
+
+                assert!(!view.split_active_pane_vertical(cx));
+                assert_eq!(view.session.tabs[0].panes.len(), 1);
+                assert_eq!(view.active_pane_id(), Some(pane_id.as_str()));
+                assert!(matches!(
+                    view.active_terminal(),
+                    Some(super::super::Terminal::HerdrAgent(_))
+                ));
+                let toasts = crate::ui::toast::drain_pending();
+                assert!(toasts.iter().any(|toast| {
+                    toast.kind == crate::ui::toast::ToastKind::Info
+                        && toast.message == "Herdr Agent tabs cannot be split"
+                }));
+            })
+            .expect("attempt split from Agent pane");
+
+        assert_eq!(
+            (
+                handle.create_effects(),
+                handle.attach_effects(),
+                handle.detach_effects(),
+                handle.close_effects(),
+            ),
+            effects_before
+        );
+    }
+
+    #[test]
+    fn only_confirmed_close_stops_and_removes_the_agent_binding() {
+        let key = AgentKey {
+            space: SpaceId::new("space-a"),
+            agent: AgentId::new("agent-a"),
+        };
+        let (controller, handle) = fake_controller();
+        handle.set_writable(key.clone(), 7);
+        let mut runtime = HerdrRuntime::with_controller(controller);
+        runtime
+            .request_open_with_id(RequestId::new(), key.clone())
+            .expect("request fake attach");
+        let ready = runtime.drain().ready_tabs.remove(0);
+        runtime.register_agent_tab(ready.key, "pane-a".to_string(), ready.attachment);
+
+        let pane_id = runtime
+            .close_agent(&key, &Confirmed::after_user_confirmation())
+            .expect("confirmed close");
+
+        assert_eq!(pane_id.as_deref(), Some("pane-a"));
+        assert_eq!(handle.detach_effects(), 0);
+        assert_eq!(handle.close_effects(), 1);
+        assert!(runtime.agent_panes.is_empty());
+    }
+
+    #[test]
     fn agent_tab_lookup_covers_active_and_stashed_workspaces() {
         let terminal = super::super::Terminal::new_herdr_agent(
             TerminalSize::default(),
@@ -961,6 +1279,34 @@ mod tests {
                 workspace: 1,
                 tab: 0,
             })
+        );
+    }
+
+    #[test]
+    fn workspace_delete_requires_agent_tabs_to_close_first() {
+        let size = TerminalSize::default();
+        let native = super::super::TerminalView::create_native_tab(
+            7,
+            super::super::Terminal::new_test_display(size),
+            80,
+            24,
+            None,
+        );
+        let agent = super::super::TerminalView::create_native_tab(
+            8,
+            super::super::Terminal::new_herdr_agent(size, TerminalOptions::default()),
+            80,
+            24,
+            None,
+        );
+
+        assert_eq!(
+            workspace_delete_policy(&[native]),
+            WorkspaceDeletePolicy::Allow
+        );
+        assert_eq!(
+            workspace_delete_policy(&[agent]),
+            WorkspaceDeletePolicy::RequireAgentTabClose
         );
     }
 
@@ -1000,7 +1346,7 @@ mod tests {
             )],
         )]);
         handle.set_writable(key.clone(), 7);
-        let terminal_view = open_test_terminal_view(cx);
+        let terminal_view = super::super::TerminalView::open_test_window(cx);
 
         terminal_view
             .update(cx, |view, _window, cx| {
@@ -1049,7 +1395,7 @@ mod tests {
         };
         let (controller, handle) = fake_controller();
         handle.set_writable(key.clone(), 7);
-        let terminal_view = open_test_terminal_view(cx);
+        let terminal_view = super::super::TerminalView::open_test_window(cx);
 
         terminal_view
             .update(cx, |view, _window, cx| {
@@ -1058,17 +1404,21 @@ mod tests {
                     .request_open_with_id(RequestId::new(), key.clone())
                     .expect("request fake attach");
                 let ready = runtime.drain().ready_tabs.remove(0);
-                let agent_tab = agent_test_tab(12);
+                let agent_tab = super::super::TerminalView::agent_test_tab(12);
                 let pane_id = agent_tab.active_pane_id.clone();
                 runtime.register_agent_tab(ready.key, pane_id.clone(), ready.attachment);
                 view.herdr = Some(runtime);
-                view.session.tabs = vec![native_test_tab(10), native_test_tab(11)];
+                view.session.tabs = vec![
+                    super::super::TerminalView::native_test_tab(10),
+                    super::super::TerminalView::native_test_tab(11),
+                ];
                 view.session.active_tab = 0;
                 view.session.workspaces = vec![
                     super::super::workspaces::WorkspaceEntry::new(1),
                     super::super::workspaces::WorkspaceEntry::new(2),
                 ];
-                view.session.workspaces[1].tabs = vec![native_test_tab(13), agent_tab];
+                view.session.workspaces[1].tabs =
+                    vec![super::super::TerminalView::native_test_tab(13), agent_tab];
                 view.session.workspaces[1].active_tab = 0;
 
                 view.open_or_focus_agent(key, cx);
@@ -1092,7 +1442,7 @@ mod tests {
         };
         let (controller, handle) = fake_controller();
         handle.set_writable(key.clone(), 7);
-        let terminal_view = open_test_terminal_view(cx);
+        let terminal_view = super::super::TerminalView::open_test_window(cx);
 
         terminal_view
             .update(cx, |view, _window, cx| {
@@ -1101,18 +1451,22 @@ mod tests {
                     .request_open_with_id(RequestId::new(), key.clone())
                     .expect("request fake attach");
                 let ready = runtime.drain().ready_tabs.remove(0);
-                let agent_tab = agent_test_tab(22);
+                let agent_tab = super::super::TerminalView::agent_test_tab(22);
                 let pane_id = agent_tab.active_pane_id.clone();
                 runtime.register_agent_tab(ready.key, pane_id, ready.attachment);
                 view.herdr = Some(runtime);
-                view.session.tabs = vec![native_test_tab(20), native_test_tab(21)];
+                view.session.tabs = vec![
+                    super::super::TerminalView::native_test_tab(20),
+                    super::super::TerminalView::native_test_tab(21),
+                ];
                 view.session.active_tab = 0;
                 let active_pane_before = view.active_pane_id().unwrap().to_string();
                 view.session.workspaces = vec![
                     super::super::workspaces::WorkspaceEntry::new(1),
                     super::super::workspaces::WorkspaceEntry::new(2),
                 ];
-                view.session.workspaces[1].tabs = vec![native_test_tab(23), agent_tab];
+                view.session.workspaces[1].tabs =
+                    vec![super::super::TerminalView::native_test_tab(23), agent_tab];
                 view.session.workspaces[1].pending_restore = Some(StoredWorkspace {
                     name: "broken".to_string(),
                     pinned: false,
