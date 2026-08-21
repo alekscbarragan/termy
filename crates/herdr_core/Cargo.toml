@@ -7,6 +7,9 @@ license = "MIT"
 [lints]
 workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 uuid = { workspace = true }
 

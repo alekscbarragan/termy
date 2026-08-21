@@ -60,7 +60,7 @@ pub struct AgentCatalogEntry {
 
 impl AgentCatalogEntry {
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "test-support")),
         expect(
             dead_code,
             reason = "the real transport constructs catalog entries in P9"
@@ -91,7 +91,7 @@ pub struct SpaceCatalogEntry {
 
 impl SpaceCatalogEntry {
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "test-support")),
         expect(
             dead_code,
             reason = "the real transport constructs catalog entries in P9"
@@ -117,7 +117,7 @@ pub struct CatalogSnapshot {
 
 impl CatalogSnapshot {
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "test-support")),
         expect(
             dead_code,
             reason = "the real transport constructs catalog snapshots in P9"
@@ -131,7 +131,7 @@ impl CatalogSnapshot {
         &self.spaces
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn remove_agent(&mut self, key: &AgentKey) -> bool {
         let Some(space) = self.spaces.iter_mut().find(|space| space.id == key.space) else {
             return false;

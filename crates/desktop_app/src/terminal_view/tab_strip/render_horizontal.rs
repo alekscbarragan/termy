@@ -407,7 +407,8 @@ impl TerminalView {
             cx,
         );
         let show_left_inset_divider = Self::should_render_left_inset_divider(state.overflow_state);
-        let workspace_actions = workspace_sidebar_visible
+        let workspace_actions = self
+            .workspace_sidebar_actions_visible()
             .then(|| self.render_workspace_sidebar_titlebar_actions(&palette, cx));
 
         div()

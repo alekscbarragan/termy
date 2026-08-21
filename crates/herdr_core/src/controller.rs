@@ -129,7 +129,7 @@ pub struct HerdrController {
 }
 
 impl HerdrController {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_transport(transport: impl HerdrTransport + 'static) -> Self {
         let (input_tx, input_rx) = std::sync::mpsc::channel();
         Self {

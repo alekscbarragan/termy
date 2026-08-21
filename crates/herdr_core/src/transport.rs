@@ -7,7 +7,7 @@ use crate::{
 pub struct AttachmentId(u64);
 
 impl AttachmentId {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(value: u64) -> Self {
         Self(value)
     }

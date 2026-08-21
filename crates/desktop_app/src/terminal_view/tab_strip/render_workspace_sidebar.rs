@@ -111,7 +111,7 @@ impl TerminalView {
             .on_hover(cx.listener(|this, hovering: &bool, _window, cx| {
                 this.set_workspace_sidebar_peek_visible(*hovering, cx);
             }))
-            .child(self.render_workspace_sidebar(colors, font_family, sidebar_bg, cx))
+            .child(self.render_sidebar(colors, font_family, sidebar_bg, cx))
             .into_any_element()
     }
 

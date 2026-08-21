@@ -3777,7 +3777,7 @@ impl Render for TerminalView {
             .then(|| self.render_tab_sidebar(window, &colors, &ui_font_family, tabbar_bg, cx));
         let workspace_sidebar = self
             .workspace_sidebar_visible()
-            .then(|| self.render_workspace_sidebar(&colors, &ui_font_family, tabbar_bg, cx));
+            .then(|| self.render_sidebar(&colors, &ui_font_family, tabbar_bg, cx));
         let workspace_sidebar_overlay = self.workspace_sidebar_overlay_visible().then(|| {
             self.render_workspace_sidebar_overlay(&colors, &ui_font_family, tabbar_bg, cx)
         });
