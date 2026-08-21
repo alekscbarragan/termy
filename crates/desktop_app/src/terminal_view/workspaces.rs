@@ -563,6 +563,19 @@ impl TerminalView {
             return false;
         };
         let deleting_active = removed_index == self.session.active_workspace;
+        let delete_policy = {
+            let tabs = if deleting_active {
+                self.session.tabs.as_slice()
+            } else {
+                self.session.workspaces[removed_index].tabs.as_slice()
+            };
+            herdr::workspace_delete_policy(tabs)
+        };
+        if delete_policy == herdr::WorkspaceDeletePolicy::RequireAgentTabClose {
+            crate::ui::toast::info("Close Herdr Agent tabs before deleting this Workspace");
+            self.notify_overlay(cx);
+            return false;
+        }
         let replacement_id = if deleting_active {
             let replacement_index = Self::replacement_workspace_index_before_deletion(
                 removed_index,
