@@ -3,8 +3,10 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+#[cfg(test)]
+use crate::AttachmentConflict;
 use crate::{
-    AgentKey, AttachmentConflict, CatalogSnapshot, CreateAgentFailure, RequestId,
+    AgentKey, CatalogSnapshot, CreateAgentFailure, RequestId,
     transport::{
         AttachmentId, AttachmentOutput, CreateAgentRequest, HerdrTransport, TransportAttachResult,
         TransportCommand, TransportError, TransportNotification,
@@ -37,8 +39,20 @@ pub(crate) struct FakeHerdrTransport {
 }
 
 #[derive(Clone)]
-pub(crate) struct FakeHerdrHandle {
+pub struct FakeHerdrHandle {
     state: Arc<Mutex<FakeState>>,
+}
+
+#[cfg(feature = "test-support")]
+pub type FakeAgentCatalogRow = (crate::AgentId, crate::AgentPhase, crate::ControlOwnership);
+
+#[cfg(feature = "test-support")]
+pub type FakeSpaceCatalogRow = (crate::SpaceId, Vec<FakeAgentCatalogRow>);
+
+#[cfg(feature = "test-support")]
+pub fn fake_controller() -> (crate::HerdrController, FakeHerdrHandle) {
+    let (transport, handle) = FakeHerdrTransport::new();
+    (crate::HerdrController::with_transport(transport), handle)
 }
 
 impl FakeHerdrTransport {
@@ -56,10 +70,12 @@ impl FakeHerdrTransport {
         self.state.lock().expect("lock fake Herdr state")
     }
 
+    #[cfg(test)]
     pub(crate) fn push_notification(&self, notification: TransportNotification) {
         self.state().incoming.push_back(notification);
     }
 
+    #[cfg(test)]
     pub(crate) fn inputs_for_id(&self, attachment: AttachmentId) -> Vec<Vec<u8>> {
         self.state()
             .input_by_attachment
@@ -88,6 +104,27 @@ impl FakeHerdrHandle {
             .push_back(TransportNotification::CatalogSnapshot(snapshot));
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn seed_catalog_rows(&self, spaces: Vec<FakeSpaceCatalogRow>) {
+        self.seed_catalog(CatalogSnapshot::new(
+            spaces
+                .into_iter()
+                .map(|(space, agents)| {
+                    crate::SpaceCatalogEntry::new(
+                        space,
+                        agents
+                            .into_iter()
+                            .map(|(agent, phase, control)| {
+                                crate::AgentCatalogEntry::new(agent, phase, control)
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        ));
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_create_outcome(
         &self,
         request_id: RequestId,
@@ -96,35 +133,41 @@ impl FakeHerdrHandle {
         self.state().create_outcomes.insert(request_id, outcome);
     }
 
+    #[cfg(test)]
     pub(crate) fn create_effects(&self) -> usize {
         self.state().create_effects
     }
 
+    #[cfg(test)]
     pub(crate) fn create_requests(&self) -> Vec<CreateAgentRequest> {
         self.state().create_requests.clone()
     }
 
-    pub(crate) fn set_writable(&self, agent: AgentKey, attachment: u64) {
+    pub fn set_writable(&self, agent: AgentKey, attachment: u64) {
         self.state().attach_outcomes.insert(
             agent,
             TransportAttachResult::Writable(AttachmentId::new(attachment)),
         );
     }
 
+    #[cfg(test)]
     pub(crate) fn set_conflict(&self, agent: AgentKey, conflict: AttachmentConflict) {
         self.state()
             .attach_outcomes
             .insert(agent, TransportAttachResult::Conflict(conflict));
     }
 
+    #[cfg(test)]
     pub(crate) fn attach_requests(&self) -> usize {
         self.state().attach_requests
     }
 
+    #[cfg(test)]
     pub(crate) fn attach_effects(&self) -> usize {
         self.state().attach_effects
     }
 
+    #[cfg(test)]
     pub(crate) fn inputs_for(&self, attachment: u64) -> Vec<Vec<u8>> {
         self.state()
             .input_by_attachment
@@ -133,7 +176,7 @@ impl FakeHerdrHandle {
             .unwrap_or_default()
     }
 
-    pub(crate) fn push_output(&self, attachment: u64, bytes: Vec<u8>) {
+    pub fn push_output(&self, attachment: u64, bytes: Vec<u8>) {
         self.state()
             .incoming
             .push_back(TransportNotification::AttachmentOutput(AttachmentOutput {
@@ -142,18 +185,22 @@ impl FakeHerdrHandle {
             }));
     }
 
+    #[cfg(test)]
     pub(crate) fn detach_effects(&self) -> usize {
         self.state().detach_effects
     }
 
+    #[cfg(test)]
     pub(crate) fn close_effects(&self) -> usize {
         self.state().close_effects
     }
 
+    #[cfg(test)]
     pub(crate) fn fail_next_send(&self) {
         self.state().fail_next_send = true;
     }
 
+    #[cfg(test)]
     pub(crate) fn fail_next_recv(&self) {
         self.state().fail_next_recv = true;
     }

@@ -60,6 +60,7 @@ mod backend;
 mod benchmark;
 mod command_palette;
 mod constants;
+mod herdr;
 mod inline_input;
 mod inspector;
 mod interaction;
@@ -1255,6 +1256,8 @@ pub(crate) enum TabBarVisibility {
 /// The main terminal view component
 pub struct TerminalView {
     session: SessionState,
+    herdr: Option<herdr::HerdrRuntime>,
+    herdr_sidebar_view: herdr::SidebarView,
     workspace_sidebar_enabled: bool,
     workspace_sidebar_width: f32,
     workspace_sidebar_resize_drag: Option<workspaces::WorkspaceSidebarResizeDragState>,
@@ -3773,6 +3776,8 @@ impl TerminalView {
         let plugin_runtime = PluginRuntime::new(config_path.as_deref());
         let mut view = Self {
             session: SessionState::new(),
+            herdr: herdr::HerdrRuntime::from_saved_preference(config.herdr_enabled),
+            herdr_sidebar_view: herdr::SidebarView::default(),
             workspace_sidebar_enabled: config.sidebar_enabled,
             workspace_sidebar_width: Self::clamp_workspace_sidebar_width(config.sidebar_width),
             workspace_sidebar_resize_drag: None,
@@ -4218,6 +4223,8 @@ impl TerminalView {
             self.sync_workspace_sidebar_width_from_config(config.sidebar_width);
         let workspace_sidebar_changed =
             workspace_sidebar_enabled_changed || workspace_sidebar_width_changed;
+        let herdr_enabled_changed =
+            herdr::HerdrRuntime::sync_saved_preference(&mut self.herdr, config.herdr_enabled);
         self.workspace_sidebar_enabled = config.sidebar_enabled;
         if !self.workspace_sidebar_enabled {
             self.workspace_sidebar_collapsed = false;
@@ -4398,6 +4405,7 @@ impl TerminalView {
             || auto_hide_tabbar_changed
             || simple_mode_changed
             || workspace_sidebar_changed
+            || herdr_enabled_changed
         {
             cx.notify();
         }
@@ -4534,6 +4542,7 @@ impl TerminalView {
             self.native_terminal_wakeup_batch = ready_terminal_ids;
             should_redraw
         };
+        should_redraw |= self.process_herdr_events();
         self.sync_plugin_lifecycle_state(self.runtime_uses_tmux(), cx);
 
         if self.clear_stale_kitty_image_state() {
