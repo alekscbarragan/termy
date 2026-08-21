@@ -26,6 +26,7 @@ Termy is a Rust workspace split by ownership boundary, not by implementation con
 - `themes/` (`termy_themes`): bundled theme definitions.
 - `search/` (`termy_search`): reusable terminal search primitives.
 - `ssh_core/` (`termy_ssh_core`): saved SSH host validation, non-secret persistence, OpenSSH launch arguments, and keychain-backed credentials.
+- `herdr_core/` (`termy_herdr_core`): Herdr domain identities, lifecycle vocabulary, exact commands, confirmation witness, and trusted executable vetting.
 
 ## Release, Install, And Support
 

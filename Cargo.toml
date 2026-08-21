@@ -8,6 +8,7 @@ members = [
   "crates/core",
   "crates/desktop_app",
   "crates/ffi",
+  "crates/herdr_core",
   "crates/native_sdk",
   "crates/plugin_runtime",
   "crates/release_core",

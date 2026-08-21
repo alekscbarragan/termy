@@ -12,7 +12,7 @@ Termy is a single repository with several product surfaces. Keep changes in the 
 - `crates/terminal_ui/` owns the GPUI terminal grid and keystroke adapters plus tmux pane display/client support used by the desktop app. Shared headless terminal types are imported directly from `termy_core`.
 - `crates/tmux_control_core/` owns the UI-agnostic tmux control-mode protocol and transport shared by terminal UI and FFI.
 - `crates/ui/` owns Termy's design system in GPUI: theme-derived color tokens, layout metrics, and stateless chrome components. It must stay free of config, command, plugin, and SSH domain crates.
-- `crates/config_core/`, `crates/command_core/`, `crates/theme_core/`, and `crates/search/` own pure domain logic shared by the app, CLI, docs generation, and embedding surfaces.
+- `crates/config_core/`, `crates/command_core/`, `crates/theme_core/`, `crates/search/`, and `crates/herdr_core/` own pure domain logic shared by product surfaces.
 - `crates/ssh_core/` owns saved SSH host validation, non-secret persistence, exact OpenSSH arguments, and system-keychain credential lifecycle.
 - `crates/ffi/` exposes libtermy to C-compatible hosts.
 - `website/` owns the public website and user-facing docs.
@@ -31,7 +31,7 @@ Termy is a single repository with several product surfaces. Keep changes in the 
 - `termy_terminal_ui` (`crates/terminal_ui/`) is the GPUI-facing terminal adapter used by the desktop app.
 - `termy_tmux_control_core` (`crates/tmux_control_core/`) is the shared headless tmux control-mode layer.
 - `termy_ui` (`crates/ui/`) is the GPUI design system: tokens, metrics, and chrome components shared by settings-style surfaces.
-- `termy_command_core`, `termy_config_core`, `termy_theme_core`, `termy_search`, `termy_ssh_core`, and `termy_themes` are pure domain crates.
+- `termy_command_core`, `termy_config_core`, `termy_theme_core`, `termy_search`, `termy_ssh_core`, `termy_herdr_core`, and `termy_themes` are pure domain crates.
 - `termy_ffi` and `termy_native_sdk` are embedding/native-integration surfaces.
 - `termy_cli`, `termy_cli_install_core`, `termy_release_core`, and `termy_auto_update` own command-line, install, release, and update support.
 - Desktop update presentation and toast state live under `crates/desktop_app/src/ui/` because they have no non-desktop consumers.

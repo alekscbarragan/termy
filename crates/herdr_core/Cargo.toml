@@ -1,0 +1,14 @@
+[package]
+name = "termy_herdr_core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[lints]
+workspace = true
+
+[dependencies]
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
