@@ -4,10 +4,12 @@
     "index",
     "tabs",
     "splits-panes",
+    "program-status",
     "search",
     "command-palette",
     "plugins",
     "ssh-hosts",
+    "multiplexer",
     "tmux-sessions",
     "tasks-layouts"
   ],

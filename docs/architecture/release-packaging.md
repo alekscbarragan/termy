@@ -10,13 +10,33 @@ Release packaging is rooted in `scripts/`. GitHub release workflows should call 
 - Windows installer definition: `scripts/installer/termy.iss`
 - Linux tarball and AppImage: `scripts/build-linux.sh`
 - app icon generation: `scripts/generate-icon.sh`
-- release CI: `.github/workflows/release.yml`
+- release artifact CI: `.github/workflows/release.yml`
+- GitHub macOS signing setup: `docs/architecture/macos-release-signing.md`
+- stable release finalization and AUR dispatch: `.github/workflows/finalize-stable-release.yml`
 
 The app version used by packaging scripts comes from `crates/desktop_app/Cargo.toml` unless an explicit version is passed.
 
+Pre-release tags such as `v1.0.0-rc.1` are supported. Artifact file names keep the tag as is, while the Linux deb and RPM package versions become `1.0.0~rc.1` and the AUR `pkgver` becomes `1.0.0rc.1`, so package managers order the pre-release before `1.0.0`. Publish pre-releases with GitHub's pre-release flag so stable finalization (latest release and AUR) skips them. The in-app version still comes from `crates/desktop_app/Cargo.toml`.
+
+## Update installation
+
+The macOS updater stages the new app bundle on the destination filesystem before
+replacing the installed bundle. Installation failures restore the previous bundle;
+if restoration also fails, the error identifies the retained recovery files.
+
+The Linux tarball installer in the updater replaces all three executable entries:
+the `termy` launcher, `termy-bin`, and `termy-cli`. It rejects incomplete archives
+before changing the installation and stages replacements before publishing them
+by rename. Linux in-app update availability remains controlled by the platform gate.
+
+Run the installer regression tests with
+`cargo test -p termy --lib auto_update`. On Unix hosts these also exercise
+Linux archive installation using temporary directories, without updating the
+host's installed application.
+
 ## Artifact Paths
 
-- macOS DMG: `dist/Termy-<version>-macos-<arch>[-signed].dmg`
+- macOS DMG: `dist/Termy-<version>-macos-<arch>[-signed].dmg` (GitHub releases require `-signed`)
 - Windows setup: `target/dist/Termy-<version>-windows-<arch>-Setup.exe`
 - Linux tarball: `target/dist/Termy-<version>-linux-<arch>.tar.gz`
 - Linux AppImage: `target/dist/Termy-<version>-linux-<arch>.AppImage`
@@ -33,19 +53,22 @@ just build-setup -- -Version 0.3.0 -Arch x64 -Target x86_64-pc-windows-msvc
 
 Use `scripts/build-dmg-signed.sh` when a Developer ID signing identity is required. Unsigned DMGs should use `scripts/build-dmg.sh` directly.
 
+The release workflow requires the Developer ID certificate and App Store Connect team API key described in [macOS release signing](macos-release-signing.md). Both macOS architectures must be signed and notarized before the release workflow attaches artifacts. Stable release finalization waits for those signed DMGs.
+
 ## Boundary Rules
 
 - Keep packaging scripts in `scripts/`.
 - Keep generated artifacts out of the repo and under `dist/` or `target/dist/`.
 - Keep release CI aligned with the script outputs.
 - Keep platform-specific installer definitions under `scripts/installer/` unless a platform needs a larger packaging tree.
+- File-manager context-menu payloads belong in `scripts/file-manager/` and must be copied by `scripts/build-linux.sh`, `scripts/build-dmg.sh`, and `scripts/installer/termy.iss`. Do not add a parallel `packaging/` tree for those files.
 
 ## Validation
 
 Run these checks after packaging or release workflow changes:
 
 ```sh
-bash -n scripts/build-dmg.sh scripts/build-dmg-signed.sh scripts/build-linux.sh
+bash -n scripts/build-dmg.sh scripts/build-dmg-signed.sh scripts/setup-macos-signing.sh scripts/build-linux.sh
 pwsh -NoProfile -Command '$null = [System.Management.Automation.Language.Parser]::ParseFile("scripts/build-setup.ps1", [ref]$null, [ref]$null)' # when PowerShell is available
 just check-boundaries
 ```

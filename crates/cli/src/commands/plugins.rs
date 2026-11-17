@@ -11,9 +11,9 @@ use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::Deserialize;
 use tempfile::TempDir;
-use termy_plugin_runtime::{
-    MAX_PLUGIN_SOURCE_BYTES, MAX_PLUGIN_SOURCE_FILES, PluginRuntime, PluginSourceMetadata,
-    valid_plugin_id, validate_plugin_capabilities,
+use termy_core::plugin_runtime::{
+    MAX_PLUGIN_SOURCE_BYTES, MAX_PLUGIN_SOURCE_FILES, PLUGIN_FULL_ACCESS_WARNING, PluginRuntime,
+    PluginSourceMetadata, valid_plugin_id, validate_plugin_capabilities,
 };
 
 use crate::PluginCommand;
@@ -61,6 +61,9 @@ fn add(
         return Err("--ref and --path can only be used with a GitHub source".to_string());
     }
 
+    // Local installs have never asked for confirmation, and scripts rely on
+    // that, so this only prints the warning.
+    eprintln!("{PLUGIN_FULL_ACCESS_WARNING}");
     let installed = plugin_runtime()?.install_from_directory(Path::new(source))?;
     println!(
         "Installed {} ({}) at {}",
@@ -116,13 +119,14 @@ fn list() -> Result<(), String> {
 }
 
 fn dev(path: &Path) -> Result<(), String> {
-    let source = fs::canonicalize(path).map_err(|error| {
+    let source = dunce::canonicalize(path).map_err(|error| {
         format!(
             "failed to resolve plugin source {}: {error}",
             path.display()
         )
     })?;
     let runtime = plugin_runtime()?;
+    eprintln!("{PLUGIN_FULL_ACCESS_WARNING}");
     let installed = runtime.sync_from_directory(&source)?;
     println!(
         "Synced {} ({}) to {}",
@@ -234,8 +238,7 @@ fn status(selected_id: Option<&str>) -> Result<(), String> {
         let version = plugin
             .version
             .as_deref()
-            .map(|version| format!(" v{version}"))
-            .unwrap_or_default();
+            .map_or_default(|version| format!(" v{version}"));
         println!("{}{}  {}  {}", plugin.id, version, status, plugin.name);
         if let Some(source) = plugin.source {
             println!(
@@ -386,8 +389,7 @@ fn title_from_id(id: &str) -> String {
             let mut characters = part.chars();
             let first = characters
                 .next()
-                .map(|character| character.to_ascii_uppercase())
-                .unwrap_or_default();
+                .map_or_default(|character| character.to_ascii_uppercase());
             format!("{first}{}", characters.as_str())
         })
         .collect::<Vec<_>>()
@@ -505,17 +507,14 @@ fn remove(id: &str, yes: bool) -> Result<(), String> {
 }
 
 fn plugin_runtime() -> Result<PluginRuntime, String> {
-    let config_path = termy_config_core::config_path()
+    let config_path = termy_core::config_core::config_path()
         .ok_or_else(|| "Termy config path is unavailable".to_string())?;
     Ok(PluginRuntime::new(Some(&config_path)))
 }
 
 fn print_trusted_code_warning(candidate: &PluginCandidate, source: &GitHubSource, revision: &str) {
-    eprintln!("WARNING: Termy plugins are trusted code.");
-    eprintln!(
-        "`{}` can run arbitrary Bun code with your user permissions.",
-        candidate.name
-    );
+    eprintln!("{PLUGIN_FULL_ACCESS_WARNING}");
+    eprintln!("Plugin: {} ({})", candidate.name, candidate.id);
     eprintln!(
         "Source: {}{} @ {}",
         source.repository_url(),

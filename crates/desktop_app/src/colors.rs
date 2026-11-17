@@ -2,11 +2,10 @@ use crate::config::{
     AppConfig, AppearanceMode, CustomColors, SHELL_DECIDE_THEME_ID, SystemAppearance,
     resolve_active_theme,
 };
-use crate::theme_store;
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb as AnsiRgb};
-use gpui::Rgba;
-use termy_themes as themes;
-use termy_themes::Rgb8;
+use crate::theme_library;
+use gpui_kit::Rgba;
+use termy_core::themes;
+use termy_core::themes::Rgb8;
 
 #[derive(Clone)]
 pub struct TerminalColors {
@@ -56,10 +55,7 @@ impl TerminalColors {
         let mut colors = if theme.eq_ignore_ascii_case(SHELL_DECIDE_THEME_ID) {
             Self::from_theme_colors(fallback)
         } else {
-            if let Some(theme_colors) = theme_store::load_installed_theme_colors(theme)
-                .or_else(|| themes::builtin_theme(theme))
-                .or_else(|| themes::resolve_theme(theme))
-            {
+            if let Some(theme_colors) = theme_library::theme_colors(theme) {
                 Self::from_theme_colors(theme_colors)
             } else {
                 log::warn!("Theme '{theme}' is unavailable; using the built-in fallback");
@@ -96,58 +92,12 @@ impl TerminalColors {
         }
     }
 
-    /// Convert an alacritty ANSI color to a GPUI Rgba
-    pub fn convert(&self, color: AnsiColor) -> Rgba {
-        match color {
-            AnsiColor::Named(named) => self.named_color(named),
-            AnsiColor::Spec(AnsiRgb { r, g, b }) => rgba(r, g, b),
-            AnsiColor::Indexed(idx) => self.indexed_color(idx),
-        }
-    }
-
-    fn named_color(&self, color: NamedColor) -> Rgba {
-        match color {
-            NamedColor::Black => self.ansi[0],
-            NamedColor::Red => self.ansi[1],
-            NamedColor::Green => self.ansi[2],
-            NamedColor::Yellow => self.ansi[3],
-            NamedColor::Blue => self.ansi[4],
-            NamedColor::Magenta => self.ansi[5],
-            NamedColor::Cyan => self.ansi[6],
-            NamedColor::White => self.ansi[7],
-            NamedColor::BrightBlack => self.ansi[8],
-            NamedColor::BrightRed => self.ansi[9],
-            NamedColor::BrightGreen => self.ansi[10],
-            NamedColor::BrightYellow => self.ansi[11],
-            NamedColor::BrightBlue => self.ansi[12],
-            NamedColor::BrightMagenta => self.ansi[13],
-            NamedColor::BrightCyan => self.ansi[14],
-            NamedColor::BrightWhite => self.ansi[15],
-            NamedColor::Foreground => self.foreground,
-            NamedColor::Background => self.background,
-            NamedColor::Cursor => self.cursor,
-            _ => self.foreground,
-        }
-    }
-
     pub(crate) fn indexed_color(&self, idx: u8) -> Rgba {
-        match idx {
-            // Standard ANSI colors
-            0..=15 => self.ansi[idx as usize],
-            // 216 color cube (6x6x6)
-            16..=231 => {
-                let idx = idx - 16;
-                let r = (idx / 36) % 6;
-                let g = (idx / 6) % 6;
-                let b = idx % 6;
-                let to_component = |c: u8| if c == 0 { 0 } else { 55 + c * 40 };
-                rgba(to_component(r), to_component(g), to_component(b))
-            }
-            // Grayscale (24 shades)
-            232..=255 => {
-                let gray = 8 + (idx - 232) * 10;
-                rgba(gray, gray, gray)
-            }
+        if idx < 16 {
+            self.ansi[idx as usize]
+        } else {
+            let color = termy_core::TerminalQueryColors::default().indexed_color(idx);
+            rgba(color.r, color.g, color.b)
         }
     }
 }

@@ -3,7 +3,7 @@ use crate::config;
 use crate::settings_view::{SettingsSection, SettingsWindow};
 use crate::terminal_view::TerminalView;
 use crate::terminal_view::initial_window_background_appearance;
-use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui_kit::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 
 pub(crate) fn open_config_file() -> Result<(), String> {
     config::open_config_file().map_err(|error| error.to_string())
@@ -37,11 +37,7 @@ pub(crate) fn open_settings_or_config_file(cx: &mut App) -> Result<(), String> {
 }
 
 pub(crate) fn focus_existing_window<V: 'static>(cx: &mut App) -> bool {
-    if let Some(window_handle) = cx
-        .windows()
-        .into_iter()
-        .find_map(|handle| handle.downcast::<V>())
-    {
+    if let Some(window_handle) = preferred_window::<V>(cx) {
         window_handle
             .update(cx, |_view, window, _cx| {
                 window.activate_window();
@@ -52,38 +48,42 @@ pub(crate) fn focus_existing_window<V: 'static>(cx: &mut App) -> bool {
     }
 }
 
+fn preferred_window<V: 'static>(cx: &App) -> Option<gpui_kit::WindowHandle<V>> {
+    cx.active_window()
+        .and_then(|handle| handle.downcast::<V>())
+        .or_else(|| {
+            cx.windows()
+                .into_iter()
+                .find_map(|handle| handle.downcast::<V>())
+        })
+}
+
 pub(crate) fn has_window<V: 'static>(cx: &App) -> bool {
     cx.windows()
         .into_iter()
         .any(|handle| handle.downcast::<V>().is_some())
 }
 
-pub(crate) fn update_open_settings_windows(
-    cx: &mut App,
-    mut update: impl FnMut(&mut SettingsWindow, &mut gpui::Context<SettingsWindow>),
-) {
-    for settings_window in cx
-        .windows()
-        .into_iter()
-        .filter_map(|handle| handle.downcast::<SettingsWindow>())
-    {
-        let _ = settings_window.update(cx, |view, _window, cx| update(view, cx));
+pub(crate) fn close_terminal_window<V: 'static>(handle: gpui_kit::AnyWindowHandle, cx: &mut App) {
+    let windows = cx.windows();
+    if !windows.contains(&handle) {
+        return;
     }
-}
-
-pub(crate) fn refresh_open_terminal_theme_assets(cx: &mut App) {
-    for terminal_window in cx
-        .windows()
+    let terminal_count = windows
         .into_iter()
-        .filter_map(|handle| handle.downcast::<TerminalView>())
-    {
-        let _ = terminal_window.update(cx, |view, _window, cx| {
-            view.reload_theme_assets(cx);
-        });
+        .filter(|window| window.downcast::<V>().is_some())
+        .count();
+    log::debug!("Closing terminal window; {terminal_count} terminal windows remain");
+    if terminal_count <= 1 {
+        cx.quit();
+    } else {
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
     }
 }
 
 pub(crate) fn close_settings_windows(cx: &mut App) {
+    #[cfg(all(target_os = "macos", not(test)))]
+    crate::native_settings::close();
     for settings_window in cx
         .windows()
         .into_iter()
@@ -98,11 +98,7 @@ pub(crate) fn open_new_tab_in_main_window(
     command: Option<String>,
     dir: Option<String>,
 ) -> Result<(), String> {
-    let Some(main_window) = cx
-        .windows()
-        .into_iter()
-        .find_map(|handle| handle.downcast::<TerminalView>())
-    else {
+    let Some(main_window) = preferred_window::<TerminalView>(cx) else {
         return Err("No main window available for new tab deeplink".to_string());
     };
 
@@ -127,6 +123,11 @@ fn open_settings_window_with_section(
     section: Option<SettingsSection>,
     cx: &mut App,
 ) -> Result<(), String> {
+    // macOS 13 and later get the SwiftUI window for the sections it draws.
+    #[cfg(all(target_os = "macos", not(test)))]
+    if crate::native_settings::supported() && crate::native_settings::open(section, cx) {
+        return Ok(());
+    }
     // Key-repeat and repeated action dispatch should raise the existing settings window,
     // not spawn duplicate windows.
     if section.is_none() && focus_existing_window::<SettingsWindow>(cx) {
@@ -166,21 +167,21 @@ fn open_settings_window_with_section(
     let window_background = initial_window_background_appearance(&settings_load.config);
 
     #[cfg(target_os = "macos")]
-    let titlebar = Some(gpui::TitlebarOptions {
+    let titlebar = Some(gpui_kit::TitlebarOptions {
         title: Some("Settings".into()),
         appears_transparent: true,
-        traffic_light_position: Some(gpui::point(px(12.0), px(10.0))),
+        traffic_light_position: Some(gpui_kit::point(px(12.0), px(10.0))),
     });
     #[cfg(target_os = "windows")]
-    let titlebar = Some(gpui::TitlebarOptions {
+    let titlebar = Some(gpui_kit::TitlebarOptions {
         title: Some("Settings".into()),
         appears_transparent: false,
         traffic_light_position: None,
     });
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let titlebar = Some(gpui::TitlebarOptions {
+    let titlebar = Some(gpui_kit::TitlebarOptions {
         title: Some("Settings".into()),
-        appears_transparent: true,
+        appears_transparent: false,
         traffic_light_position: None,
     });
 
@@ -190,11 +191,28 @@ fn open_settings_window_with_section(
             titlebar,
             window_background,
             app_id: Some(APP_ID.to_string()),
+            // Match the terminal window: let KDE/the window manager own the frame.
+            #[cfg(target_os = "linux")]
+            window_decorations: Some(gpui_kit::WindowDecorations::Server),
             is_resizable: true,
             window_min_size: Some(minimum_window_size),
             ..Default::default()
         },
         |window, cx| {
+            #[cfg(target_os = "linux")]
+            {
+                window.set_window_title("Settings");
+            }
+            // The settings window keeps the OS caption; registering lets its
+            // DWM frame follow the Termy theme.
+            #[cfg(target_os = "windows")]
+            crate::native_sdk::win32_window::register_window(window, "Settings");
+            // Opening a window without a tabbing identifier turns AppKit's
+            // automatic tabbing off app-wide; native terminal tabs need it on.
+            #[cfg(target_os = "macos")]
+            if crate::native_window_tabs_enabled(&settings_load.config) {
+                crate::macos_native_tabs::allow_automatic_window_tabbing();
+            }
             cx.new(|cx| {
                 let mut view = SettingsWindow::new(window, cx);
                 if let Some(section) = section {
@@ -211,7 +229,7 @@ fn open_settings_window_with_section(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AnyWindowHandle, TestAppContext};
+    use gpui_kit::{AnyWindowHandle, TestAppContext};
 
     fn settings_window_count(cx: &TestAppContext) -> usize {
         cx.windows()
@@ -220,7 +238,7 @@ mod tests {
             .count()
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn open_settings_window_reuses_existing_window(cx: &mut TestAppContext) {
         assert_eq!(settings_window_count(cx), 0);
 
@@ -251,7 +269,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn open_settings_window_does_not_duplicate_when_called_from_settings_update(
         cx: &mut TestAppContext,
     ) {

@@ -1,13 +1,15 @@
 use super::*;
-use crate::theme_store;
-use gpui::Modifiers;
-use gpui::point;
+use crate::theme_library;
+use gpui_kit::Modifiers;
+use gpui_kit::point;
 use state::{
     CommandPaletteCommandIntent, CommandPaletteItem, CommandPaletteItemKind,
-    CommandPaletteScrollDirection, command_palette_next_scroll_y, command_palette_target_scroll_y,
-    ordered_theme_ids_for_palette,
+    CommandPaletteScrollDirection, ReleaseListState, command_palette_next_scroll_y,
+    command_palette_target_scroll_y, ordered_theme_ids_for_palette,
 };
-use termy_command_core::{CommandAvailability, CommandCapabilities, CommandUnavailableReason};
+use termy_core::command_core::{
+    CommandAvailability, CommandCapabilities, CommandUnavailableReason,
+};
 
 mod fuzzy;
 mod plugins;
@@ -217,7 +219,7 @@ impl TerminalView {
     fn command_palette_core_command_items_for_state(
         capabilities: CommandCapabilities,
     ) -> Vec<CommandPaletteItem> {
-        CommandAction::palette_entries()
+        CommandAction::palette_entries_for_runtime(capabilities.tmux_runtime_active)
             .into_iter()
             .map(|entry| {
                 Self::command_palette_command_item_for_state(
@@ -236,6 +238,19 @@ impl TerminalView {
         Self::command_palette_core_command_items_for_state(capabilities)
     }
 
+    /// Commands that only make sense while the built-in multiplexer runs.
+    fn command_palette_multiplexer_items(&self, cx: &App) -> Option<CommandPaletteItem> {
+        self.multiplexer.as_ref()?;
+        let detached = crate::multiplexer::detached_windows(cx);
+        Some(CommandPaletteItem::command_with_state(
+            "Reopen Detached Window",
+            "restore closed window multiplexer background sessions running",
+            CommandAction::ReopenDetachedWindow,
+            detached > 0,
+            (detached == 0).then_some("None detached"),
+        ))
+    }
+
     fn command_palette_items_for_mode(
         &mut self,
         mode: CommandPaletteMode,
@@ -245,6 +260,7 @@ impl TerminalView {
             CommandPaletteMode::Commands => {
                 let mut items =
                     Self::command_palette_command_items_for_state(self.command_capabilities());
+                items.extend(self.command_palette_multiplexer_items(cx));
                 items.push(CommandPaletteItem::manage_ssh_hosts());
                 let ssh_enabled = self.runtime_kind() == RuntimeKind::Native;
                 items.extend(
@@ -253,6 +269,7 @@ impl TerminalView {
                         .map(|host| CommandPaletteItem::ssh_host(host, ssh_enabled)),
                 );
                 items.extend(self.command_palette_plugin_items(cx));
+                items.extend(self.command_palette_visible_task_items());
                 items
             }
             CommandPaletteMode::Themes => self.command_palette_theme_items(),
@@ -275,6 +292,20 @@ impl TerminalView {
                 self.command_palette_plugin_input_items()
             }
             CommandPaletteMode::AppInfo => self.command_palette_app_info_items(),
+            CommandPaletteMode::Releases => self.command_palette_release_items(),
+        }
+    }
+
+    fn command_palette_release_items(&self) -> Vec<CommandPaletteItem> {
+        match &self.command_palette.release_list {
+            ReleaseListState::Ready(rows) => rows
+                .iter()
+                .cloned()
+                .map(CommandPaletteItem::release_notes)
+                .collect(),
+            ReleaseListState::Idle | ReleaseListState::Loading | ReleaseListState::Failed(_) => {
+                Vec::new()
+            }
         }
     }
 
@@ -419,31 +450,44 @@ impl TerminalView {
         }
     }
 
+    /// Tasks runnable right now: global tasks always, layout-scoped tasks only
+    /// when their layout is loaded. Shared by the Tasks browser and the
+    /// Commands root list so both agree on what can run.
+    fn command_palette_visible_task_items(&self) -> Vec<CommandPaletteItem> {
+        Self::visible_task_items_for_state(&self.tasks, self.current_named_layout.as_deref())
+    }
+
+    fn visible_task_items_for_state(
+        tasks: &[TaskConfig],
+        current_layout: Option<&str>,
+    ) -> Vec<CommandPaletteItem> {
+        tasks
+            .iter()
+            .filter(|task| match (task.layout.as_deref(), current_layout) {
+                (None, _) => true,
+                (Some(task_layout), Some(current_layout)) => {
+                    task_layout.eq_ignore_ascii_case(current_layout)
+                }
+                (Some(_), None) => false,
+            })
+            .map(|task| {
+                CommandPaletteItem::task(
+                    task.name.as_str(),
+                    task.command.as_str(),
+                    task.working_dir.as_deref(),
+                    task.layout.as_deref(),
+                )
+            })
+            .collect()
+    }
+
     fn command_palette_task_items(&self) -> Vec<CommandPaletteItem> {
         let query = self.command_palette.input().text().trim();
         let current_layout = self.current_named_layout.as_deref();
 
         match self.command_palette.task_intent() {
             TaskIntent::Browse => {
-                let mut items = self
-                    .tasks
-                    .iter()
-                    .filter(|task| match (task.layout.as_deref(), current_layout) {
-                        (None, _) => true,
-                        (Some(task_layout), Some(current_layout)) => {
-                            task_layout.eq_ignore_ascii_case(current_layout)
-                        }
-                        (Some(_), None) => false,
-                    })
-                    .map(|task| {
-                        CommandPaletteItem::task(
-                            task.name.as_str(),
-                            task.command.as_str(),
-                            task.working_dir.as_deref(),
-                            task.layout.as_deref(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
+                let mut items = self.command_palette_visible_task_items();
 
                 if query.is_empty() {
                     items.insert(
@@ -582,7 +626,7 @@ impl TerminalView {
     }
 
     fn command_palette_theme_items(&self) -> Vec<CommandPaletteItem> {
-        let theme_ids = theme_store::load_installed_theme_ids();
+        let theme_ids = theme_library::available_theme_ids();
 
         ordered_theme_ids_for_palette(theme_ids, &self.theme_id)
             .into_iter()
@@ -620,6 +664,9 @@ impl TerminalView {
         if mode == CommandPaletteMode::Commands {
             self.reload_saved_ssh_hosts();
         }
+        if mode == CommandPaletteMode::Releases {
+            self.schedule_release_list_fetch(cx);
+        }
         let items = self.command_palette_items_for_mode(mode, cx);
         if mode == CommandPaletteMode::PluginInputs && self.plugin_input_uses_free_text() {
             self.command_palette.set_items_unfiltered(items);
@@ -637,6 +684,44 @@ impl TerminalView {
 
         self.reset_cursor_blink_phase();
         self.notify_for_command_palette_event(notify_event, cx);
+    }
+
+    fn schedule_release_list_fetch(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.command_palette.release_list, ReleaseListState::Idle) {
+            return;
+        }
+
+        self.command_palette.release_list_generation =
+            self.command_palette.release_list_generation.wrapping_add(1);
+        let generation = self.command_palette.release_list_generation;
+        self.command_palette.release_list = ReleaseListState::Loading;
+
+        let bg = cx
+            .background_executor()
+            .spawn(async { crate::ui::release_notes::fetch_release_list() });
+        cx.spawn(async move |this, cx| {
+            let result = bg.await;
+            let _ = cx.update(|cx| {
+                this.update(cx, |view, cx| {
+                    if view.command_palette.mode() != CommandPaletteMode::Releases
+                        || view.command_palette.release_list_generation != generation
+                    {
+                        return;
+                    }
+                    view.command_palette.release_list = match result {
+                        Ok(releases) => {
+                            ReleaseListState::Ready(crate::ui::release_notes::release_list_rows(
+                                &releases,
+                                crate::APP_VERSION,
+                            ))
+                        }
+                        Err(message) => ReleaseListState::Failed(message),
+                    };
+                    view.refresh_command_palette_items_for_current_mode(cx);
+                })
+            });
+        })
+        .detach();
     }
 
     pub(super) fn set_command_palette_mode(
@@ -667,6 +752,8 @@ impl TerminalView {
         }
 
         let _ = self.close_terminal_context_menu(cx);
+        // Typing goes to the palette, not the AppKit search field.
+        self.release_native_search_focus();
         let was_open = self.command_palette.is_open();
         if !was_open {
             self.command_palette.reload_recents();
@@ -818,8 +905,10 @@ impl TerminalView {
 
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
-                smol::Timer::after(Duration::from_millis(16)).await;
-                let Ok(Ok(keep_animating)) = cx.update(|cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let Ok(keep_animating) = cx.update(|cx| {
                     this.update(cx, |view, cx| {
                         let changed = view.tick_command_palette_scroll_animation();
                         if changed {
@@ -856,7 +945,7 @@ impl TerminalView {
         let scroll_handle = self.command_palette.base_scroll_handle();
         let offset = scroll_handle.offset();
         let current_y = -Into::<f32>::into(offset.y);
-        let max_offset_from_handle: f32 = scroll_handle.max_offset().height.into();
+        let max_offset_from_handle: f32 = scroll_handle.max_offset().y.into();
         let max_scroll = max_offset_from_handle
             .max(self.command_palette.scroll_max_y())
             .max(0.0);
@@ -1079,6 +1168,7 @@ impl TerminalView {
             CommandPaletteMode::Tasks => CommandPaletteEscapeAction::BackToCommands,
             CommandPaletteMode::PluginInputs => CommandPaletteEscapeAction::BackFromPluginInput,
             CommandPaletteMode::AppInfo => CommandPaletteEscapeAction::BackToCommands,
+            CommandPaletteMode::Releases => CommandPaletteEscapeAction::BackToCommands,
         }
     }
 
@@ -1307,15 +1397,19 @@ impl TerminalView {
                 cx,
             ),
             CommandPaletteItemKind::AppInfoEntry { label, value } => {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(value));
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(value));
                 crate::ui::toast::success(format!("Copied {label}"));
                 self.notify_overlay(cx);
             }
             CommandPaletteItemKind::AppInfoCopyAll { payload } => {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(payload));
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(payload));
                 crate::ui::toast::success("Copied app info to clipboard");
                 self.close_command_palette(cx);
                 self.notify_overlay(cx);
+            }
+            CommandPaletteItemKind::ReleaseNotes { tag } => {
+                self.close_command_palette(cx);
+                self.open_release_notes(tag, cx);
             }
         }
     }
@@ -1325,7 +1419,7 @@ impl TerminalView {
         task_name: &str,
         command: &str,
         working_dir: Option<&str>,
-        layout_name: Option<&str>,
+        _layout_name: Option<&str>,
         cx: &mut Context<Self>,
     ) {
         let command = command.trim();
@@ -1360,12 +1454,6 @@ impl TerminalView {
         };
         terminal.write_input(command_input.as_bytes());
         cx.notify();
-        match layout_name {
-            Some(layout_name) => crate::ui::toast::success(format!(
-                "Started task \"{task_name}\" for layout \"{layout_name}\""
-            )),
-            None => crate::ui::toast::success(format!("Started task \"{task_name}\"")),
-        }
         self.notify_overlay(cx);
     }
 
@@ -1439,18 +1527,11 @@ impl TerminalView {
             keybind: None,
         };
 
-        match config::upsert_task(task.clone()) {
+        match config::upsert_task(task) {
             Ok(()) => {
                 self.command_palette.set_task_intent(TaskIntent::Browse);
                 self.close_command_palette(cx);
                 self.reload_config(cx);
-                match task.layout.as_deref() {
-                    Some(layout_name) => crate::ui::toast::success(format!(
-                        "Saved task \"{}\" for layout \"{}\"",
-                        task.name, layout_name
-                    )),
-                    None => crate::ui::toast::success(format!("Saved task \"{}\"", task.name)),
-                }
                 self.notify_overlay(cx);
             }
             Err(error) => {
@@ -1509,7 +1590,6 @@ impl TerminalView {
         match self.save_current_workspace_as_named_layout(layout_name) {
             Ok(()) => {
                 self.close_command_palette(cx);
-                crate::ui::toast::success(format!("Saved layout \"{}\"", layout_name.trim()));
                 self.notify_overlay(cx);
             }
             Err(error) => {
@@ -1523,7 +1603,6 @@ impl TerminalView {
         match self.load_named_layout(layout_name, cx) {
             Ok(()) => {
                 self.close_command_palette(cx);
-                crate::ui::toast::success(format!("Loaded layout \"{layout_name}\""));
                 self.notify_overlay(cx);
             }
             Err(error) => {
@@ -1573,11 +1652,6 @@ impl TerminalView {
         match self.rename_named_layout(current_layout_name, next_layout_name) {
             Ok(()) => {
                 self.close_command_palette(cx);
-                crate::ui::toast::success(format!(
-                    "Renamed layout \"{}\" to \"{}\"",
-                    current_layout_name,
-                    next_layout_name.trim()
-                ));
                 self.notify_overlay(cx);
             }
             Err(error) => {
@@ -1602,7 +1676,6 @@ impl TerminalView {
         match self.delete_named_layout(layout_name) {
             Ok(()) => {
                 self.close_command_palette(cx);
-                crate::ui::toast::success(format!("Deleted layout \"{layout_name}\""));
                 self.notify_overlay(cx);
             }
             Err(error) => {
@@ -1634,12 +1707,10 @@ impl TerminalView {
         match self.persist_theme_selection(theme_id, cx) {
             Ok(true) => {
                 self.close_command_palette(cx);
-                crate::ui::toast::success(format!("Theme set to {}", self.theme_id));
                 self.notify_overlay(cx);
             }
             Ok(false) => {
                 self.close_command_palette(cx);
-                crate::ui::toast::info(format!("Theme already set to {theme_id}"));
                 self.notify_overlay(cx);
             }
             Err(error) => {
@@ -1679,81 +1750,6 @@ impl TerminalView {
         }
 
         self.execute_command_action(action, false, window, cx);
-
-        if keep_open {
-            return;
-        }
-
-        match action {
-            CommandAction::OpenConfig => {
-                crate::ui::toast::info("Opened settings file");
-                self.notify_overlay(cx);
-            }
-            CommandAction::PrettifyConfig => {
-                crate::ui::toast::success("Prettified settings file");
-                self.notify_overlay(cx);
-            }
-            CommandAction::NewTab => crate::ui::toast::success("Opened new tab"),
-            CommandAction::CloseTab => crate::ui::toast::info("Closed active tab"),
-            CommandAction::ClosePaneOrTab => crate::ui::toast::info("Closed active pane or tab"),
-            CommandAction::ZoomIn => crate::ui::toast::info("Zoomed in"),
-            CommandAction::ZoomOut => crate::ui::toast::info("Zoomed out"),
-            CommandAction::ZoomReset => crate::ui::toast::info("Zoom reset"),
-            CommandAction::ImportColors => {}
-            CommandAction::Quit
-            | CommandAction::SwitchTheme
-            | CommandAction::ManageTmuxSessions
-            | CommandAction::ManageSavedLayouts
-            | CommandAction::RunTask
-            | CommandAction::AppInfo
-            | CommandAction::RestartApp
-            | CommandAction::RenameTab
-            | CommandAction::MoveTabLeft
-            | CommandAction::MoveTabRight
-            | CommandAction::SwitchTabLeft
-            | CommandAction::SwitchTabRight
-            | CommandAction::CycleTabs
-            | CommandAction::SwitchToTab1
-            | CommandAction::SwitchToTab2
-            | CommandAction::SwitchToTab3
-            | CommandAction::SwitchToTab4
-            | CommandAction::SwitchToTab5
-            | CommandAction::SwitchToTab6
-            | CommandAction::SwitchToTab7
-            | CommandAction::SwitchToTab8
-            | CommandAction::SwitchToTab9
-            | CommandAction::SplitPaneVertical
-            | CommandAction::SplitPaneHorizontal
-            | CommandAction::ClosePane
-            | CommandAction::FocusPaneLeft
-            | CommandAction::FocusPaneRight
-            | CommandAction::FocusPaneUp
-            | CommandAction::FocusPaneDown
-            | CommandAction::FocusPaneNext
-            | CommandAction::FocusPanePrevious
-            | CommandAction::ResizePaneLeft
-            | CommandAction::ResizePaneRight
-            | CommandAction::ResizePaneUp
-            | CommandAction::ResizePaneDown
-            | CommandAction::TogglePaneZoom
-            | CommandAction::CheckForUpdates
-            | CommandAction::ToggleCommandPalette
-            | CommandAction::Copy
-            | CommandAction::Paste
-            | CommandAction::SelectAll
-            | CommandAction::OpenSearch
-            | CommandAction::CloseSearch
-            | CommandAction::SearchNext
-            | CommandAction::SearchPrevious
-            | CommandAction::ToggleSearchCaseSensitive
-            | CommandAction::ToggleSearchRegex
-            | CommandAction::OpenSettings
-            | CommandAction::MinimizeWindow
-            | CommandAction::InstallCli
-            | CommandAction::ToggleTabBarVisibility
-            | CommandAction::ToggleWorkspaceSidebar
-            | CommandAction::ToggleInspector => {}
-        }
     }
 
     fn command_palette_should_stay_open(action: CommandAction) -> bool {
@@ -1763,6 +1759,7 @@ impl TerminalView {
                 | CommandAction::ManageTmuxSessions
                 | CommandAction::ManageSavedLayouts
                 | CommandAction::RunTask
+                | CommandAction::BrowseReleaseNotes
         )
     }
 }
@@ -1770,6 +1767,35 @@ impl TerminalView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui_kit::test]
+    fn palette_keyboard_input_and_dismissal(cx: &mut gpui_kit::TestAppContext) {
+        let config = crate::config::AppConfig {
+            auto_update: false,
+            native_tab_persistence: false,
+            tmux_enabled: false,
+            ..Default::default()
+        };
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::keybindings::install_keybindings(cx, &config, false);
+        });
+        let (view, cx) =
+            cx.add_window_view(|window, cx| TerminalView::new_for_window(window, cx, config, true));
+        cx.simulate_keystrokes(if cfg!(target_os = "windows") {
+            "ctrl-shift-p"
+        } else {
+            "secondary-p"
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.is_command_palette_open()));
+        cx.simulate_input("split");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.command_palette.input().text(), "split");
+        });
+        cx.simulate_keystrokes("escape");
+        view.read_with(cx, |view, _| assert!(!view.is_command_palette_open()));
+    }
 
     #[test]
     fn escape_action_is_mode_dependent() {
@@ -1822,6 +1848,16 @@ mod tests {
                 TaskIntent::CreateGlobalInput,
             ),
             CommandPaletteEscapeAction::BackToTaskBrowse
+        );
+        assert_eq!(
+            TerminalView::command_palette_escape_action(
+                CommandPaletteMode::Releases,
+                TmuxSessionIntent::AttachOrSwitch,
+                CommandPaletteCommandIntent::Browse,
+                SavedLayoutIntent::Browse,
+                TaskIntent::Browse,
+            ),
+            CommandPaletteEscapeAction::BackToCommands
         );
     }
 
@@ -1930,6 +1966,9 @@ mod tests {
         assert!(TerminalView::command_palette_should_stay_open(
             CommandAction::RunTask
         ));
+        assert!(TerminalView::command_palette_should_stay_open(
+            CommandAction::BrowseReleaseNotes
+        ));
         assert!(!TerminalView::command_palette_should_stay_open(
             CommandAction::NewTab
         ));
@@ -1956,6 +1995,23 @@ mod tests {
             tmux_runtime_active: tmux_enabled,
             install_cli_available,
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tmux_runtime_exposes_windows_commands_in_palette() {
+        let native =
+            TerminalView::command_palette_core_command_items_for_state(test_caps(true, false));
+        let tmux =
+            TerminalView::command_palette_core_command_items_for_state(test_caps(true, true));
+        let is_manage = |item: &CommandPaletteItem| {
+            matches!(
+                item.kind,
+                CommandPaletteItemKind::Command(CommandAction::ManageTmuxSessions)
+            )
+        };
+        assert!(!native.iter().any(is_manage));
+        assert!(tmux.iter().any(is_manage));
     }
 
     #[test]
@@ -2011,10 +2067,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        #[cfg(not(target_os = "windows"))]
         assert_eq!(filtered_actions, vec![CommandAction::ManageTmuxSessions]);
-        #[cfg(target_os = "windows")]
-        assert!(filtered_actions.is_empty());
     }
 
     #[test]
@@ -2113,5 +2166,72 @@ mod tests {
         assert!(TerminalView::palette_task_name_is_valid("build"));
         assert!(TerminalView::palette_task_name_is_valid(" build "));
         assert!(!TerminalView::palette_task_name_is_valid("build.web"));
+    }
+
+    fn task_config(name: &str, layout: Option<&str>) -> TaskConfig {
+        TaskConfig {
+            name: name.to_string(),
+            command: format!("echo {name}"),
+            layout: layout.map(ToOwned::to_owned),
+            working_dir: None,
+            keybind: None,
+        }
+    }
+
+    fn visible_task_titles(tasks: &[TaskConfig], current_layout: Option<&str>) -> Vec<String> {
+        TerminalView::visible_task_items_for_state(tasks, current_layout)
+            .iter()
+            .map(|item| item.title.clone())
+            .collect()
+    }
+
+    #[test]
+    fn visible_task_items_follow_current_layout() {
+        let tasks = vec![
+            task_config("build", None),
+            task_config("migrate", Some("dashboard")),
+            task_config("seed", Some("backend")),
+        ];
+
+        assert_eq!(
+            visible_task_titles(&tasks, None),
+            vec!["build".to_string()],
+            "without a loaded layout only global tasks are visible"
+        );
+        assert_eq!(
+            visible_task_titles(&tasks, Some("dashboard")),
+            vec!["build".to_string(), "migrate [dashboard]".to_string()],
+            "the loaded layout unlocks its own tasks"
+        );
+        assert_eq!(
+            visible_task_titles(&tasks, Some("DASHBOARD")),
+            vec!["build".to_string(), "migrate [dashboard]".to_string()],
+            "layout matching is case-insensitive"
+        );
+    }
+
+    #[test]
+    fn root_search_finds_tasks_by_name_alongside_commands() {
+        let mut items =
+            TerminalView::command_palette_core_command_items_for_state(test_caps(true, true));
+        items.extend(TerminalView::visible_task_items_for_state(
+            &[task_config("build", None)],
+            None,
+        ));
+
+        let matches = super::state::rank_command_palette_items(
+            &items,
+            "build",
+            &super::recents::CommandPaletteRecents::default(),
+            super::state::CommandPaletteRanking::ByScore,
+        );
+
+        assert!(
+            matches.iter().any(|matched| matches!(
+                items[matched.item_index].kind,
+                CommandPaletteItemKind::Task { .. }
+            )),
+            "task named 'build' should match query 'build' in the root list"
+        );
     }
 }

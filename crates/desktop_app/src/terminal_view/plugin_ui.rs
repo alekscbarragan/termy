@@ -7,8 +7,8 @@ use crate::text_input::{
     MultilineTextInputElement, TextInputAlignment, TextInputElement, TextInputProvider,
     TextInputState,
 };
-use gpui::prelude::FluentBuilder;
-use gpui::{
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::{
     AnyElement, AnyWindowHandle, App, AppContext, AsyncApp, ClipboardItem, Context, FocusHandle,
     Focusable, Font, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, ParentElement, Render, Rgba, ScrollHandle, SharedString,
@@ -16,7 +16,7 @@ use gpui::{
 };
 use serde_json::Value;
 use std::{borrow::Cow, collections::BTreeMap};
-use termy_plugin_runtime::{
+use termy_core::plugin_runtime::{
     PluginContext, PluginOriginContext, PluginRuntime, PluginUiAlignment, PluginUiButtonVariant,
     PluginUiGap, PluginUiNode, PluginUiTextVariant, PluginUiTone, PluginViewAction,
     PluginViewDescriptor, PluginViewRender, PluginViewTarget, PluginViewValue,
@@ -110,8 +110,8 @@ impl PluginUiView {
         }
     }
 
-    fn focus(&self, window: &mut Window, _cx: &mut Context<Self>) {
-        self.focus_handle.focus(window);
+    fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle.focus(window, cx);
     }
 
     pub(in crate::terminal_view) fn target(&self) -> PluginViewTarget {
@@ -125,7 +125,7 @@ impl PluginUiView {
     fn current_context(
         &self,
         cx: &mut Context<Self>,
-    ) -> Result<termy_plugin_runtime::PluginContext, String> {
+    ) -> Result<termy_core::plugin_runtime::PluginContext, String> {
         let mut context = self
             .parent
             .update(cx, |view, cx| view.plugin_context(cx))
@@ -150,10 +150,12 @@ impl PluginUiView {
         let window_handle = self.window_handle;
 
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result = smol::unblock(move || {
-                runtime.render_view(&plugin_id, &view_id, &revision, params, context)
-            })
-            .await;
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    runtime.render_view(&plugin_id, &view_id, &revision, params, context)
+                })
+                .await;
             Self::finish_request(this, window_handle, result, cx);
         })
         .detach();
@@ -185,7 +187,7 @@ impl PluginUiView {
         result: Result<PluginViewRender, String>,
         cx: &mut AsyncApp,
     ) {
-        let _ = cx.update(|cx| {
+        cx.update(|cx| {
             let actions = this
                 .update(cx, |view, cx| view.apply_render_result(result, cx))
                 .ok()
@@ -210,7 +212,7 @@ impl PluginUiView {
         &mut self,
         result: Result<PluginViewRender, String>,
         cx: &mut Context<Self>,
-    ) -> Option<Vec<termy_plugin_runtime::PluginAction>> {
+    ) -> Option<Vec<termy_core::plugin_runtime::PluginAction>> {
         self.loading = false;
         self.busy = false;
         match result {
@@ -302,7 +304,7 @@ impl PluginUiView {
             .as_ref()
             .is_some_and(|input| input.id == id)
         {
-            self.focus_handle.focus(window);
+            self.focus_handle.focus(window, cx);
             return;
         }
         self.commit_active_input();
@@ -321,7 +323,7 @@ impl PluginUiView {
             multiline: Self::input_is_multiline(&self.nodes, id),
         });
         self.focused_control = Some(id.to_string());
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -568,12 +570,14 @@ impl PluginUiView {
         };
         let window_handle = self.window_handle;
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result = smol::unblock(move || {
-                runtime.invoke_view_action(
-                    &plugin_id, &view_id, &revision, params, action, values, context,
-                )
-            })
-            .await;
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    runtime.invoke_view_action(
+                        &plugin_id, &view_id, &revision, params, action, values, context,
+                    )
+                })
+                .await;
             Self::finish_request(this, window_handle, result, cx);
         })
         .detach();
@@ -672,7 +676,7 @@ impl PluginUiView {
             self.commit_active_input();
             self.active_input = None;
             self.focused_control = Some(id);
-            self.focus_handle.focus(window);
+            self.focus_handle.focus(window, cx);
             cx.notify();
         }
     }
@@ -693,8 +697,7 @@ impl PluginUiView {
                 let query = self
                     .list_queries
                     .get(&id)
-                    .map(|query| query.to_lowercase())
-                    .unwrap_or_default();
+                    .map_or_default(|query| query.to_lowercase());
                 children
                     .into_iter()
                     .filter_map(|child| match child {
@@ -1158,7 +1161,7 @@ impl TextInputProvider for PluginUiView {
     }
 }
 
-impl gpui::EntityInputHandler for PluginUiView {
+impl gpui_kit::EntityInputHandler for PluginUiView {
     fn text_for_range(
         &mut self,
         range: std::ops::Range<usize>,
@@ -1175,7 +1178,7 @@ impl gpui::EntityInputHandler for PluginUiView {
         _ignore_disabled_input: bool,
         _window: &mut Window,
         _cx: &mut Context<Self>,
-    ) -> Option<gpui::UTF16Selection> {
+    ) -> Option<gpui_kit::UTF16Selection> {
         Some(self.text_input_state()?.selected_text_range())
     }
 
@@ -1238,10 +1241,10 @@ impl gpui::EntityInputHandler for PluginUiView {
     fn bounds_for_range(
         &mut self,
         range_utf16: std::ops::Range<usize>,
-        element_bounds: gpui::Bounds<gpui::Pixels>,
+        element_bounds: gpui_kit::Bounds<gpui_kit::Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
-    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+    ) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
         Some(
             self.text_input_state()?
                 .bounds_for_range(range_utf16, element_bounds),
@@ -1250,7 +1253,7 @@ impl gpui::EntityInputHandler for PluginUiView {
 
     fn character_index_for_point(
         &mut self,
-        point: gpui::Point<gpui::Pixels>,
+        point: gpui_kit::Point<gpui_kit::Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {

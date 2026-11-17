@@ -8,12 +8,13 @@
 
 use super::plugins;
 use super::state::{CommandPaletteItem, CommandPaletteItemKind};
-use termy_command_core::CommandId;
+use termy_core::command_core::CommandId;
 
 pub(super) fn command_icon_path(id: CommandId) -> &'static str {
-    use termy_command_core::CommandId::*;
+    use termy_core::command_core::CommandId::*;
     match id {
         NewTab => "icons/command_palette/new-tab.svg",
+        NewWindow | ReopenDetachedWindow => "icons/command_palette/new-window.svg",
         CloseTab | ClosePane | ClosePaneOrTab => "icons/command_palette/close-tab.svg",
         MoveTabLeft | SwitchTabLeft => "icons/command_palette/tab-left.svg",
         MoveTabRight | SwitchTabRight | CycleTabs => "icons/command_palette/tab-right.svg",
@@ -25,7 +26,10 @@ pub(super) fn command_icon_path(id: CommandId) -> &'static str {
         SplitPaneVertical => "icons/command_palette/split-right.svg",
         SplitPaneHorizontal => "icons/command_palette/split-down.svg",
         FocusPaneLeft | FocusPaneRight | FocusPaneUp | FocusPaneDown | FocusPaneNext
-        | FocusPanePrevious => "icons/command_palette/focus-pane.svg",
+        | FocusPanePrevious | FocusPane1 | FocusPane2 | FocusPane3 | FocusPane4 | FocusPane5
+        | FocusPane6 | FocusPane7 | FocusPane8 | FocusPane9 => {
+            "icons/command_palette/focus-pane.svg"
+        }
         ResizePaneLeft | ResizePaneRight | ResizePaneUp | ResizePaneDown => {
             "icons/command_palette/resize-pane.svg"
         }
@@ -49,9 +53,11 @@ pub(super) fn command_icon_path(id: CommandId) -> &'static str {
         | ToggleSearchCaseSensitive
         | ToggleSearchRegex => "icons/settings/search.svg",
         CheckForUpdates => "icons/command_palette/check-update.svg",
+        ViewReleaseNotes | BrowseReleaseNotes => "icons/command_palette/info.svg",
         Quit => "icons/command_palette/power.svg",
         ToggleCommandPalette => "icons/command_palette/command.svg",
         Copy | Paste | SelectAll => "icons/command_palette/clipboard.svg",
+        ClearScreen => "icons/settings/reset.svg",
         InstallCli => "icons/command_palette/cli.svg",
         ToggleTabBarVisibility => "icons/settings/tabs.svg",
         ToggleWorkspaceSidebar => "icons/command_palette/sidebar.svg",
@@ -96,13 +102,14 @@ pub(super) fn palette_item_icon_path(item: &CommandPaletteItem) -> &'static str 
         | CommandPaletteItemKind::Task { .. } => "icons/command_palette/play.svg",
         CommandPaletteItemKind::AppInfoEntry { .. } => "icons/command_palette/info.svg",
         CommandPaletteItemKind::AppInfoCopyAll { .. } => "icons/command_palette/clipboard.svg",
+        CommandPaletteItemKind::ReleaseNotes { .. } => "icons/command_palette/info.svg",
     }
 }
 
 /// Group label for a built-in command. Exhaustive on purpose: a new command
 /// fails to compile until it is filed under a category.
 pub(super) fn command_category(id: CommandId) -> &'static str {
-    use termy_command_core::CommandId::*;
+    use termy_core::command_core::CommandId::*;
     match id {
         NewTab
         | CloseTab
@@ -124,10 +131,10 @@ pub(super) fn command_category(id: CommandId) -> &'static str {
         | ToggleTabBarVisibility => "Tabs",
         SplitPaneVertical | SplitPaneHorizontal | ClosePane | ClosePaneOrTab | FocusPaneLeft
         | FocusPaneRight | FocusPaneUp | FocusPaneDown | FocusPaneNext | FocusPanePrevious
-        | ResizePaneLeft | ResizePaneRight | ResizePaneUp | ResizePaneDown | TogglePaneZoom => {
-            "Panes"
-        }
-        MinimizeWindow | ToggleWorkspaceSidebar => "Window",
+        | FocusPane1 | FocusPane2 | FocusPane3 | FocusPane4 | FocusPane5 | FocusPane6
+        | FocusPane7 | FocusPane8 | FocusPane9 | ResizePaneLeft | ResizePaneRight
+        | ResizePaneUp | ResizePaneDown | TogglePaneZoom => "Panes",
+        NewWindow | ReopenDetachedWindow | MinimizeWindow | ToggleWorkspaceSidebar => "Window",
         ManageTmuxSessions | ManageSavedLayouts | RunTask => "Sessions",
         OpenSearch
         | CloseSearch
@@ -135,12 +142,11 @@ pub(super) fn command_category(id: CommandId) -> &'static str {
         | SearchPrevious
         | ToggleSearchCaseSensitive
         | ToggleSearchRegex => "Search",
-        Copy | Paste | SelectAll => "Edit",
+        Copy | Paste | SelectAll | ClearScreen => "Edit",
         SwitchTheme | ImportColors | ZoomIn | ZoomOut | ZoomReset => "Appearance",
         OpenConfig | PrettifyConfig | OpenSettings | InstallCli => "Settings",
-        AppInfo | RestartApp | CheckForUpdates | Quit | ToggleCommandPalette | ToggleInspector => {
-            "App"
-        }
+        AppInfo | RestartApp | CheckForUpdates | ViewReleaseNotes | BrowseReleaseNotes | Quit
+        | ToggleCommandPalette | ToggleInspector => "App",
     }
 }
 
@@ -207,7 +213,8 @@ fn keystroke_keycaps(keystroke: &str) -> Vec<String> {
 }
 
 /// Category label for a row, or `None` for rows whose mode already says what
-/// they are.
+/// they are. Task rows appear both in the Tasks browser (where the label is
+/// hidden) and in the mixed Commands root list (where it reads "Tasks").
 pub(super) fn palette_item_category(item: &CommandPaletteItem) -> Option<String> {
     match &item.kind {
         CommandPaletteItemKind::Command(action) => {
@@ -217,7 +224,47 @@ pub(super) fn palette_item_category(item: &CommandPaletteItem) -> Option<String>
         CommandPaletteItemKind::SshHost { .. } | CommandPaletteItemKind::ManageSshHosts => {
             Some("SSH".to_string())
         }
+        CommandPaletteItemKind::Task { .. } => Some("Tasks".to_string()),
         _ => None,
+    }
+}
+
+/// Colour-coding key for a row's icon tile. Always present, even in modes
+/// that hide the category label, so every list still gets the same tiles.
+pub(super) fn palette_item_tint_category(item: &CommandPaletteItem) -> &'static str {
+    match &item.kind {
+        CommandPaletteItemKind::Command(action) => command_category(action.to_command_id()),
+        CommandPaletteItemKind::PluginCommand { .. }
+        | CommandPaletteItemKind::PluginInputSubmit { .. }
+        | CommandPaletteItemKind::PluginInputOption { .. } => "Plugins",
+        CommandPaletteItemKind::Theme(_) => "Appearance",
+        CommandPaletteItemKind::SshHost { .. } | CommandPaletteItemKind::ManageSshHosts => "SSH",
+        CommandPaletteItemKind::TmuxSessionAttachOrSwitch { .. }
+        | CommandPaletteItemKind::TmuxSessionCreateAndAttach { .. }
+        | CommandPaletteItemKind::TmuxSessionDetachCurrent
+        | CommandPaletteItemKind::TmuxSessionOpenRenameMode
+        | CommandPaletteItemKind::TmuxSessionOpenKillMode
+        | CommandPaletteItemKind::TmuxSessionRenameSelect { .. }
+        | CommandPaletteItemKind::TmuxSessionRenameApply { .. }
+        | CommandPaletteItemKind::TmuxSessionKill { .. } => "Sessions",
+        CommandPaletteItemKind::SavedLayoutOpen { .. }
+        | CommandPaletteItemKind::SavedLayoutOpenTasksMode { .. }
+        | CommandPaletteItemKind::SavedLayoutOpenSaveMode
+        | CommandPaletteItemKind::SavedLayoutSaveAs { .. }
+        | CommandPaletteItemKind::SavedLayoutOpenRenameMode
+        | CommandPaletteItemKind::SavedLayoutRenameSelect { .. }
+        | CommandPaletteItemKind::SavedLayoutRenameApply { .. }
+        | CommandPaletteItemKind::SavedLayoutOpenDeleteMode
+        | CommandPaletteItemKind::SavedLayoutDelete { .. } => "Sessions",
+        CommandPaletteItemKind::TaskOpenCreateGlobalMode
+        | CommandPaletteItemKind::TaskOpenCreateLayoutMode { .. }
+        | CommandPaletteItemKind::TaskOpenSaveCurrentCommandGlobalMode
+        | CommandPaletteItemKind::TaskOpenSaveCurrentCommandLayoutMode { .. }
+        | CommandPaletteItemKind::TaskCreate { .. }
+        | CommandPaletteItemKind::Task { .. } => "Tasks",
+        CommandPaletteItemKind::AppInfoEntry { .. }
+        | CommandPaletteItemKind::AppInfoCopyAll { .. }
+        | CommandPaletteItemKind::ReleaseNotes { .. } => "App",
     }
 }
 
@@ -230,7 +277,7 @@ mod tests {
     fn every_command_has_an_embedded_icon_and_a_category() {
         for id in CommandId::all() {
             let icon = command_icon_path(id);
-            let embedded = gpui::AssetSource::load(&crate::asset_source::EmbeddedAssets, icon)
+            let embedded = gpui_kit::AssetSource::load(&crate::asset_source::EmbeddedAssets, icon)
                 .ok()
                 .flatten()
                 .is_some();
@@ -280,20 +327,47 @@ mod tests {
             kind: CommandPaletteItemKind::PluginCommand {
                 plugin_id: "acme".to_string(),
                 command_id: "do-thing".to_string(),
-                icon: termy_plugin_runtime::PluginIcon::Command,
+                icon: termy_core::plugin_runtime::PluginIcon::Command,
             },
         };
 
         assert_eq!(palette_item_category(&item).as_deref(), Some("acme"));
+        assert_eq!(palette_item_tint_category(&item), "Plugins");
+    }
+
+    #[test]
+    fn every_command_has_a_known_tile_tint() {
+        for id in CommandId::all() {
+            let category = command_category(id);
+            assert!(
+                matches!(
+                    category,
+                    "App"
+                        | "Appearance"
+                        | "Edit"
+                        | "Panes"
+                        | "Search"
+                        | "Sessions"
+                        | "Settings"
+                        | "Tabs"
+                        | "Window"
+                ),
+                "unexpected tint category {category} for {}",
+                id.config_name()
+            );
+        }
     }
 
     #[test]
     fn non_command_rows_have_no_category() {
         let theme = CommandPaletteItem::theme("nord".to_string(), false);
         assert_eq!(palette_item_category(&theme), None);
+    }
 
+    #[test]
+    fn task_rows_carry_a_tasks_category_for_the_mixed_root_list() {
         let task = CommandPaletteItem::task("build", "cargo build", None, None);
-        assert_eq!(palette_item_category(&task), None);
+        assert_eq!(palette_item_category(&task).as_deref(), Some("Tasks"));
     }
 
     #[test]

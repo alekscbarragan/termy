@@ -21,6 +21,10 @@ description: Every action you can bind to a trigger.
 
 `minimize_window`, `zoom_in`, `zoom_out`, `zoom_reset`, `quit`, `restart_app`, `app_info`.
 
+`reopen_detached_window` brings back a window you closed while other windows
+stayed open, with its running terminals. It needs the
+[built-in multiplexer](/docs/using-termy/multiplexer).
+
 ## Search
 
 `open_search`, `close_search`, `search_next`, `search_previous`,
@@ -29,6 +33,17 @@ description: Every action you can bind to a trigger.
 ## Clipboard
 
 `copy`, `paste`.
+
+## Terminal
+
+`clear_screen` sends the same form-feed control character as `Ctrl+L` to the
+active pane, clearing the viewport while preserving scrollback in shells that
+use the conventional `Ctrl+L` behavior. On macOS, `Cmd+K` uses this action by
+default. On other platforms, bind it explicitly if desired:
+
+```txt
+keybind = secondary-k=clear_screen
+```
 
 ## App
 

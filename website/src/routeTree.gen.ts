@@ -9,24 +9,26 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as LlmsDottxtRouteImport } from './routes/llms[.]txt'
-import { Route as LlmsFullDottxtRouteImport } from './routes/llms-full[.]txt'
-import { Route as DownloadRouteImport } from './routes/download'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as DemoRouteImport } from './routes/demo'
+import { Route as DownloadRouteImport } from './routes/download'
+import { Route as LlmsFullDottxtRouteImport } from './routes/llms-full[.]txt'
+import { Route as LlmsDottxtRouteImport } from './routes/llms[.]txt'
+import { Route as SponsorsRouteImport } from './routes/sponsors'
+import { Route as ApiSearchDotjsonRouteImport } from './routes/api/search[.]json'
+import { Route as DocsSplatRouteImport } from './routes/docs/$'
+import { Route as DocsChar123Char125DotmdRouteImport } from './routes/docs/{$}[.]md'
 import { Route as ReleasesIndexRouteImport } from './routes/releases/index'
 import { Route as ReleasesSlugRouteImport } from './routes/releases/$slug'
-import { Route as DocsChar123Char125DotmdRouteImport } from './routes/docs/{$}[.]md'
-import { Route as DocsSplatRouteImport } from './routes/docs/$'
-import { Route as ApiSearchDotjsonRouteImport } from './routes/api/search[.]json'
 
-const LlmsDottxtRoute = LlmsDottxtRouteImport.update({
-  id: '/llms.txt',
-  path: '/llms.txt',
+const IndexRoute = IndexRouteImport.update({
+  id: '/',
+  path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
-const LlmsFullDottxtRoute = LlmsFullDottxtRouteImport.update({
-  id: '/llms-full.txt',
-  path: '/llms-full.txt',
+const DemoRoute = DemoRouteImport.update({
+  id: '/demo',
+  path: '/demo',
   getParentRoute: () => rootRouteImport,
 } as any)
 const DownloadRoute = DownloadRouteImport.update({
@@ -34,9 +36,34 @@ const DownloadRoute = DownloadRouteImport.update({
   path: '/download',
   getParentRoute: () => rootRouteImport,
 } as any)
-const IndexRoute = IndexRouteImport.update({
-  id: '/',
-  path: '/',
+const LlmsFullDottxtRoute = LlmsFullDottxtRouteImport.update({
+  id: '/llms-full.txt',
+  path: '/llms-full.txt',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LlmsDottxtRoute = LlmsDottxtRouteImport.update({
+  id: '/llms.txt',
+  path: '/llms.txt',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SponsorsRoute = SponsorsRouteImport.update({
+  id: '/sponsors',
+  path: '/sponsors',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiSearchDotjsonRoute = ApiSearchDotjsonRouteImport.update({
+  id: '/api/search.json',
+  path: '/api/search.json',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DocsSplatRoute = DocsSplatRouteImport.update({
+  id: '/docs/$',
+  path: '/docs/$',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DocsChar123Char125DotmdRoute = DocsChar123Char125DotmdRouteImport.update({
+  id: '/docs/{$}.md',
+  path: '/docs/{$}.md',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ReleasesIndexRoute = ReleasesIndexRouteImport.update({
@@ -49,27 +76,14 @@ const ReleasesSlugRoute = ReleasesSlugRouteImport.update({
   path: '/releases/$slug',
   getParentRoute: () => rootRouteImport,
 } as any)
-const DocsChar123Char125DotmdRoute = DocsChar123Char125DotmdRouteImport.update({
-  id: '/docs/{$}.md',
-  path: '/docs/{$}.md',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const DocsSplatRoute = DocsSplatRouteImport.update({
-  id: '/docs/$',
-  path: '/docs/$',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const ApiSearchDotjsonRoute = ApiSearchDotjsonRouteImport.update({
-  id: '/api/search.json',
-  path: '/api/search.json',
-  getParentRoute: () => rootRouteImport,
-} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/demo': typeof DemoRoute
   '/download': typeof DownloadRoute
   '/llms-full.txt': typeof LlmsFullDottxtRoute
   '/llms.txt': typeof LlmsDottxtRoute
+  '/sponsors': typeof SponsorsRoute
   '/api/search.json': typeof ApiSearchDotjsonRoute
   '/docs/$': typeof DocsSplatRoute
   '/docs/{$}.md': typeof DocsChar123Char125DotmdRoute
@@ -78,9 +92,11 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/demo': typeof DemoRoute
   '/download': typeof DownloadRoute
   '/llms-full.txt': typeof LlmsFullDottxtRoute
   '/llms.txt': typeof LlmsDottxtRoute
+  '/sponsors': typeof SponsorsRoute
   '/api/search.json': typeof ApiSearchDotjsonRoute
   '/docs/$': typeof DocsSplatRoute
   '/docs/{$}.md': typeof DocsChar123Char125DotmdRoute
@@ -90,9 +106,11 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/demo': typeof DemoRoute
   '/download': typeof DownloadRoute
   '/llms-full.txt': typeof LlmsFullDottxtRoute
   '/llms.txt': typeof LlmsDottxtRoute
+  '/sponsors': typeof SponsorsRoute
   '/api/search.json': typeof ApiSearchDotjsonRoute
   '/docs/$': typeof DocsSplatRoute
   '/docs/{$}.md': typeof DocsChar123Char125DotmdRoute
@@ -103,9 +121,11 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/demo'
     | '/download'
     | '/llms-full.txt'
     | '/llms.txt'
+    | '/sponsors'
     | '/api/search.json'
     | '/docs/$'
     | '/docs/{$}.md'
@@ -114,9 +134,11 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/demo'
     | '/download'
     | '/llms-full.txt'
     | '/llms.txt'
+    | '/sponsors'
     | '/api/search.json'
     | '/docs/$'
     | '/docs/{$}.md'
@@ -125,9 +147,11 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/'
+    | '/demo'
     | '/download'
     | '/llms-full.txt'
     | '/llms.txt'
+    | '/sponsors'
     | '/api/search.json'
     | '/docs/$'
     | '/docs/{$}.md'
@@ -137,9 +161,11 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  DemoRoute: typeof DemoRoute
   DownloadRoute: typeof DownloadRoute
   LlmsFullDottxtRoute: typeof LlmsFullDottxtRoute
   LlmsDottxtRoute: typeof LlmsDottxtRoute
+  SponsorsRoute: typeof SponsorsRoute
   ApiSearchDotjsonRoute: typeof ApiSearchDotjsonRoute
   DocsSplatRoute: typeof DocsSplatRoute
   DocsChar123Char125DotmdRoute: typeof DocsChar123Char125DotmdRoute
@@ -149,18 +175,18 @@ export interface RootRouteChildren {
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/llms.txt': {
-      id: '/llms.txt'
-      path: '/llms.txt'
-      fullPath: '/llms.txt'
-      preLoaderRoute: typeof LlmsDottxtRouteImport
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/llms-full.txt': {
-      id: '/llms-full.txt'
-      path: '/llms-full.txt'
-      fullPath: '/llms-full.txt'
-      preLoaderRoute: typeof LlmsFullDottxtRouteImport
+    '/demo': {
+      id: '/demo'
+      path: '/demo'
+      fullPath: '/demo'
+      preLoaderRoute: typeof DemoRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/download': {
@@ -170,11 +196,46 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof DownloadRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
+    '/llms-full.txt': {
+      id: '/llms-full.txt'
+      path: '/llms-full.txt'
+      fullPath: '/llms-full.txt'
+      preLoaderRoute: typeof LlmsFullDottxtRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/llms.txt': {
+      id: '/llms.txt'
+      path: '/llms.txt'
+      fullPath: '/llms.txt'
+      preLoaderRoute: typeof LlmsDottxtRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/sponsors': {
+      id: '/sponsors'
+      path: '/sponsors'
+      fullPath: '/sponsors'
+      preLoaderRoute: typeof SponsorsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/search.json': {
+      id: '/api/search.json'
+      path: '/api/search.json'
+      fullPath: '/api/search.json'
+      preLoaderRoute: typeof ApiSearchDotjsonRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/docs/$': {
+      id: '/docs/$'
+      path: '/docs/$'
+      fullPath: '/docs/$'
+      preLoaderRoute: typeof DocsSplatRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/docs/{$}.md': {
+      id: '/docs/{$}.md'
+      path: '/docs/{$}.md'
+      fullPath: '/docs/{$}.md'
+      preLoaderRoute: typeof DocsChar123Char125DotmdRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/releases/': {
@@ -191,35 +252,16 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ReleasesSlugRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/docs/{$}.md': {
-      id: '/docs/{$}.md'
-      path: '/docs/{$}.md'
-      fullPath: '/docs/{$}.md'
-      preLoaderRoute: typeof DocsChar123Char125DotmdRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/docs/$': {
-      id: '/docs/$'
-      path: '/docs/$'
-      fullPath: '/docs/$'
-      preLoaderRoute: typeof DocsSplatRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/api/search.json': {
-      id: '/api/search.json'
-      path: '/api/search.json'
-      fullPath: '/api/search.json'
-      preLoaderRoute: typeof ApiSearchDotjsonRouteImport
-      parentRoute: typeof rootRouteImport
-    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  DemoRoute: DemoRoute,
   DownloadRoute: DownloadRoute,
   LlmsFullDottxtRoute: LlmsFullDottxtRoute,
   LlmsDottxtRoute: LlmsDottxtRoute,
+  SponsorsRoute: SponsorsRoute,
   ApiSearchDotjsonRoute: ApiSearchDotjsonRoute,
   DocsSplatRoute: DocsSplatRoute,
   DocsChar123Char125DotmdRoute: DocsChar123Char125DotmdRoute,
@@ -231,11 +273,10 @@ export const routeTree = rootRouteImport
   ._addFileTypes<FileRouteTypes>()
 
 import type { getRouter } from './router.tsx'
-import type { startInstance } from './start.ts'
+import type { createStart } from '@tanstack/react-start'
 declare module '@tanstack/react-start' {
   interface Register {
     ssr: true
     router: Awaited<ReturnType<typeof getRouter>>
-    config: Awaited<ReturnType<typeof startInstance.getOptions>>
   }
 }

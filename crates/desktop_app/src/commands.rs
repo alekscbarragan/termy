@@ -1,11 +1,11 @@
-use gpui::{FocusHandle, KeyBinding, MenuItem, OsAction, Window, actions};
-use termy_command_core::{CommandAvailability, CommandCapabilities, CommandId};
+use gpui_kit::{FocusHandle, KeyBinding, MenuItem, OsAction, Window, actions};
+use termy_core::command_core::{CommandAvailability, CommandCapabilities, CommandId};
 
 const GLOBAL_CONTEXT: Option<&str> = None;
 const TERMINAL_CONTEXT: Option<&str> = Some("Terminal");
 const INLINE_INPUT_CONTEXT: Option<&str> = Some("InlineInput");
 
-#[derive(Clone, Debug, PartialEq, Eq, gpui::Action)]
+#[derive(Clone, Debug, PartialEq, Eq, gpui_kit::Action)]
 #[action(namespace = termy, no_json)]
 pub struct RunNamedTask {
     pub task_name: String,
@@ -17,7 +17,7 @@ impl RunNamedTask {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, gpui::Action)]
+#[derive(Clone, Debug, PartialEq, Eq, gpui_kit::Action)]
 #[action(namespace = termy, no_json)]
 pub struct RunPluginCommand {
     pub plugin_id: String,
@@ -47,16 +47,22 @@ impl RunPluginCommand {
 
 pub type MenuSection = u8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandPaletteVisibility {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommandVisibility {
     Always,
     MacOsOnly,
+    /// The tmux/pane command group is hidden on Windows until tmux is active.
     NotWindows,
 }
 
-impl CommandPaletteVisibility {
+impl CommandVisibility {
     pub fn is_visible(self) -> bool {
         self.is_visible_on_platform(cfg!(target_os = "macos"), cfg!(target_os = "windows"))
+    }
+
+    pub fn is_visible_for_runtime(self, tmux_runtime_active: bool) -> bool {
+        self.is_visible()
+            || (cfg!(target_os = "windows") && tmux_runtime_active && self == Self::NotWindows)
     }
 
     pub const fn is_visible_on_platform(self, is_macos: bool, is_windows: bool) -> bool {
@@ -91,26 +97,8 @@ impl MenuRoot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MenuVisibility {
-    Always,
-    MacOsOnly,
-    NotWindows,
-}
-
-impl MenuVisibility {
-    pub fn is_visible(self) -> bool {
-        self.is_visible_on_platform(cfg!(target_os = "macos"), cfg!(target_os = "windows"))
-    }
-
-    pub const fn is_visible_on_platform(self, is_macos: bool, is_windows: bool) -> bool {
-        match self {
-            Self::Always => true,
-            Self::MacOsOnly => is_macos,
-            Self::NotWindows => !is_windows,
-        }
-    }
-}
+pub type MenuVisibility = CommandVisibility;
+pub type CommandPaletteVisibility = CommandVisibility;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MenuActionRole {
@@ -238,22 +226,21 @@ macro_rules! define_commands {
                 COMMAND_SPECS.iter().map(|spec| spec.action)
             }
 
-            #[allow(dead_code)]
             pub fn from_config_name(name: &str) -> Option<Self> {
                 CommandId::from_config_name(name).map(Self::from_command_id)
             }
 
-            #[allow(dead_code)]
-            pub fn all_config_names() -> impl std::iter::ExactSizeIterator<Item = &'static str> {
-                CommandId::all_config_names()
+            #[cfg(test)]
+            pub fn palette_entries() -> Vec<CommandPaletteEntry> {
+                Self::palette_entries_for_runtime(false)
             }
 
-            pub fn palette_entries() -> Vec<CommandPaletteEntry> {
+            pub fn palette_entries_for_runtime(tmux_runtime_active: bool) -> Vec<CommandPaletteEntry> {
                 COMMAND_SPECS
                     .iter()
                     .filter_map(|spec| {
                         let palette = spec.palette?;
-                        if !palette.visibility.is_visible() {
+                        if !palette.visibility.is_visible_for_runtime(tmux_runtime_active) {
                             return None;
                         }
 
@@ -270,12 +257,20 @@ macro_rules! define_commands {
                 &MENU_ROOTS
             }
 
+            #[cfg(test)]
             pub fn menu_entries_for_root(root: MenuRoot) -> Vec<CommandMenuEntry> {
+                Self::menu_entries_for_root_for_runtime(root, false)
+            }
+
+            pub fn menu_entries_for_root_for_runtime(
+                root: MenuRoot,
+                tmux_runtime_active: bool,
+            ) -> Vec<CommandMenuEntry> {
                 let mut entries = COMMAND_SPECS
                     .iter()
                     .filter_map(|spec| {
                         let menu = spec.menu?;
-                        if menu.root != root || !menu.visibility.is_visible() {
+                        if menu.root != root || !menu.visibility.is_visible_for_runtime(tmux_runtime_active) {
                             return None;
                         }
 
@@ -366,7 +361,6 @@ macro_rules! impl_command_action_id_mapping {
                 }
             }
 
-            #[allow(dead_code)]
             pub fn to_command_id(self) -> CommandId {
                 match self {
                     $(Self::$variant => CommandId::$variant,)+
@@ -389,6 +383,37 @@ define_commands!(
             MenuRoot::File,
             0,
             "New Tab",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        NewWindow,
+        GLOBAL_CONTEXT,
+        Some(palette(
+            "New Window",
+            "create open window",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::File,
+            0,
+            "New Window",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    // Listed in the palette only while the built-in multiplexer runs (see
+    // `command_palette_multiplexer_items`), so it has no static palette entry.
+    // Menus are static: without the multiplexer the menu item explains that.
+    (
+        ReopenDetachedWindow,
+        TERMINAL_CONTEXT,
+        None,
+        Some(menu(
+            MenuRoot::Window,
+            0,
+            "Reopen Detached Window",
             MenuVisibility::Always,
             MenuActionRole::Normal
         ))
@@ -643,6 +668,15 @@ define_commands!(
         )),
         None
     ),
+    (FocusPane1, TERMINAL_CONTEXT, None, None),
+    (FocusPane2, TERMINAL_CONTEXT, None, None),
+    (FocusPane3, TERMINAL_CONTEXT, None, None),
+    (FocusPane4, TERMINAL_CONTEXT, None, None),
+    (FocusPane5, TERMINAL_CONTEXT, None, None),
+    (FocusPane6, TERMINAL_CONTEXT, None, None),
+    (FocusPane7, TERMINAL_CONTEXT, None, None),
+    (FocusPane8, TERMINAL_CONTEXT, None, None),
+    (FocusPane9, TERMINAL_CONTEXT, None, None),
     (
         ResizePaneLeft,
         TERMINAL_CONTEXT,
@@ -908,6 +942,38 @@ define_commands!(
         ))
     ),
     (
+        ViewReleaseNotes,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "View Release Notes",
+            "changelog what's new github release notes this version installed",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::Help,
+            0,
+            "Release Notes",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        BrowseReleaseNotes,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Browse Release Notes",
+            "past releases latest changelog what's new github history versions",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::Help,
+            0,
+            "Browse Release Notes",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
         Quit,
         GLOBAL_CONTEXT,
         Some(palette(
@@ -970,6 +1036,16 @@ define_commands!(
             MenuVisibility::Always,
             MenuActionRole::SelectAll
         ))
+    ),
+    (
+        ClearScreen,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Clear Screen",
+            "clear terminal viewport",
+            CommandPaletteVisibility::Always
+        )),
+        None
     ),
     (CloseSearch, TERMINAL_CONTEXT, None, None),
     (
@@ -1064,7 +1140,7 @@ define_commands!(
     ),
 );
 
-termy_command_core::termy_command_catalog!(impl_command_action_id_mapping);
+termy_core::termy_command_catalog!(impl_command_action_id_mapping);
 
 actions!(
     termy_inline_input,
@@ -1117,342 +1193,4 @@ pub fn inline_input_keybindings() -> Vec<KeyBinding> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        CommandAction, CommandPaletteVisibility, MenuActionRole, MenuRoot, MenuVisibility,
-        inline_input_keybindings,
-    };
-    use std::collections::HashSet;
-    use termy_command_core::{CommandCapabilities, CommandId};
-
-    #[test]
-    fn command_catalog_contains_unique_actions() {
-        let mut seen = HashSet::new();
-        for spec in CommandAction::specs() {
-            assert!(seen.insert(spec.action), "duplicate action in catalog");
-        }
-
-        assert_eq!(seen.len(), CommandAction::all().count());
-    }
-
-    #[test]
-    fn switch_theme_is_configurable_and_palette_visible() {
-        assert_eq!(
-            CommandAction::from_config_name("switch_theme"),
-            Some(CommandAction::SwitchTheme)
-        );
-        assert!(
-            CommandAction::palette_entries()
-                .iter()
-                .any(|entry| entry.action == CommandAction::SwitchTheme)
-        );
-    }
-
-    #[test]
-    fn tab_bar_visibility_toggle_is_configurable_and_palette_visible() {
-        assert_eq!(
-            CommandAction::from_config_name("toggle_tab_bar_visibility"),
-            Some(CommandAction::ToggleTabBarVisibility)
-        );
-        assert!(
-            CommandAction::palette_entries()
-                .iter()
-                .any(|entry| entry.action == CommandAction::ToggleTabBarVisibility)
-        );
-    }
-
-    #[test]
-    fn tab_actions_are_always_palette_visible() {
-        let entries = CommandAction::palette_entries();
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.action == CommandAction::NewTab)
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.action == CommandAction::ClosePaneOrTab)
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.action == CommandAction::MoveTabLeft)
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.action == CommandAction::MoveTabRight)
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.action == CommandAction::SwitchTabLeft)
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.action == CommandAction::SwitchTabRight)
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.action == CommandAction::CycleTabs)
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.action == CommandAction::RenameTab)
-        );
-        assert!(
-            !entries
-                .iter()
-                .any(|entry| entry.action == CommandAction::CloseTab)
-        );
-    }
-
-    #[test]
-    fn file_menu_includes_requested_pane_actions() {
-        let file_entries = CommandAction::menu_entries_for_root(MenuRoot::File);
-
-        #[cfg(not(target_os = "windows"))]
-        for action in [
-            CommandAction::ClosePaneOrTab,
-            CommandAction::SplitPaneVertical,
-            CommandAction::SplitPaneHorizontal,
-            CommandAction::FocusPaneNext,
-        ] {
-            assert!(
-                file_entries.iter().any(|entry| entry.action == action),
-                "missing {action:?} from File menu"
-            );
-        }
-        #[cfg(target_os = "windows")]
-        for action in [
-            CommandAction::ManageTmuxSessions,
-            CommandAction::SplitPaneVertical,
-            CommandAction::SplitPaneHorizontal,
-            CommandAction::FocusPaneNext,
-        ] {
-            assert!(
-                !file_entries.iter().any(|entry| entry.action == action),
-                "unexpected {action:?} in File menu on Windows"
-            );
-        }
-
-        let close_pane_or_tab = file_entries
-            .iter()
-            .find(|entry| entry.action == CommandAction::ClosePaneOrTab)
-            .expect("missing ClosePaneOrTab from File menu");
-        assert_eq!(close_pane_or_tab.section, 1);
-        assert!(
-            !file_entries
-                .iter()
-                .any(|entry| entry.action == CommandAction::ClosePane)
-        );
-    }
-
-    #[test]
-    fn window_menu_excludes_file_menu_pane_actions() {
-        let window_entries = CommandAction::menu_entries_for_root(MenuRoot::Window);
-        for action in [
-            CommandAction::ClosePaneOrTab,
-            CommandAction::SplitPaneVertical,
-            CommandAction::SplitPaneHorizontal,
-            CommandAction::ClosePane,
-            CommandAction::FocusPaneNext,
-            CommandAction::FocusPanePrevious,
-        ] {
-            assert!(
-                !window_entries.iter().any(|entry| entry.action == action),
-                "unexpected {action:?} in Window menu"
-            );
-        }
-    }
-
-    #[test]
-    fn file_menu_section_order_is_stable() {
-        let file_entries = CommandAction::menu_entries_for_root(MenuRoot::File);
-        let sections = file_entries
-            .iter()
-            .map(|entry| entry.section)
-            .collect::<Vec<_>>();
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(sections, [0, 0, 1, 1, 1, 1, 1]);
-        #[cfg(target_os = "windows")]
-        assert_eq!(sections, [0, 0, 1]);
-    }
-
-    #[test]
-    fn menu_entries_have_non_empty_titles_and_valid_sections() {
-        for root in CommandAction::menu_roots() {
-            for entry in CommandAction::menu_entries_for_root(*root) {
-                assert!(!entry.title.trim().is_empty());
-                assert_eq!(entry.root, *root);
-            }
-        }
-    }
-
-    #[test]
-    fn view_menu_includes_tab_bar_toggle() {
-        let view_entries = CommandAction::menu_entries_for_root(MenuRoot::View);
-        assert!(
-            view_entries
-                .iter()
-                .any(|entry| entry.action == CommandAction::ToggleTabBarVisibility)
-        );
-    }
-
-    #[test]
-    fn menu_entries_do_not_collide_on_root_section_and_title() {
-        let mut seen = HashSet::new();
-        for root in CommandAction::menu_roots() {
-            for entry in CommandAction::menu_entries_for_root(*root) {
-                assert!(
-                    seen.insert((entry.root, entry.section, entry.title)),
-                    "duplicate menu entry for ({:?}, {}, {:?})",
-                    entry.root,
-                    entry.section,
-                    entry.title
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn menu_visibility_filters_by_platform() {
-        assert!(MenuVisibility::Always.is_visible_on_platform(true, true));
-        assert!(MenuVisibility::Always.is_visible_on_platform(false, false));
-        assert!(MenuVisibility::MacOsOnly.is_visible_on_platform(true, false));
-        assert!(!MenuVisibility::MacOsOnly.is_visible_on_platform(false, false));
-        assert!(MenuVisibility::NotWindows.is_visible_on_platform(true, false));
-        assert!(!MenuVisibility::NotWindows.is_visible_on_platform(false, true));
-    }
-
-    #[test]
-    fn palette_visibility_filters_by_platform() {
-        assert!(CommandPaletteVisibility::Always.is_visible_on_platform(true, true));
-        assert!(CommandPaletteVisibility::Always.is_visible_on_platform(false, false));
-        assert!(CommandPaletteVisibility::MacOsOnly.is_visible_on_platform(true, false));
-        assert!(!CommandPaletteVisibility::MacOsOnly.is_visible_on_platform(false, false));
-        assert!(CommandPaletteVisibility::NotWindows.is_visible_on_platform(false, false));
-        assert!(!CommandPaletteVisibility::NotWindows.is_visible_on_platform(false, true));
-    }
-
-    #[test]
-    fn windows_hides_tmux_commands_from_palette_entries() {
-        let entries = CommandAction::palette_entries();
-        #[cfg(target_os = "windows")]
-        {
-            for action in [
-                CommandAction::ManageTmuxSessions,
-                CommandAction::SplitPaneVertical,
-                CommandAction::SplitPaneHorizontal,
-                CommandAction::ClosePane,
-                CommandAction::FocusPaneLeft,
-                CommandAction::FocusPaneRight,
-                CommandAction::FocusPaneUp,
-                CommandAction::FocusPaneDown,
-                CommandAction::FocusPaneNext,
-                CommandAction::FocusPanePrevious,
-                CommandAction::ResizePaneLeft,
-                CommandAction::ResizePaneRight,
-                CommandAction::ResizePaneUp,
-                CommandAction::ResizePaneDown,
-                CommandAction::TogglePaneZoom,
-            ] {
-                assert!(
-                    !entries.iter().any(|entry| entry.action == action),
-                    "unexpected tmux palette action {action:?} on Windows"
-                );
-            }
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            assert!(
-                entries
-                    .iter()
-                    .any(|entry| entry.action == CommandAction::ManageTmuxSessions)
-            );
-            assert!(
-                entries
-                    .iter()
-                    .any(|entry| entry.action == CommandAction::SplitPaneVertical)
-            );
-        }
-    }
-
-    #[test]
-    fn only_edit_commands_use_os_edit_roles() {
-        for root in CommandAction::menu_roots() {
-            for entry in CommandAction::menu_entries_for_root(*root) {
-                match entry.role {
-                    MenuActionRole::Copy => assert_eq!(entry.action, CommandAction::Copy),
-                    MenuActionRole::Paste => assert_eq!(entry.action, CommandAction::Paste),
-                    MenuActionRole::SelectAll => {
-                        assert_eq!(entry.action, CommandAction::SelectAll);
-                    }
-                    MenuActionRole::Normal => {}
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn inline_input_keybindings_include_copy_binding() {
-        assert_eq!(inline_input_keybindings().len(), 18);
-    }
-
-    #[test]
-    fn command_action_roundtrips_all_core_command_ids() {
-        for command_id in CommandId::all() {
-            let action = CommandAction::from_command_id(command_id);
-            assert_eq!(action.to_command_id(), command_id);
-        }
-    }
-
-    #[test]
-    fn command_action_count_matches_core_catalog() {
-        assert_eq!(CommandAction::all().count(), CommandId::all().count());
-    }
-
-    #[test]
-    fn command_action_availability_reason_matches_command_core() {
-        let caps = CommandCapabilities {
-            tmux_runtime_active: false,
-            install_cli_available: true,
-        };
-        let availability = CommandAction::ResizePaneLeft.availability(caps);
-        assert!(availability.enabled);
-        assert_eq!(availability.reason, None);
-    }
-
-    #[test]
-    fn menu_roots_are_stable_and_ordered() {
-        assert_eq!(
-            CommandAction::menu_roots(),
-            &[
-                MenuRoot::App,
-                MenuRoot::File,
-                MenuRoot::Edit,
-                MenuRoot::View,
-                MenuRoot::Window,
-                MenuRoot::Help,
-            ]
-        );
-    }
-
-    #[test]
-    fn tmux_only_actions_match_command_core_tmux_only_set() {
-        let mut actual = CommandAction::all()
-            .filter(|action| action.to_command_id().is_tmux_only())
-            .map(|action| action.to_command_id().config_name())
-            .collect::<Vec<_>>();
-        actual.sort_unstable();
-
-        let expected: Vec<&str> = vec![];
-
-        assert_eq!(actual, expected);
-    }
-}
+mod tests;

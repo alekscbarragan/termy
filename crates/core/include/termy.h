@@ -1,0 +1,1105 @@
+#ifndef TERMY_H
+#define TERMY_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+  TERMY_FFI_OK = 0,
+  TERMY_FFI_NULL = 1,
+  TERMY_FFI_INVALID_UTF8 = 2,
+  TERMY_FFI_SPAWN_FAILED = 3,
+  TERMY_FFI_CONFIG_LOAD_FAILED = 4,
+  TERMY_FFI_UNKNOWN_KEY = 5,
+  TERMY_FFI_WRITE_FAILED = 6,
+  TERMY_FFI_SERIALIZE_FAILED = 7,
+  /* A Rust panic was caught before it could unwind across the C ABI. */
+  TERMY_FFI_PANICKED = 8,
+  TERMY_FFI_INVALID_ARGUMENT = 9,
+  /* The snapshot was written by an incompatible format version. */
+  TERMY_FFI_UNSUPPORTED_SNAPSHOT_VERSION = 10,
+  /* The bytes are not a snapshot, or it is truncated or corrupt. */
+  TERMY_FFI_INVALID_SNAPSHOT = 11,
+  /* No session host runs there, or it cannot be reached or started. */
+  TERMY_FFI_HOST_UNAVAILABLE = 12,
+  /* A session host of another Termy version runs there. */
+  TERMY_FFI_VERSION_MISMATCH = 13,
+  /* The multiplexer pane is gone or its program exited. */
+  TERMY_FFI_NOT_FOUND = 14,
+} TermyFfiStatus;
+
+typedef enum {
+  TERMY_FFI_EVENT_WAKEUP = 1,
+  TERMY_FFI_EVENT_TITLE = 2,
+  TERMY_FFI_EVENT_RESET_TITLE = 3,
+  TERMY_FFI_EVENT_BELL = 4,
+  TERMY_FFI_EVENT_EXIT = 5,
+  TERMY_FFI_EVENT_CLIPBOARD_STORE = 6,
+  TERMY_FFI_EVENT_SHELL_PROMPT_START = 7,
+  TERMY_FFI_EVENT_SHELL_COMMAND_START = 8,
+  TERMY_FFI_EVENT_SHELL_COMMAND_EXECUTING = 9,
+  TERMY_FFI_EVENT_SHELL_COMMAND_FINISHED = 10,
+  TERMY_FFI_EVENT_PROGRESS = 11,
+  TERMY_FFI_EVENT_WORKING_DIRECTORY = 12,
+  /* UTF-8 JSON array of OSC 7501 records in payload; replaces the prior snapshot. */
+  TERMY_FFI_EVENT_PROGRAM_STATUS = 13,
+  /* Keys or a paste were dropped because the program's input backlog is full. */
+  TERMY_FFI_EVENT_INPUT_DROPPED = 14,
+} TermyFfiEventKind;
+
+typedef enum {
+  TERMY_FFI_PROGRESS_CLEAR = 0,
+  TERMY_FFI_PROGRESS_IN_PROGRESS = 1,
+  TERMY_FFI_PROGRESS_ERROR = 2,
+  TERMY_FFI_PROGRESS_INDETERMINATE = 3,
+  TERMY_FFI_PROGRESS_WARNING = 4,
+} TermyFfiProgressState;
+
+typedef enum {
+  TERMY_FFI_CLIPBOARD_LOCATION_CLIPBOARD = 1,
+  TERMY_FFI_CLIPBOARD_LOCATION_PRIMARY = 2,
+} TermyFfiClipboardLocation;
+
+typedef enum {
+  TERMY_FFI_CLIPBOARD_RESULT_SUCCESS = 0,
+  TERMY_FFI_CLIPBOARD_RESULT_DENIED = 1,
+  TERMY_FFI_CLIPBOARD_RESULT_UNSUPPORTED = 2,
+  TERMY_FFI_CLIPBOARD_RESULT_BUSY = 3,
+  TERMY_FFI_CLIPBOARD_RESULT_INVALID_DATA = 4,
+  TERMY_FFI_CLIPBOARD_RESULT_IO_ERROR = 5,
+} TermyFfiClipboardResultStatus;
+
+typedef enum {
+  TERMY_FFI_GLYPH_RENDER_BLOCK_ELEMENT = 1,
+  TERMY_FFI_GLYPH_RENDER_BOX_DRAWING = 2,
+  TERMY_FFI_GLYPH_RENDER_SEXTANT = 3,
+  TERMY_FFI_GLYPH_RENDER_BRAILLE = 4,
+  TERMY_FFI_GLYPH_RENDER_ROUNDED_CORNER = 5,
+  TERMY_FFI_GLYPH_RENDER_DIAGONAL = 6,
+} TermyFfiGlyphRenderKind;
+
+typedef enum {
+  TERMY_FFI_GLYPH_RECT_SNAP_NEAREST = 1,
+  TERMY_FFI_GLYPH_RECT_SNAP_OUTWARD = 2,
+} TermyFfiGlyphRectSnapKind;
+
+typedef enum {
+  TERMY_FFI_GLYPH_STROKE_LINE = 1,
+  TERMY_FFI_GLYPH_STROKE_ROUNDED_CORNER = 2,
+} TermyFfiGlyphStrokeKind;
+
+/*
+ * Opaque terminal handle. Created by one of the *_new constructors below and
+ * destroyed with the free function. Not copyable: free each handle exactly once
+ * and never use it afterward.
+ *
+ * THREAD SAFETY. A handle is not internally synchronized. With one exception,
+ * no two functions taking the same handle may run concurrently — the caller
+ * must serialize all access to a given handle (confine it to one thread, or
+ * hold an external lock). Distinct handles are independent and may be used from
+ * different threads simultaneously.
+ *
+ * The exception is the wake channel: wait_for_wakeup and notify_wakeup touch
+ * only an internal wake channel, never the terminal state, and are the only
+ * functions safe to call concurrently with the serialized calls above. The
+ * intended pattern is a single dedicated thread blocked in wait_for_wakeup
+ * while another thread drives the terminal; notify_wakeup may be called from
+ * any thread to wake that waiter.
+ *
+ * LIFETIME. The free function invalidates the handle and releases everything it
+ * owns, including the wake channel. The caller MUST guarantee that no other
+ * function — including a thread blocked in wait_for_wakeup — is executing on
+ * the handle when it is freed, and that none is called afterward. To tear down
+ * a handle that has a wakeup thread: stop issuing terminal calls, call
+ * notify_wakeup to release the blocked wait, JOIN that thread, then free.
+ * Freeing while a thread is inside wait_for_wakeup is a use-after-free.
+ */
+typedef struct TermyFfiTerminal TermyFfiTerminal;
+typedef struct TermyFfiConfig TermyFfiConfig;
+typedef struct TermyFfiMultiplexer TermyFfiMultiplexer;
+typedef struct TermyFfiSearcher TermyFfiSearcher;
+
+typedef struct {
+  uint16_t cols;
+  uint16_t rows;
+  float cell_width;
+  float cell_height;
+} TermyFfiSize;
+
+typedef struct {
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+  uint8_t a;
+} TermyFfiColor;
+
+/* One viewport cell. Carries no position: full frames are row-major
+ * (index = row * cols + col) and frame-update cells follow the dirty spans
+ * in order, so the host derives position from context. */
+typedef struct {
+  uint32_t codepoint;
+  TermyFfiColor fg;
+  TermyFfiColor bg;
+  bool uses_terminal_default_bg;
+  bool bold;
+  bool render_text;
+  bool wide_character_spacer;
+  bool line_wrapped;
+  bool italic;
+  bool underline;
+  bool strikethrough;
+} TermyFfiCell;
+
+typedef struct {
+  bool visible;
+  size_t col;
+  size_t row;
+  uint32_t style;
+} TermyFfiCursor;
+
+typedef struct {
+  uint16_t cols;
+  uint16_t rows;
+  TermyFfiCell *cells_ptr;
+  size_t cells_len;
+  size_t cells_capacity;
+  TermyFfiCursor cursor;
+  size_t display_offset;
+  size_t history_size;
+} TermyFfiFrame;
+
+typedef struct {
+  uint8_t *ptr;
+  size_t len;
+  size_t capacity;
+} TermyFfiBytes;
+
+/* Non-owning bytes. The owner and lifetime depend on the containing call or
+ * callback and are documented with that API. */
+typedef struct {
+  const uint8_t *ptr;
+  size_t len;
+} TermyFfiByteSlice;
+
+typedef struct {
+  TermyFfiByteSlice mime_type;
+  TermyFfiByteSlice data;
+} TermyFfiClipboardContent;
+
+typedef struct {
+  uint32_t location;
+  const TermyFfiByteSlice *mime_types_ptr;
+  size_t mime_types_len;
+  bool list_available;
+  TermyFfiByteSlice name;
+  bool has_name;
+  bool permission_granted;
+  bool can_remember_permission;
+} TermyFfiClipboardReadRequest;
+
+typedef struct {
+  uint32_t status;
+  const TermyFfiByteSlice *available_formats_ptr;
+  size_t available_formats_len;
+  const TermyFfiClipboardContent *contents_ptr;
+  size_t contents_len;
+  bool remember_permission;
+} TermyFfiClipboardReadResponse;
+
+typedef struct {
+  uint32_t location;
+  const TermyFfiClipboardContent *contents_ptr;
+  size_t contents_len;
+  TermyFfiByteSlice name;
+  bool has_name;
+  bool permission_granted;
+  bool can_remember_permission;
+} TermyFfiClipboardWriteRequest;
+
+typedef struct {
+  uint32_t status;
+  bool remember_permission;
+} TermyFfiClipboardWriteResponse;
+
+typedef void *TermyFfiUserData;
+typedef void (*TermyFfiClipboardReadReplyCallback)(
+    TermyFfiUserData user_data,
+    const TermyFfiClipboardReadResponse *response);
+typedef void (*TermyFfiClipboardReadCallback)(
+    TermyFfiUserData user_data,
+    const TermyFfiClipboardReadRequest *request,
+    TermyFfiUserData reply_user_data,
+    TermyFfiClipboardReadReplyCallback reply_callback);
+typedef TermyFfiClipboardWriteResponse (*TermyFfiClipboardWriteCallback)(
+    TermyFfiUserData user_data,
+    const TermyFfiClipboardWriteRequest *request);
+typedef void (*TermyFfiProtocolReplyCallback)(
+    TermyFfiUserData user_data,
+    TermyFfiByteSlice reply);
+
+/* Placements of the same image in one batch share a single `png` (or `rgba`)
+ * buffer (same pointer). Never free it directly:
+ * termy_kitty_graphics_batch_free releases each buffer once.
+ *
+ * `rgba` is set only by termy_terminal_kitty_graphics_placements_rgba: the
+ * image as image_width * image_height RGBA8 pixels with straight alpha. */
+typedef struct {
+  uint64_t placement_serial;
+  uint32_t image_id;
+  uint32_t placement_id;
+  TermyFfiBytes png;
+  uint32_t image_width;
+  uint32_t image_height;
+  uint64_t image_generation;
+  int32_t viewport_row;
+  size_t col;
+  uint32_t source_x;
+  uint32_t source_y;
+  uint32_t source_width;
+  uint32_t source_height;
+  bool has_display_cols;
+  uint32_t display_cols;
+  bool has_display_rows;
+  uint32_t display_rows;
+  uint32_t occupied_cols;
+  uint32_t occupied_rows;
+  uint32_t x_offset;
+  uint32_t y_offset;
+  int32_t z_index;
+  int32_t col_offset;
+  bool is_virtual_cell;
+  uint32_t virtual_cell_col;
+  uint32_t virtual_cell_row;
+  uint32_t clip_top_rows;
+  uint32_t clip_bottom_rows;
+  uint64_t next_frame_delay_ms;
+  TermyFfiBytes rgba;
+} TermyFfiKittyGraphicsPlacement;
+
+/* An image whose pixels the host already holds. */
+typedef struct {
+  uint32_t image_id;
+  uint64_t image_generation;
+} TermyFfiKittyImageKey;
+
+/* `cell_width` and `cell_height` are the terminal's cell size, in the pixels
+ * that image sizes and pixel offsets are measured in. Scale by your cell size
+ * over this one. */
+typedef struct {
+  uint64_t revision;
+  TermyFfiKittyGraphicsPlacement *placements_ptr;
+  size_t placements_len;
+  size_t placements_capacity;
+  float cell_width;
+  float cell_height;
+} TermyFfiKittyGraphicsBatch;
+
+typedef struct {
+  uint32_t kind;
+  int32_t exit_code;
+  uint8_t progress_state;
+  uint8_t progress_value;
+  TermyFfiBytes payload;
+} TermyFfiEvent;
+
+typedef struct {
+  TermyFfiEvent *events_ptr;
+  size_t events_len;
+  size_t events_capacity;
+  bool has_more;
+} TermyFfiEventBatch;
+
+typedef struct {
+  size_t row;
+  size_t left_col;
+  size_t right_col;
+} TermyFfiDirtySpan;
+
+typedef struct {
+  float cell_width;
+  float cell_height;
+  float font_size;
+} TermyFfiGlyphMetrics;
+
+typedef struct {
+  float left;
+  float top;
+  float right;
+  float bottom;
+  float alpha;
+  uint32_t snap_kind;
+} TermyFfiGlyphRect;
+
+typedef struct {
+  float x;
+  float y;
+} TermyFfiGlyphPoint;
+
+/* Stroke width is a fraction of the cell width. Lines use point_0..point_1;
+ * rounded corners use point_0..point_5. */
+typedef struct {
+  uint32_t kind;
+  uint32_t point_count;
+  float width;
+  TermyFfiGlyphPoint point_0;
+  TermyFfiGlyphPoint point_1;
+  TermyFfiGlyphPoint point_2;
+  TermyFfiGlyphPoint point_3;
+  TermyFfiGlyphPoint point_4;
+  TermyFfiGlyphPoint point_5;
+} TermyFfiGlyphStroke;
+
+typedef struct {
+  size_t cell_index;
+  uint32_t render_kind;
+  size_t rect_start;
+  size_t rect_len;
+  size_t stroke_start;
+  size_t stroke_len;
+} TermyFfiGlyphPlanEntry;
+
+typedef struct {
+  TermyFfiGlyphPlanEntry *entries_ptr;
+  size_t entries_len;
+  size_t entries_capacity;
+  TermyFfiGlyphRect *rects_ptr;
+  size_t rects_len;
+  size_t rects_capacity;
+  TermyFfiGlyphStroke *strokes_ptr;
+  size_t strokes_len;
+  size_t strokes_capacity;
+} TermyFfiGlyphRenderPlan;
+
+typedef struct {
+  uint32_t kind;
+  TermyFfiDirtySpan *spans_ptr;
+  size_t spans_len;
+  size_t spans_capacity;
+} TermyFfiDamage;
+
+typedef struct {
+  uint16_t cols;
+  uint16_t rows;
+  TermyFfiCell *cells_ptr;
+  size_t cells_len;
+  size_t cells_capacity;
+  TermyFfiCursor cursor;
+  size_t display_offset;
+  size_t history_size;
+  uint32_t damage_kind;
+  TermyFfiDirtySpan *spans_ptr;
+  size_t spans_len;
+  size_t spans_capacity;
+} TermyFfiFrameUpdate;
+
+/* One scroll of viewport rows top..=bottom (inclusive) by count rows:
+ * direction 1 moves content toward row 0, 2 away from it. Rows a scroll
+ * exposes are in the update's damage. */
+typedef struct {
+  size_t top;
+  size_t bottom;
+  size_t count;
+  uint32_t direction;
+} TermyFfiViewportScroll;
+
+typedef struct {
+  TermyFfiViewportScroll *scrolls_ptr;
+  size_t scrolls_len;
+  size_t scrolls_capacity;
+} TermyFfiViewportScrollBatch;
+
+typedef struct {
+  size_t start_col;
+  size_t end_col;
+  TermyFfiBytes uri;
+} TermyFfiHyperlink;
+
+typedef struct {
+  size_t start_row;
+  size_t start_col;
+  size_t end_row;
+  size_t end_col;
+  TermyFfiBytes uri;
+} TermyFfiLink;
+
+typedef struct {
+  size_t row;
+  size_t start_col;
+  size_t end_col;
+  TermyFfiBytes line;
+} TermyFfiSearchMatch;
+
+typedef struct {
+  TermyFfiSearchMatch *matches_ptr;
+  size_t matches_len;
+  size_t matches_capacity;
+} TermyFfiSearchBatch;
+
+/* A buffer line OSC 133 shell integration marked, with kinds holding
+ * TERMY_PROMPT_MARK_PROMPT (133;A, prompt start) and/or
+ * TERMY_PROMPT_MARK_OUTPUT (133;C, command output start). */
+#define TERMY_PROMPT_MARK_PROMPT 1u
+#define TERMY_PROMPT_MARK_OUTPUT 2u
+typedef struct {
+  int32_t line;
+  uint8_t kinds;
+} TermyFfiPromptMark;
+
+typedef struct {
+  TermyFfiPromptMark *marks_ptr;
+  size_t marks_len;
+  size_t marks_capacity;
+} TermyFfiPromptMarkBatch;
+
+typedef struct {
+  bool case_sensitive;
+  bool regex;
+} TermyFfiSearchOptions;
+
+typedef struct {
+  size_t line_number;
+  uint32_t kind;
+  TermyFfiBytes message;
+} TermyFfiConfigDiagnostic;
+
+typedef struct {
+  TermyFfiConfigDiagnostic *diagnostics_ptr;
+  size_t diagnostics_len;
+  size_t diagnostics_capacity;
+} TermyFfiConfigDiagnosticBatch;
+
+typedef struct {
+  TermyFfiBytes font_family;
+  TermyFfiBytes active_theme;
+  TermyFfiColor foreground;
+  TermyFfiColor background;
+  TermyFfiColor cursor;
+  float font_size;
+  float line_height;
+  float padding_x;
+  float padding_y;
+  float background_opacity;
+  bool background_opacity_cells;
+  bool cursor_blink;
+  uint32_t cursor_style;
+  float cell_width;
+  float cell_height;
+  bool background_blur;
+  float mouse_scroll_multiplier;
+  uint32_t scrollbar_visibility;
+  uint32_t scrollbar_style;
+  bool copy_on_select;
+  bool copy_on_select_toast;
+  uint32_t pane_focus_effect;
+  float pane_focus_strength;
+  bool chrome_contrast;
+} TermyFfiRenderConfig;
+
+typedef struct {
+  bool warn_on_quit;
+  bool warn_on_quit_with_running_process;
+} TermyFfiSafetyConfig;
+
+typedef struct {
+  bool auto_update;
+  bool tmux_enabled;
+  bool tmux_persistence;
+  bool tmux_exclusive;
+  bool tmux_show_active_pane_border;
+  bool simple_mode;
+  bool native_tab_persistence;
+  bool native_layout_autosave;
+  bool native_buffer_persistence;
+  bool show_debug_overlay;
+  bool onboarding_complete;
+  uint32_t tab_close_visibility;
+  uint32_t tab_width_mode;
+  uint32_t tab_bar_position;
+  bool tab_switch_modifier_hints;
+  bool chrome_contrast;
+  bool command_palette_show_keybinds;
+  uint32_t app_icon;
+  bool shell_integration_enabled;
+  bool progress_indicator_enabled;
+  bool auto_hide_tabbar;
+  bool show_termy_in_titlebar;
+  bool macos_option_as_alt;
+} TermyFfiNativeConfig;
+
+typedef struct {
+  const uint8_t *key_ptr;
+  size_t key_len;
+  const uint8_t *value_ptr;
+  size_t value_len;
+} TermyFfiEnvVar;
+
+typedef struct {
+  const TermyFfiConfig *config;
+  const uint8_t *working_directory_ptr;
+  size_t working_directory_len;
+  const uint8_t *startup_command_ptr;
+  size_t startup_command_len;
+  const TermyFfiEnvVar *env_vars_ptr;
+  size_t env_vars_len;
+} TermyFfiTerminalOptions;
+
+typedef struct {
+  bool control;
+  bool alt;
+  bool shift;
+  bool platform;
+  bool function;
+  const uint8_t *key_ptr;
+  size_t key_len;
+  const uint8_t *key_char_ptr;
+  size_t key_char_len;
+  uint32_t event_kind;
+} TermyFfiKeystroke;
+
+typedef struct {
+  uint32_t kind;
+  uint32_t button;
+  size_t col;
+  size_t row;
+  bool control;
+  bool alt;
+  bool shift;
+} TermyFfiMouseInput;
+
+TermyFfiSize termy_size_default(void);
+TermyFfiStatus termy_terminal_new(
+    TermyFfiSize size,
+    const uint8_t *startup_command_ptr,
+    size_t startup_command_len,
+    TermyFfiTerminal **out_terminal);
+TermyFfiStatus termy_terminal_new_with_config(
+    TermyFfiSize size,
+    const TermyFfiConfig *config,
+    const uint8_t *startup_command_ptr,
+    size_t startup_command_len,
+    TermyFfiTerminal **out_terminal);
+TermyFfiStatus termy_terminal_new_with_options(
+    TermyFfiSize size,
+    const TermyFfiTerminalOptions *options,
+    TermyFfiTerminal **out_terminal);
+/* A terminal without a PTY, fed with termy_terminal_feed_output. Its wake
+ * channel fires when a synchronized update (?2026) times out and commits
+ * without further output, so hosts should render and drain replies then. */
+TermyFfiStatus termy_display_terminal_new(
+    TermyFfiSize size,
+    TermyFfiTerminal **out_terminal);
+TermyFfiStatus termy_config_load_default(TermyFfiConfig **out_config);
+TermyFfiStatus termy_config_load_path(
+    const uint8_t *path_ptr,
+    size_t path_len,
+    TermyFfiConfig **out_config);
+TermyFfiStatus termy_config_from_contents(
+    const uint8_t *contents_ptr,
+    size_t contents_len,
+    TermyFfiConfig **out_config);
+TermyFfiStatus termy_config_free(TermyFfiConfig *config);
+bool termy_config_loaded_from_disk(const TermyFfiConfig *config);
+size_t termy_config_runtime_scrollback_history(const TermyFfiConfig *config);
+TermyFfiStatus termy_config_runtime_inactive_tab_scrollback(
+    const TermyFfiConfig *config,
+    bool *out_enabled,
+    size_t *out_value);
+size_t termy_config_diagnostic_count(const TermyFfiConfig *config);
+TermyFfiStatus termy_config_window_size(
+    const TermyFfiConfig *config,
+    float *out_width,
+    float *out_height);
+TermyFfiStatus termy_config_working_directory(
+    const TermyFfiConfig *config,
+    TermyFfiBytes *out_working_directory);
+TermyFfiStatus termy_config_safety(
+    const TermyFfiConfig *config,
+    TermyFfiSafetyConfig *out_safety);
+TermyFfiStatus termy_config_native(
+    const TermyFfiConfig *config,
+    TermyFfiNativeConfig *out_native);
+TermyFfiStatus termy_config_tmux_binary(
+    const TermyFfiConfig *config,
+    TermyFfiBytes *out_binary);
+TermyFfiStatus termy_config_ui_font_family(
+    const TermyFfiConfig *config,
+    TermyFfiBytes *out_font_family);
+TermyFfiStatus termy_config_path(
+    const TermyFfiConfig *config,
+    TermyFfiBytes *out_path);
+TermyFfiStatus termy_config_tasks_json(
+    const TermyFfiConfig *config,
+    TermyFfiBytes *out_json);
+TermyFfiStatus termy_config_keybinds_json(
+    const TermyFfiConfig *config,
+    TermyFfiBytes *out_json);
+TermyFfiStatus termy_config_diagnostics(
+    const TermyFfiConfig *config,
+    TermyFfiConfigDiagnosticBatch *out_batch);
+TermyFfiStatus termy_config_diagnostics_free(TermyFfiConfigDiagnosticBatch *batch);
+TermyFfiStatus termy_config_render_config(
+    const TermyFfiConfig *config,
+    TermyFfiRenderConfig *out_render_config);
+TermyFfiStatus termy_config_render_config_for_appearance(
+    const TermyFfiConfig *config,
+    uint32_t system_appearance,
+    TermyFfiRenderConfig *out_render_config);
+TermyFfiStatus termy_render_config_free(TermyFfiRenderConfig *render_config);
+TermyFfiStatus termy_settings_schema_json(
+    const TermyFfiConfig *config,
+    TermyFfiBytes *out_bytes);
+TermyFfiStatus termy_settings_set_root(
+    const uint8_t *key_ptr,
+    size_t key_len,
+    const uint8_t *value_ptr,
+    size_t value_len);
+TermyFfiStatus termy_settings_reset_root(
+    const uint8_t *key_ptr,
+    size_t key_len);
+/* The same edits for the config file at a given path instead of the
+ * default one, so an app can keep a config of its own. */
+TermyFfiStatus termy_settings_set_root_at(
+    const uint8_t *path_ptr,
+    size_t path_len,
+    const uint8_t *key_ptr,
+    size_t key_len,
+    const uint8_t *value_ptr,
+    size_t value_len);
+TermyFfiStatus termy_settings_reset_root_at(
+    const uint8_t *path_ptr,
+    size_t path_len,
+    const uint8_t *key_ptr,
+    size_t key_len);
+TermyFfiStatus termy_settings_set_color(
+    const uint8_t *key_ptr,
+    size_t key_len,
+    const uint8_t *hex_ptr,
+    size_t hex_len);
+TermyFfiStatus termy_settings_set_keybinds(
+    const uint8_t *text_ptr,
+    size_t text_len);
+TermyFfiStatus termy_cli_install(
+    const uint8_t *shell_ptr,
+    size_t shell_len,
+    TermyFfiBytes *out_message);
+
+/* tmux control mode is unix-only; libtermy does not export it on Windows. */
+#ifndef _WIN32
+typedef struct {
+  uint32_t kind;
+  TermyFfiBytes pane_id;
+  TermyFfiBytes data;
+} TermyFfiTmuxNotification;
+
+typedef struct {
+  TermyFfiTmuxNotification *notifications_ptr;
+  size_t notifications_len;
+  size_t notifications_capacity;
+} TermyFfiTmuxNotificationBatch;
+
+typedef struct TermyFfiTmuxControl TermyFfiTmuxControl;
+
+TermyFfiStatus termy_tmux_control_open(
+    const uint8_t *binary_ptr,
+    size_t binary_len,
+    const uint8_t *socket_ptr,
+    size_t socket_len,
+    const uint8_t *session_ptr,
+    size_t session_len,
+    TermyFfiTmuxControl **out_session);
+TermyFfiStatus termy_tmux_control_poll(
+    TermyFfiTmuxControl *session,
+    TermyFfiTmuxNotificationBatch *out_batch);
+TermyFfiStatus termy_tmux_control_notifications_free(
+    TermyFfiTmuxNotificationBatch *batch);
+/* Runs one tmux command. A command containing a newline, carriage return or
+ * NUL returns TERMY_FFI_INVALID_ARGUMENT: tmux would run each line as its own
+ * command. Quote untrusted arguments before splicing them in. */
+TermyFfiStatus termy_tmux_control_send(
+    TermyFfiTmuxControl *session,
+    const uint8_t *command_ptr,
+    size_t command_len,
+    TermyFfiBytes *out_output);
+void termy_tmux_control_close(TermyFfiTmuxControl *session);
+#endif /* _WIN32 */
+
+TermyFfiStatus termy_settings_prettify_config(void);
+TermyFfiStatus termy_terminal_reload_default_config_colors(TermyFfiTerminal *terminal);
+TermyFfiStatus termy_terminal_apply_config_colors_for_appearance(
+    TermyFfiTerminal *terminal,
+    const TermyFfiConfig *config,
+    uint32_t system_appearance);
+/* Destroy a terminal handle. See the handle contract above: any wakeup thread
+ * must be woken (notify) and joined before calling this; freeing while a thread
+ * is inside wait_for_wakeup is a use-after-free. Passing null is a no-op. */
+TermyFfiStatus termy_terminal_free(TermyFfiTerminal *terminal);
+TermyFfiStatus termy_terminal_write(
+    TermyFfiTerminal *terminal,
+    const uint8_t *bytes_ptr,
+    size_t bytes_len);
+/* The process ID of the program a terminal started in its own PTY. Writes 0
+ * and returns TERMY_FFI_NOT_FOUND for a display terminal or a session-host
+ * pane, whose program the host runs. */
+TermyFfiStatus termy_terminal_child_pid(TermyFfiTerminal *terminal, int32_t *out_pid);
+/* Writes a mouse motion or drag report from the mouse encoder.
+ * Motion may fill only half of the input backlog, so a program that stops
+ * reading cannot starve later keys; reports that don't fit are dropped (the
+ * next carries the newer position), and a session host keeps only the newest
+ * one queued. (null, 0) is a no-op. */
+TermyFfiStatus termy_terminal_write_mouse_motion(
+    TermyFfiTerminal *terminal,
+    const uint8_t *bytes_ptr,
+    size_t bytes_len);
+TermyFfiStatus termy_terminal_feed_output(
+    TermyFfiTerminal *terminal,
+    const uint8_t *bytes_ptr,
+    size_t bytes_len);
+/* Display terminals: feed output and return every protocol reply queued so
+ * far (DA, DSR, DECRQM, color and status reports), synchronously and in the
+ * order the engine produced them, so a status report precedes a following
+ * DA reply. Replies otherwise wait for the protocol_reply_callback of
+ * termy_terminal_drain_events_with_clipboard. Free with termy_buffer_free;
+ * an empty result has a null pointer. Terminals with a PTY send replies to
+ * the child themselves and return none. */
+TermyFfiStatus termy_terminal_feed_output_with_replies(
+    TermyFfiTerminal *terminal,
+    const uint8_t *bytes_ptr,
+    size_t bytes_len,
+    TermyFfiBytes *out_replies);
+/* Replica mode for display terminals that mirror another terminal's output,
+ * which already answered: with replies disabled, queries are parsed and
+ * change no state, and every reply is dropped instead of queued. Enabled by
+ * default. */
+TermyFfiStatus termy_terminal_set_protocol_replies_enabled(
+    TermyFfiTerminal *terminal,
+    bool enabled);
+/* Full terminal state: screens and scrollback with cells, graphemes, styles,
+ * links and wrap flags; cursors, saved cursors, margins, tab stops, charsets,
+ * modes, kitty keyboard stacks, palette overrides, title stack, OSC 7
+ * directory and the parser's in-progress sequence. Versioned and
+ * little-endian; see crates/core/src/terminal_engine/snapshot.rs. Kitty
+ * graphics are included; queued events and replies are not. Decoding reads
+ * the current and every older snapshot version. Release the buffer like
+ * other returned bytes. Multiplexer-backed terminals return
+ * TERMY_FFI_INVALID_ARGUMENT. */
+TermyFfiStatus termy_terminal_snapshot_encode(
+    TermyFfiTerminal *terminal,
+    TermyFfiBytes *out_snapshot);
+/* A new display terminal holding a snapshot's state. Feeding it the bytes
+ * the original receives next leaves both in the same state. */
+TermyFfiStatus termy_terminal_snapshot_decode(
+    const uint8_t *snapshot_ptr,
+    size_t snapshot_len,
+    TermyFfiTerminal **out_terminal);
+/* Replace an existing terminal's state with a snapshot. The terminal keeps
+ * its configured query colors, default cursor style and cell size. */
+TermyFfiStatus termy_terminal_snapshot_restore(
+    TermyFfiTerminal *terminal,
+    const uint8_t *snapshot_ptr,
+    size_t snapshot_len);
+TermyFfiStatus termy_terminal_encode_key(
+    TermyFfiTerminal *terminal,
+    const TermyFfiKeystroke *keystroke,
+    TermyFfiBytes *out_bytes);
+TermyFfiStatus termy_terminal_encode_key_with_options(
+    TermyFfiTerminal *terminal,
+    const TermyFfiKeystroke *keystroke,
+    bool macos_option_as_alt,
+    TermyFfiBytes *out_bytes);
+TermyFfiStatus termy_terminal_encode_mouse(
+    TermyFfiTerminal *terminal,
+    const TermyFfiMouseInput *input,
+    TermyFfiBytes *out_bytes);
+/* Encode pasted UTF-8 text for the program: line endings become Enter,
+ * control characters (C0 except tab, DEL, C1) are dropped so the paste cannot
+ * run commands or end the bracket early, and the text is wrapped in
+ * bracketed-paste markers when the program enabled mode 2004. */
+TermyFfiStatus termy_terminal_encode_paste(
+    TermyFfiTerminal *terminal,
+    const uint8_t *text_ptr,
+    size_t text_len,
+    TermyFfiBytes *out_bytes);
+TermyFfiStatus termy_terminal_resize(TermyFfiTerminal *terminal, TermyFfiSize size);
+TermyFfiStatus termy_terminal_set_wakeup_enabled(
+    TermyFfiTerminal *terminal,
+    bool enabled);
+/* Block up to timeout_ms (0 = poll) for a wake signal, coalescing pending
+ * signals into one *out_woke. The one function meant to run on a dedicated
+ * thread concurrently with serialized terminal calls; must not be running when
+ * the handle is freed. */
+TermyFfiStatus termy_terminal_wait_for_wakeup(
+    TermyFfiTerminal *terminal,
+    uint64_t timeout_ms,
+    bool *out_woke);
+TermyFfiStatus termy_terminal_notify_wakeup(TermyFfiTerminal *terminal);
+TermyFfiStatus termy_terminal_scroll_display(
+    TermyFfiTerminal *terminal,
+    int32_t delta_lines,
+    bool *out_changed);
+TermyFfiStatus termy_terminal_scroll_to_bottom(
+    TermyFfiTerminal *terminal,
+    bool *out_changed);
+TermyFfiStatus termy_terminal_clear_scrollback(
+    TermyFfiTerminal *terminal,
+    bool *out_changed);
+TermyFfiStatus termy_terminal_set_scrollback_history(
+    TermyFfiTerminal *terminal,
+    size_t scrollback_history);
+/* The modes programs turned on, as JSON: alternate_screen, bracketed_paste,
+ * mouse {enabled, report_click, report_drag, report_motion, sgr_encoding,
+ * utf8_encoding} and keyboard {application_keypad, disambiguate_escape_codes,
+ * report_event_types, report_alternate_keys, report_all_keys_as_esc,
+ * report_associated_text}. Free with the buffer free call. */
+TermyFfiStatus termy_terminal_modes_json(
+    TermyFfiTerminal *terminal,
+    TermyFfiBytes *out_json);
+/* The screen and scrollback as text, the last max_lines lines (0 for all),
+ * oldest first. flags: 0 plain, 1 with SGR escapes, 2 HTML, or'd with
+ * TERMY_TEXT_UNWRAP to join lines the terminal wrapped. Free with
+ * termy_buffer_free. */
+#define TERMY_TEXT_UNWRAP (1u << 8)
+TermyFfiStatus termy_terminal_text(
+    TermyFfiTerminal *terminal,
+    uint32_t flags,
+    uint32_t max_lines,
+    TermyFfiBytes *out_text);
+/* Buffer lines are numbered with 0 the top screen row and -1 the newest
+ * history row. The first and last line of the buffer, history included. */
+TermyFfiStatus termy_terminal_line_bounds(
+    TermyFfiTerminal *terminal,
+    int32_t *out_first,
+    int32_t *out_last);
+/* The lines of first..last (inclusive) that OSC 133;A (prompt start) or
+ * 133;C (command output start) marked while the cursor was on them, oldest
+ * first. Marks follow their rows into history and through reflow; snapshots
+ * drop them. *out_supported is false, with no marks, when the terminal can't
+ * tell: it views a pane of a session host of another build. Free the batch
+ * with the prompt mark batch free call. */
+TermyFfiStatus termy_terminal_prompt_marks(
+    TermyFfiTerminal *terminal,
+    int32_t first,
+    int32_t last,
+    bool *out_supported,
+    TermyFfiPromptMarkBatch *out_batch);
+TermyFfiStatus termy_prompt_mark_batch_free(TermyFfiPromptMarkBatch *batch);
+/* The plain text of lines first..last (inclusive, clamped to the buffer): a
+ * soft-wrapped line joins the next without a newline, every other line ends
+ * with one (none after the last), and trailing blanks of each line are
+ * dropped. Free the text with the buffer free call. */
+TermyFfiStatus termy_terminal_line_range_text(
+    TermyFfiTerminal *terminal,
+    int32_t first,
+    int32_t last,
+    TermyFfiBytes *out_text);
+TermyFfiStatus termy_terminal_bracketed_paste_mode(
+    TermyFfiTerminal *terminal,
+    bool *out_enabled);
+TermyFfiStatus termy_terminal_snapshot(
+    TermyFfiTerminal *terminal,
+    TermyFfiFrame *out_frame);
+TermyFfiStatus termy_frame_free(TermyFfiFrame *frame);
+TermyFfiStatus termy_terminal_take_frame_update(
+    TermyFfiTerminal *terminal,
+    bool force_full,
+    TermyFfiFrameUpdate *out_update);
+TermyFfiStatus termy_frame_update_free(TermyFfiFrameUpdate *update);
+/* Like taking a frame update, for a host that keeps the frame it shows:
+ * scrolled output comes back as out_scrolls, to apply in order to that frame
+ * before the update's spans patch it, instead of as damage on every row it
+ * moved. Scrolls only accompany partial damage. Free them with the scrolls
+ * free call. */
+TermyFfiStatus termy_terminal_take_frame_update_with_scrolls(
+    TermyFfiTerminal *terminal,
+    bool force_full,
+    TermyFfiFrameUpdate *out_update,
+    TermyFfiViewportScrollBatch *out_scrolls);
+TermyFfiStatus termy_viewport_scrolls_free(TermyFfiViewportScrollBatch *scrolls);
+/* Build a sparse special-glyph plan from a retained full row-major frame.
+ * Pass no spans to plan the full frame, or inclusive dirty spans to plan only
+ * changed cells. Entry cell_index values address the full frame. Rectangle and
+ * stroke coordinates are cell-relative; hosts perform final device-pixel
+ * snapping. Free successful plans with the matching plan free function. */
+TermyFfiStatus termy_cells_build_glyph_render_plan(
+    const TermyFfiCell *cells_ptr,
+    size_t cells_len,
+    uint16_t cols,
+    uint16_t rows,
+    const TermyFfiDirtySpan *spans_ptr,
+    size_t spans_len,
+    TermyFfiGlyphMetrics metrics,
+    TermyFfiGlyphRenderPlan *out_plan);
+TermyFfiStatus termy_glyph_render_plan_free(TermyFfiGlyphRenderPlan *plan);
+TermyFfiStatus termy_terminal_kitty_graphics_revision(
+    TermyFfiTerminal *terminal,
+    uint64_t *out_revision);
+TermyFfiStatus termy_terminal_kitty_graphics_placements(
+    TermyFfiTerminal *terminal,
+    TermyFfiKittyGraphicsBatch *out_batch);
+/* The same placements without the PNG round trip. An image's pixels arrive
+ * as raw RGBA8 in `rgba` (or in `png` for the rare image stored only as a
+ * PNG), and an image listed in `known` arrives with neither: keep the pixels
+ * of the images you draw, keyed by id and generation, and pass those keys. */
+TermyFfiStatus termy_terminal_kitty_graphics_placements_rgba(
+    TermyFfiTerminal *terminal,
+    const TermyFfiKittyImageKey *known_ptr,
+    size_t known_len,
+    TermyFfiKittyGraphicsBatch *out_batch);
+TermyFfiStatus termy_kitty_graphics_batch_free(
+    TermyFfiKittyGraphicsBatch *batch);
+TermyFfiStatus termy_terminal_kitty_clipboard_paste_events_enabled(
+    TermyFfiTerminal *terminal,
+    bool *out_enabled);
+TermyFfiStatus termy_terminal_send_kitty_clipboard_paste_event(
+    TermyFfiTerminal *terminal,
+    uint32_t location,
+    const TermyFfiByteSlice *available_formats_ptr,
+    size_t available_formats_len,
+    bool *out_sent);
+TermyFfiStatus termy_terminal_hyperlink_at(
+    TermyFfiTerminal *terminal,
+    size_t row,
+    size_t col,
+    bool *out_found,
+    TermyFfiHyperlink *out_link);
+TermyFfiStatus termy_hyperlink_free(TermyFfiHyperlink *link);
+TermyFfiStatus termy_terminal_link_at(
+    TermyFfiTerminal *terminal,
+    size_t row,
+    size_t col,
+    bool *out_found,
+    TermyFfiLink *out_link);
+TermyFfiStatus termy_link_free(TermyFfiLink *link);
+TermyFfiStatus termy_terminal_take_damage(
+    TermyFfiTerminal *terminal,
+    TermyFfiDamage *out_damage);
+TermyFfiStatus termy_damage_free(TermyFfiDamage *damage);
+TermyFfiStatus termy_terminal_drain_events(
+    TermyFfiTerminal *terminal,
+    TermyFfiEventBatch *out_batch);
+/* Drain events while synchronously servicing Kitty OSC 5522 clipboard
+ * requests. Request fields and their nested byte slices are borrowed only for
+ * the duration of each callback. A read callback must invoke reply_callback
+ * synchronously before returning and must not retain it or reply_user_data;
+ * response slices are copied during that invocation. Either host callback may
+ * be NULL; missing reads are denied and missing writes are unsupported. The
+ * host must enforce its own clipboard permission policy using the request
+ * permission fields. protocol_reply_callback receives reply bytes for
+ * display-only terminals without an owned PTY; its byte slice is borrowed only
+ * for that callback. A NULL protocol_reply_callback drops the queued replies
+ * without changing any other state. No callback may re-enter the same
+ * terminal handle. */
+TermyFfiStatus termy_terminal_drain_events_with_clipboard(
+    TermyFfiTerminal *terminal,
+    TermyFfiUserData user_data,
+    TermyFfiClipboardReadCallback read_callback,
+    TermyFfiClipboardWriteCallback write_callback,
+    TermyFfiProtocolReplyCallback protocol_reply_callback,
+    TermyFfiEventBatch *out_batch);
+TermyFfiStatus termy_event_batch_free(TermyFfiEventBatch *batch);
+TermyFfiStatus termy_terminal_search(
+    TermyFfiTerminal *terminal,
+    const uint8_t *query_ptr,
+    size_t query_len,
+    TermyFfiSearchBatch *out_batch);
+TermyFfiStatus termy_terminal_search_with_options(
+    TermyFfiTerminal *terminal,
+    const uint8_t *query_ptr,
+    size_t query_len,
+    TermyFfiSearchOptions options,
+    TermyFfiSearchBatch *out_batch);
+TermyFfiStatus termy_search_batch_free(TermyFfiSearchBatch *batch);
+/* A search of a terminal's history and screen that may run on any thread,
+ * concurrently with every call on the terminal (unlike the calls above, which
+ * are serialized): it holds its own reference to the engine or, for a
+ * session-host pane, its own connection, and stays valid after the terminal
+ * is freed. Creating one is a serialized call on the terminal. A local
+ * terminal's text is copied in chunks with the engine lock released between
+ * them, so output keeps parsing. Free it with the searcher free call. */
+TermyFfiStatus termy_terminal_searcher_new(
+    TermyFfiTerminal *terminal,
+    TermyFfiSearcher **out_searcher);
+TermyFfiStatus termy_searcher_search(
+    const TermyFfiSearcher *searcher,
+    const uint8_t *query_ptr,
+    size_t query_len,
+    TermyFfiSearchOptions options,
+    TermyFfiSearchBatch *out_batch);
+TermyFfiStatus termy_searcher_free(TermyFfiSearcher *searcher);
+TermyFfiStatus termy_buffer_free(TermyFfiBytes bytes);
+
+/* Multiplexer: terminals whose programs live in a session host, so they
+ * outlive the app and can be attached again after a relaunch. Calls block on
+ * the host; make them off the UI thread. A created or attached terminal is an
+ * ordinary TermyFfiTerminal: freeing it detaches, and the program keeps
+ * running until the pane is closed. */
+
+/* Connect to the host in root (empty: the directory Termy and `termy mux`
+ * share), starting host_executable (termy-session-host) when none runs. */
+TermyFfiStatus termy_multiplexer_connect(
+    const uint8_t *root_ptr,
+    size_t root_len,
+    const uint8_t *host_executable_ptr,
+    size_t host_executable_len,
+    TermyFfiMultiplexer **out_multiplexer);
+TermyFfiStatus termy_multiplexer_free(TermyFfiMultiplexer *multiplexer);
+/* Start a pane and attach to it. out_pane_id is an owned buffer. */
+TermyFfiStatus termy_multiplexer_create_terminal(
+    const TermyFfiMultiplexer *multiplexer,
+    TermyFfiSize size,
+    const TermyFfiTerminalOptions *options,
+    TermyFfiBytes *out_pane_id,
+    TermyFfiTerminal **out_terminal);
+/* Attach to a running pane; TERMY_FFI_NOT_FOUND when it is gone. */
+TermyFfiStatus termy_multiplexer_attach_terminal(
+    const TermyFfiMultiplexer *multiplexer,
+    const uint8_t *pane_id_ptr,
+    size_t pane_id_len,
+    TermyFfiTerminal **out_terminal);
+/* The host's panes as a JSON array of objects with id, child_pid, title,
+ * working_directory, exited and shell, in an owned buffer. */
+TermyFfiStatus termy_multiplexer_list_json(
+    const TermyFfiMultiplexer *multiplexer,
+    TermyFfiBytes *out_json);
+/* End a pane's program and remove the pane. */
+TermyFfiStatus termy_multiplexer_close(
+    const TermyFfiMultiplexer *multiplexer,
+    const uint8_t *pane_id_ptr,
+    size_t pane_id_len);
+/* End every pane and stop the host. */
+TermyFfiStatus termy_multiplexer_shutdown(const TermyFfiMultiplexer *multiplexer);
+
+/* The shared window, workspace, tab and split layout, as a JSON tree of pane
+ * IDs; see the ffi README. Writes are compare-and-set on the revision. */
+typedef struct TermyFfiLayoutWatch TermyFfiLayoutWatch;
+typedef void (*TermyFfiLayoutChangedCallback)(void *context, uint64_t revision);
+TermyFfiStatus termy_multiplexer_layout_json(
+    const TermyFfiMultiplexer *multiplexer,
+    TermyFfiBytes *out_json);
+TermyFfiStatus termy_multiplexer_set_layout_json(
+    const TermyFfiMultiplexer *multiplexer,
+    const uint8_t *json_ptr,
+    size_t json_len,
+    uint64_t expected_revision,
+    uint64_t *out_revision,
+    bool *out_updated);
+TermyFfiStatus termy_multiplexer_watch_layout(
+    const TermyFfiMultiplexer *multiplexer,
+    TermyFfiLayoutChangedCallback callback,
+    TermyFfiUserData context,
+    TermyFfiLayoutWatch **out_watch);
+TermyFfiStatus termy_layout_watch_free(TermyFfiLayoutWatch *watch);
+TermyFfiBytes termy_null_buffer(void);
+size_t termy_runtime_config_default_scrollback(void);
+size_t termy_terminal_options_default_scrollback(void);
+TermyFfiStatus termy_query_color_default_foreground(TermyFfiColor *out_color);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

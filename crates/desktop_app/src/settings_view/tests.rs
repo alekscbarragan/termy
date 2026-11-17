@@ -1,6 +1,6 @@
 use super::test_utils::open_settings_window_handle;
 use super::*;
-use gpui::{AnyWindowHandle, Keystroke, TestAppContext};
+use gpui_kit::{AnyWindowHandle, Keystroke, TestAppContext};
 
 fn settings_window_count(cx: &TestAppContext) -> usize {
     cx.windows()
@@ -55,7 +55,7 @@ fn settings_preview_keeps_unrelated_value() {
     );
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn settings_ui_tokens_track_the_windows_own_chrome_colors(cx: &mut TestAppContext) {
     let settings = open_settings_window_handle(cx);
 
@@ -90,14 +90,14 @@ fn settings_ui_tokens_track_the_windows_own_chrome_colors(cx: &mut TestAppContex
 
     cx.update(|app| {
         assert_eq!(
-            app.try_global::<termy_ui::Tokens>().copied(),
+            app.try_global::<crate::design_system::Tokens>().copied(),
             Some(tokens),
             "components render from the global, so it has to carry this window's colors"
         );
     });
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn escape_closes_settings_window_with_sidebar_search_active(cx: &mut TestAppContext) {
     let settings = open_settings_window_handle(cx);
     assert_eq!(settings_window_count(cx), 1);

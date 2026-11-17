@@ -1,0 +1,6530 @@
+#![allow(clippy::missing_safety_doc)]
+
+use std::{
+    collections::{BTreeSet, HashMap},
+    ffi::c_void,
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
+    ptr, slice, str,
+    time::Duration,
+};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::{
+    ConfigDiagnostic, ConfigDiagnosticKind, KittyGraphicsRenderPlacement, LoadedTermyConfig,
+    ProgressState, Terminal, TerminalClipboardContent, TerminalClipboardLocation,
+    TerminalClipboardReadRequest, TerminalClipboardReadResult, TerminalClipboardTarget,
+    TerminalClipboardWriteRequest, TerminalClipboardWriteResult, TerminalDamageSnapshot,
+    TerminalDirtySpan, TerminalEvent, TerminalGlyphMetrics, TerminalGlyphNeighbors,
+    TerminalGlyphRectSnap, TerminalGlyphRenderKind, TerminalGlyphStrokeKind, TerminalKeyEventKind,
+    TerminalMouseButton, TerminalMouseEventKind, TerminalMouseModifiers, TerminalMousePosition,
+    TerminalOptions, TerminalQueryColors, TerminalReplyHost, TerminalRuntimeConfig, TerminalSize,
+    TermyCell, TermyColor, TermyFrameUpdate, TermyKeystroke, TermyModifiers, TermySearchOptions,
+    TermySharedSearchMatch, encode_mouse_report, keystroke_to_input_with_options,
+    load_config_from_contents, load_config_from_default_path, load_config_from_path,
+    terminal_glyph_plan,
+};
+use flume::{Receiver, Sender, bounded};
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TermyFfiStatus {
+    Ok = 0,
+    Null = 1,
+    InvalidUtf8 = 2,
+    SpawnFailed = 3,
+    ConfigLoadFailed = 4,
+    UnknownKey = 5,
+    WriteFailed = 6,
+    SerializeFailed = 7,
+    Panicked = 8,
+    InvalidArgument = 9,
+    UnsupportedSnapshotVersion = 10,
+    InvalidSnapshot = 11,
+    /// No session host runs there, or it cannot be reached or started.
+    HostUnavailable = 12,
+    /// A host of another Termy version runs there.
+    VersionMismatch = 13,
+    /// The pane is gone or its program exited.
+    NotFound = 14,
+}
+
+mod multiplexer;
+pub use multiplexer::*;
+mod inspect;
+pub use inspect::*;
+mod lines;
+pub use lines::*;
+
+#[cfg(test)]
+static PANIC_NEXT_FEED_OUTPUT: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static PANIC_NEXT_RESIZE: AtomicBool = AtomicBool::new(false);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TermyFfiSize {
+    pub cols: u16,
+    pub rows: u16,
+    pub cell_width: f32,
+    pub cell_height: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+/// One viewport cell. Carries no position: full frames are row-major
+/// (`index = row * cols + col`) and frame-update cells follow the dirty spans
+/// in order, so the host derives position from context.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiCell {
+    pub codepoint: u32,
+    pub fg: TermyFfiColor,
+    pub bg: TermyFfiColor,
+    pub uses_terminal_default_bg: bool,
+    pub bold: bool,
+    pub render_text: bool,
+    pub wide_character_spacer: bool,
+    pub line_wrapped: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiCursor {
+    pub visible: bool,
+    pub col: usize,
+    pub row: usize,
+    pub style: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiFrame {
+    pub cols: u16,
+    pub rows: u16,
+    pub cells_ptr: *mut TermyFfiCell,
+    pub cells_len: usize,
+    pub cells_capacity: usize,
+    pub cursor: TermyFfiCursor,
+    pub display_offset: usize,
+    pub history_size: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiFrameUpdate {
+    pub cols: u16,
+    pub rows: u16,
+    pub cells_ptr: *mut TermyFfiCell,
+    pub cells_len: usize,
+    pub cells_capacity: usize,
+    pub cursor: TermyFfiCursor,
+    pub display_offset: usize,
+    pub history_size: usize,
+    pub damage_kind: u32,
+    pub spans_ptr: *mut TermyFfiDirtySpan,
+    pub spans_len: usize,
+    pub spans_capacity: usize,
+}
+
+/// One scroll of viewport rows `top..=bottom` (inclusive) by `count` rows:
+/// `TERMY_FFI_SCROLL_UP` (1) moves content toward row 0, `..._DOWN` (2)
+/// away from it. Rows a scroll exposes are in the update's damage.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiViewportScroll {
+    pub top: usize,
+    pub bottom: usize,
+    pub count: usize,
+    pub direction: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiViewportScrollBatch {
+    pub scrolls_ptr: *mut TermyFfiViewportScroll,
+    pub scrolls_len: usize,
+    pub scrolls_capacity: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiBytes {
+    pub ptr: *mut u8,
+    pub len: usize,
+    pub capacity: usize,
+}
+
+/// Non-owning bytes supplied by an FFI caller or borrowed for a callback.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiByteSlice {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiClipboardContent {
+    pub mime_type: TermyFfiByteSlice,
+    pub data: TermyFfiByteSlice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiClipboardReadRequest {
+    pub location: u32,
+    pub mime_types_ptr: *const TermyFfiByteSlice,
+    pub mime_types_len: usize,
+    pub list_available: bool,
+    pub name: TermyFfiByteSlice,
+    pub has_name: bool,
+    pub permission_granted: bool,
+    pub can_remember_permission: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiClipboardReadResponse {
+    pub status: u32,
+    pub available_formats_ptr: *const TermyFfiByteSlice,
+    pub available_formats_len: usize,
+    pub contents_ptr: *const TermyFfiClipboardContent,
+    pub contents_len: usize,
+    pub remember_permission: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiClipboardWriteRequest {
+    pub location: u32,
+    pub contents_ptr: *const TermyFfiClipboardContent,
+    pub contents_len: usize,
+    pub name: TermyFfiByteSlice,
+    pub has_name: bool,
+    pub permission_granted: bool,
+    pub can_remember_permission: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiClipboardWriteResponse {
+    pub status: u32,
+    pub remember_permission: bool,
+}
+
+pub type TermyFfiUserData = *mut c_void;
+pub type TermyFfiClipboardReadReplyCallback = unsafe extern "C" fn(
+    user_data: TermyFfiUserData,
+    response: *const TermyFfiClipboardReadResponse,
+);
+pub type TermyFfiClipboardReadCallback = unsafe extern "C" fn(
+    user_data: TermyFfiUserData,
+    request: *const TermyFfiClipboardReadRequest,
+    reply_user_data: TermyFfiUserData,
+    reply_callback: TermyFfiClipboardReadReplyCallback,
+);
+pub type TermyFfiClipboardWriteCallback = unsafe extern "C" fn(
+    user_data: TermyFfiUserData,
+    request: *const TermyFfiClipboardWriteRequest,
+) -> TermyFfiClipboardWriteResponse;
+pub type TermyFfiProtocolReplyCallback =
+    unsafe extern "C" fn(user_data: TermyFfiUserData, reply: TermyFfiByteSlice);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiKittyGraphicsPlacement {
+    pub placement_serial: u64,
+    pub image_id: u32,
+    pub placement_id: u32,
+    pub png: TermyFfiBytes,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub image_generation: u64,
+    pub viewport_row: i32,
+    pub col: usize,
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub has_display_cols: bool,
+    pub display_cols: u32,
+    pub has_display_rows: bool,
+    pub display_rows: u32,
+    pub occupied_cols: u32,
+    pub occupied_rows: u32,
+    pub x_offset: u32,
+    pub y_offset: u32,
+    pub z_index: i32,
+    pub col_offset: i32,
+    pub is_virtual_cell: bool,
+    pub virtual_cell_col: u32,
+    pub virtual_cell_row: u32,
+    pub clip_top_rows: u32,
+    pub clip_bottom_rows: u32,
+    /// Zero for a static placement; otherwise the next animation wakeup delay.
+    pub next_frame_delay_ms: u64,
+    /// Set only by `termy_terminal_kitty_graphics_placements_rgba`: the
+    /// image as `image_width * image_height` RGBA8 pixels with straight alpha.
+    pub rgba: TermyFfiBytes,
+}
+
+/// An image whose pixels the host already holds: its id and generation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TermyFfiKittyImageKey {
+    pub image_id: u32,
+    pub image_generation: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TermyFfiKittyGraphicsBatch {
+    pub revision: u64,
+    pub placements_ptr: *mut TermyFfiKittyGraphicsPlacement,
+    pub placements_len: usize,
+    pub placements_capacity: usize,
+    /// The terminal's cell size, in the pixels that image sizes and pixel
+    /// offsets are measured in. Scale by your cell size over this one.
+    pub cell_width: f32,
+    pub cell_height: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiEvent {
+    pub kind: u32,
+    pub exit_code: i32,
+    pub progress_state: u8,
+    pub progress_value: u8,
+    pub payload: TermyFfiBytes,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiEventBatch {
+    pub events_ptr: *mut TermyFfiEvent,
+    pub events_len: usize,
+    pub events_capacity: usize,
+    pub has_more: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiDirtySpan {
+    pub row: usize,
+    pub left_col: usize,
+    pub right_col: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TermyFfiGlyphMetrics {
+    pub cell_width: f32,
+    pub cell_height: f32,
+    pub font_size: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TermyFfiGlyphRect {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub alpha: f32,
+    pub snap_kind: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TermyFfiGlyphPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TermyFfiGlyphStroke {
+    pub kind: u32,
+    pub point_count: u32,
+    pub width: f32,
+    pub point_0: TermyFfiGlyphPoint,
+    pub point_1: TermyFfiGlyphPoint,
+    pub point_2: TermyFfiGlyphPoint,
+    pub point_3: TermyFfiGlyphPoint,
+    pub point_4: TermyFfiGlyphPoint,
+    pub point_5: TermyFfiGlyphPoint,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiGlyphPlanEntry {
+    pub cell_index: usize,
+    pub render_kind: u32,
+    pub rect_start: usize,
+    pub rect_len: usize,
+    pub stroke_start: usize,
+    pub stroke_len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiGlyphRenderPlan {
+    pub entries_ptr: *mut TermyFfiGlyphPlanEntry,
+    pub entries_len: usize,
+    pub entries_capacity: usize,
+    pub rects_ptr: *mut TermyFfiGlyphRect,
+    pub rects_len: usize,
+    pub rects_capacity: usize,
+    pub strokes_ptr: *mut TermyFfiGlyphStroke,
+    pub strokes_len: usize,
+    pub strokes_capacity: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiDamage {
+    pub kind: u32,
+    pub spans_ptr: *mut TermyFfiDirtySpan,
+    pub spans_len: usize,
+    pub spans_capacity: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiHyperlink {
+    pub start_col: usize,
+    pub end_col: usize,
+    pub uri: TermyFfiBytes,
+}
+
+/// A link under a viewport cell, OSC 8 or detected in the text (URLs, domains,
+/// file paths), possibly spanning soft-wrapped rows. Rows and columns are
+/// inclusive viewport cells, clipped to the viewport.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiLink {
+    pub start_row: usize,
+    pub start_col: usize,
+    pub end_row: usize,
+    pub end_col: usize,
+    pub uri: TermyFfiBytes,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiSearchMatch {
+    pub row: usize,
+    pub start_col: usize,
+    pub end_col: usize,
+    pub line: TermyFfiBytes,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiSearchBatch {
+    pub matches_ptr: *mut TermyFfiSearchMatch,
+    pub matches_len: usize,
+    pub matches_capacity: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiSearchOptions {
+    pub case_sensitive: bool,
+    pub regex: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiConfigDiagnostic {
+    pub line_number: usize,
+    pub kind: u32,
+    pub message: TermyFfiBytes,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiConfigDiagnosticBatch {
+    pub diagnostics_ptr: *mut TermyFfiConfigDiagnostic,
+    pub diagnostics_len: usize,
+    pub diagnostics_capacity: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TermyFfiRenderConfig {
+    pub font_family: TermyFfiBytes,
+    pub active_theme: TermyFfiBytes,
+    pub foreground: TermyFfiColor,
+    pub background: TermyFfiColor,
+    pub cursor: TermyFfiColor,
+    pub font_size: f32,
+    pub line_height: f32,
+    pub padding_x: f32,
+    pub padding_y: f32,
+    pub background_opacity: f32,
+    pub background_opacity_cells: bool,
+    pub cursor_blink: bool,
+    pub cursor_style: u32,
+    pub cell_width: f32,
+    pub cell_height: f32,
+    pub background_blur: bool,
+    pub mouse_scroll_multiplier: f32,
+    pub scrollbar_visibility: u32,
+    pub scrollbar_style: u32,
+    pub copy_on_select: bool,
+    pub copy_on_select_toast: bool,
+    pub pane_focus_effect: u32,
+    pub pane_focus_strength: f32,
+    pub chrome_contrast: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiSafetyConfig {
+    pub warn_on_quit: bool,
+    pub warn_on_quit_with_running_process: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TermyFfiNativeConfig {
+    pub auto_update: bool,
+    pub tmux_enabled: bool,
+    pub tmux_persistence: bool,
+    pub tmux_exclusive: bool,
+    pub tmux_show_active_pane_border: bool,
+    pub simple_mode: bool,
+    pub native_tab_persistence: bool,
+    pub native_layout_autosave: bool,
+    pub native_buffer_persistence: bool,
+    pub show_debug_overlay: bool,
+    pub onboarding_complete: bool,
+    pub tab_close_visibility: u32,
+    pub tab_width_mode: u32,
+    pub tab_bar_position: u32,
+    pub tab_switch_modifier_hints: bool,
+    pub chrome_contrast: bool,
+    pub command_palette_show_keybinds: bool,
+    pub app_icon: u32,
+    pub shell_integration_enabled: bool,
+    pub progress_indicator_enabled: bool,
+    pub auto_hide_tabbar: bool,
+    pub show_termy_in_titlebar: bool,
+    pub macos_option_as_alt: bool,
+}
+
+/// Opaque terminal handle passed across the C ABI as `*mut TermyFfiTerminal`.
+///
+/// # Thread safety
+///
+/// The handle is **not** internally synchronized. With a single exception, no
+/// two functions taking the same handle may execute concurrently — the caller
+/// must serialize all access (confine the handle to one thread, or guard it
+/// with an external lock). Distinct handles are independent.
+///
+/// The exception is the wake channel: `termy_terminal_wait_for_wakeup` and
+/// `termy_terminal_notify_wakeup` touch only the internal wake channel, never
+/// the terminal state, so they are the only functions safe to call concurrently
+/// with the serialized calls above. The intended pattern is one dedicated
+/// thread blocked in `termy_terminal_wait_for_wakeup` while another thread
+/// drives the terminal.
+///
+/// # Lifetime
+///
+/// `termy_terminal_free` consumes the handle and drops everything it owns,
+/// including the wake channel. The caller must ensure no other function —
+/// including a thread blocked in `termy_terminal_wait_for_wakeup` — is executing
+/// on the handle when it is freed, and that none is called afterward. Teardown
+/// for a handle that has a wakeup thread: stop terminal calls, call
+/// `termy_terminal_notify_wakeup` to release the blocked wait, join that thread,
+/// then call `termy_terminal_free`. Freeing while a thread is parked in
+/// `termy_terminal_wait_for_wakeup` is a use-after-free.
+pub struct TermyFfiTerminal {
+    terminal: Terminal,
+    wakeups_tx: Option<Sender<()>>,
+    wakeups_rx: Option<Receiver<()>>,
+    /// PNG exports from the last graphics batch. Images cache their encoding
+    /// only while someone holds it, so this keeps polling from re-encoding.
+    kitty_png_exports: Vec<std::sync::Arc<Vec<u8>>>,
+}
+
+pub struct TermyFfiConfig {
+    loaded: LoadedTermyConfig,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiEnvVar {
+    pub key_ptr: *const u8,
+    pub key_len: usize,
+    pub value_ptr: *const u8,
+    pub value_len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiTerminalOptions {
+    pub config: *const TermyFfiConfig,
+    pub working_directory_ptr: *const u8,
+    pub working_directory_len: usize,
+    pub startup_command_ptr: *const u8,
+    pub startup_command_len: usize,
+    pub env_vars_ptr: *const TermyFfiEnvVar,
+    pub env_vars_len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiKeystroke {
+    pub control: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub platform: bool,
+    pub function: bool,
+    pub key_ptr: *const u8,
+    pub key_len: usize,
+    pub key_char_ptr: *const u8,
+    pub key_char_len: usize,
+    pub event_kind: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermyFfiMouseInput {
+    pub kind: u32,
+    pub button: u32,
+    pub col: usize,
+    pub row: usize,
+    pub control: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+struct EmptyReplyHost;
+
+impl TerminalReplyHost for EmptyReplyHost {
+    fn load_clipboard(&mut self, _target: TerminalClipboardTarget) -> Option<String> {
+        None
+    }
+}
+
+const FFI_CLIPBOARD_LOCATION_CLIPBOARD: u32 = 1;
+const FFI_CLIPBOARD_LOCATION_PRIMARY: u32 = 2;
+const FFI_CLIPBOARD_RESULT_SUCCESS: u32 = 0;
+const FFI_CLIPBOARD_RESULT_DENIED: u32 = 1;
+const FFI_CLIPBOARD_RESULT_UNSUPPORTED: u32 = 2;
+const FFI_CLIPBOARD_RESULT_BUSY: u32 = 3;
+const FFI_CLIPBOARD_RESULT_INVALID_DATA: u32 = 4;
+const FFI_CLIPBOARD_RESULT_IO_ERROR: u32 = 5;
+
+struct FfiClipboardReplyHost {
+    user_data: TermyFfiUserData,
+    read_callback: Option<TermyFfiClipboardReadCallback>,
+    write_callback: Option<TermyFfiClipboardWriteCallback>,
+    protocol_reply_callback: Option<TermyFfiProtocolReplyCallback>,
+}
+
+struct FfiClipboardReadCapture {
+    result: Option<TerminalClipboardReadResult>,
+}
+
+unsafe extern "C" fn capture_ffi_clipboard_read_response(
+    user_data: TermyFfiUserData,
+    response: *const TermyFfiClipboardReadResponse,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    let capture = unsafe { &mut *user_data.cast::<FfiClipboardReadCapture>() };
+    if capture.result.is_some() {
+        return;
+    }
+    capture.result = Some(if response.is_null() {
+        TerminalClipboardReadResult::IoError
+    } else {
+        unsafe { clipboard_read_result_from_ffi(*response) }
+    });
+}
+
+impl TerminalReplyHost for FfiClipboardReplyHost {
+    fn load_clipboard(&mut self, _target: TerminalClipboardTarget) -> Option<String> {
+        None
+    }
+
+    fn protocol_reply(&mut self, bytes: &[u8]) {
+        if let Some(callback) = self.protocol_reply_callback {
+            unsafe { callback(self.user_data, ffi_byte_slice(bytes)) };
+        }
+    }
+
+    fn read_clipboard(
+        &mut self,
+        request: TerminalClipboardReadRequest,
+    ) -> TerminalClipboardReadResult {
+        let Some(callback) = self.read_callback else {
+            return TerminalClipboardReadResult::Denied;
+        };
+        let mime_types = request
+            .mime_types
+            .iter()
+            .map(|mime_type| ffi_byte_slice(mime_type.as_bytes()))
+            .collect::<Vec<_>>();
+        let (name, has_name) = request
+            .name
+            .as_deref()
+            .map_or((TermyFfiByteSlice::default(), false), |name| {
+                (ffi_byte_slice(name.as_bytes()), true)
+            });
+        let ffi_request = TermyFfiClipboardReadRequest {
+            location: ffi_clipboard_location(request.location),
+            mime_types_ptr: mime_types.as_ptr(),
+            mime_types_len: mime_types.len(),
+            list_available: request.list_available,
+            name,
+            has_name,
+            permission_granted: request.permission_granted,
+            can_remember_permission: request.can_remember_permission,
+        };
+        let mut capture = FfiClipboardReadCapture { result: None };
+        unsafe {
+            callback(
+                self.user_data,
+                &ffi_request,
+                ptr::from_mut(&mut capture).cast(),
+                capture_ffi_clipboard_read_response,
+            );
+        }
+        let result = capture
+            .result
+            .unwrap_or(TerminalClipboardReadResult::IoError);
+        validate_clipboard_read_result(&request, result)
+    }
+
+    fn write_clipboard(
+        &mut self,
+        request: TerminalClipboardWriteRequest,
+    ) -> TerminalClipboardWriteResult {
+        let Some(callback) = self.write_callback else {
+            return TerminalClipboardWriteResult::Unsupported;
+        };
+        let contents = request
+            .contents
+            .iter()
+            .map(|content| TermyFfiClipboardContent {
+                mime_type: ffi_byte_slice(content.mime_type.as_bytes()),
+                data: ffi_byte_slice(&content.data),
+            })
+            .collect::<Vec<_>>();
+        let (name, has_name) = request
+            .name
+            .as_deref()
+            .map_or((TermyFfiByteSlice::default(), false), |name| {
+                (ffi_byte_slice(name.as_bytes()), true)
+            });
+        let ffi_request = TermyFfiClipboardWriteRequest {
+            location: ffi_clipboard_location(request.location),
+            contents_ptr: contents.as_ptr(),
+            contents_len: contents.len(),
+            name,
+            has_name,
+            permission_granted: request.permission_granted,
+            can_remember_permission: request.can_remember_permission,
+        };
+        let response = unsafe { callback(self.user_data, &ffi_request) };
+
+        match response.status {
+            FFI_CLIPBOARD_RESULT_SUCCESS => TerminalClipboardWriteResult::Success {
+                remember_permission: response.remember_permission,
+            },
+            FFI_CLIPBOARD_RESULT_DENIED => TerminalClipboardWriteResult::Denied,
+            FFI_CLIPBOARD_RESULT_UNSUPPORTED => TerminalClipboardWriteResult::Unsupported,
+            FFI_CLIPBOARD_RESULT_BUSY => TerminalClipboardWriteResult::Busy,
+            FFI_CLIPBOARD_RESULT_INVALID_DATA => TerminalClipboardWriteResult::InvalidData,
+            FFI_CLIPBOARD_RESULT_IO_ERROR => TerminalClipboardWriteResult::IoError,
+            _ => TerminalClipboardWriteResult::IoError,
+        }
+    }
+}
+
+fn ffi_clipboard_location(location: TerminalClipboardLocation) -> u32 {
+    match location {
+        TerminalClipboardLocation::Clipboard => FFI_CLIPBOARD_LOCATION_CLIPBOARD,
+        TerminalClipboardLocation::Primary => FFI_CLIPBOARD_LOCATION_PRIMARY,
+    }
+}
+
+fn clipboard_location_from_ffi(location: u32) -> Option<TerminalClipboardLocation> {
+    match location {
+        FFI_CLIPBOARD_LOCATION_CLIPBOARD => Some(TerminalClipboardLocation::Clipboard),
+        FFI_CLIPBOARD_LOCATION_PRIMARY => Some(TerminalClipboardLocation::Primary),
+        _ => None,
+    }
+}
+
+fn ffi_byte_slice(bytes: &[u8]) -> TermyFfiByteSlice {
+    TermyFfiByteSlice {
+        ptr: bytes.as_ptr(),
+        len: bytes.len(),
+    }
+}
+
+unsafe fn ffi_returned_slice<'a, T>(ptr: *const T, len: usize) -> Option<&'a [T]> {
+    if len == 0 {
+        return Some(&[]);
+    }
+    if ptr.is_null()
+        || !(ptr as usize).is_multiple_of(std::mem::align_of::<T>())
+        || len.checked_mul(std::mem::size_of::<T>())? > isize::MAX as usize
+    {
+        return None;
+    }
+    Some(unsafe { slice::from_raw_parts(ptr, len) })
+}
+
+unsafe fn copied_ffi_bytes(bytes: TermyFfiByteSlice) -> Option<Vec<u8>> {
+    unsafe { ffi_returned_slice(bytes.ptr, bytes.len) }.map(<[u8]>::to_vec)
+}
+
+unsafe fn copied_ffi_string(bytes: TermyFfiByteSlice) -> Option<String> {
+    let bytes = unsafe { ffi_returned_slice(bytes.ptr, bytes.len) }?;
+    str::from_utf8(bytes).ok().map(ToOwned::to_owned)
+}
+
+unsafe fn copied_ffi_strings(ptr: *const TermyFfiByteSlice, len: usize) -> Option<Vec<String>> {
+    unsafe { ffi_returned_slice(ptr, len) }?
+        .iter()
+        .map(|value| unsafe { copied_ffi_string(*value) })
+        .collect()
+}
+
+unsafe fn copied_ffi_clipboard_contents(
+    ptr: *const TermyFfiClipboardContent,
+    len: usize,
+) -> Option<Vec<TerminalClipboardContent>> {
+    unsafe { ffi_returned_slice(ptr, len) }?
+        .iter()
+        .map(|content| {
+            Some(TerminalClipboardContent {
+                mime_type: unsafe { copied_ffi_string(content.mime_type) }?,
+                data: unsafe { copied_ffi_bytes(content.data) }?,
+            })
+        })
+        .collect()
+}
+
+unsafe fn clipboard_read_result_from_ffi(
+    response: TermyFfiClipboardReadResponse,
+) -> TerminalClipboardReadResult {
+    match response.status {
+        FFI_CLIPBOARD_RESULT_SUCCESS => {
+            let Some(available_formats) = (unsafe {
+                copied_ffi_strings(
+                    response.available_formats_ptr,
+                    response.available_formats_len,
+                )
+            }) else {
+                return TerminalClipboardReadResult::IoError;
+            };
+            let Some(contents) = (unsafe {
+                copied_ffi_clipboard_contents(response.contents_ptr, response.contents_len)
+            }) else {
+                return TerminalClipboardReadResult::IoError;
+            };
+            TerminalClipboardReadResult::Success {
+                available_formats,
+                contents,
+                remember_permission: response.remember_permission,
+            }
+        }
+        FFI_CLIPBOARD_RESULT_DENIED => TerminalClipboardReadResult::Denied,
+        FFI_CLIPBOARD_RESULT_UNSUPPORTED => TerminalClipboardReadResult::Unsupported,
+        FFI_CLIPBOARD_RESULT_BUSY => TerminalClipboardReadResult::Busy,
+        FFI_CLIPBOARD_RESULT_INVALID_DATA | FFI_CLIPBOARD_RESULT_IO_ERROR => {
+            TerminalClipboardReadResult::IoError
+        }
+        _ => TerminalClipboardReadResult::IoError,
+    }
+}
+
+fn validate_clipboard_read_result(
+    request: &TerminalClipboardReadRequest,
+    result: TerminalClipboardReadResult,
+) -> TerminalClipboardReadResult {
+    let TerminalClipboardReadResult::Success { ref contents, .. } = result else {
+        return result;
+    };
+    if contents.iter().any(|content| {
+        !request
+            .mime_types
+            .iter()
+            .any(|requested| requested == &content.mime_type)
+    }) {
+        return TerminalClipboardReadResult::IoError;
+    }
+    result
+}
+
+impl From<TermyFfiSize> for TerminalSize {
+    fn from(size: TermyFfiSize) -> Self {
+        Self {
+            cols: size.cols,
+            rows: size.rows,
+            cell_width: size.cell_width,
+            cell_height: size.cell_height,
+        }
+    }
+}
+
+impl From<TermyColor> for TermyFfiColor {
+    fn from(color: TermyColor) -> Self {
+        Self {
+            r: color.r,
+            g: color.g,
+            b: color.b,
+            a: color.a,
+        }
+    }
+}
+
+impl From<TermyCell> for TermyFfiCell {
+    fn from(cell: TermyCell) -> Self {
+        Self {
+            codepoint: cell.char as u32,
+            fg: cell.fg.into(),
+            bg: cell.bg.into(),
+            uses_terminal_default_bg: cell.uses_terminal_default_bg,
+            bold: cell.bold,
+            render_text: cell.render_text,
+            wide_character_spacer: cell.wide_character_spacer,
+            line_wrapped: cell.line_wrapped,
+            italic: cell.italic,
+            underline: cell.underline,
+            strikethrough: cell.strikethrough,
+        }
+    }
+}
+
+fn ffi_cursor_from_cursor(cursor: Option<crate::TerminalCursorState>) -> TermyFfiCursor {
+    cursor.map_or_else(TermyFfiCursor::default, |cursor| TermyFfiCursor {
+        visible: true,
+        col: cursor.col,
+        row: cursor.row,
+        style: match cursor.style {
+            crate::TerminalCursorStyle::Line => 1,
+            crate::TerminalCursorStyle::Block => 2,
+        },
+    })
+}
+
+// `TermyCell` is laid out as `TermyFfiCell`, so a frame's cells are handed
+// to C hosts as they are. Every bit pattern of a `TermyCell` (a `char` is a
+// valid `u32`, `bool`s are `bool`s) is a valid `TermyFfiCell`.
+const _: () = {
+    use std::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<TermyCell>() == size_of::<TermyFfiCell>());
+    assert!(align_of::<TermyCell>() == align_of::<TermyFfiCell>());
+    assert!(offset_of!(TermyCell, char) == offset_of!(TermyFfiCell, codepoint));
+    assert!(offset_of!(TermyCell, fg) == offset_of!(TermyFfiCell, fg));
+    assert!(offset_of!(TermyCell, bg) == offset_of!(TermyFfiCell, bg));
+    assert!(
+        offset_of!(TermyCell, uses_terminal_default_bg)
+            == offset_of!(TermyFfiCell, uses_terminal_default_bg)
+    );
+    assert!(offset_of!(TermyCell, bold) == offset_of!(TermyFfiCell, bold));
+    assert!(offset_of!(TermyCell, render_text) == offset_of!(TermyFfiCell, render_text));
+    assert!(
+        offset_of!(TermyCell, wide_character_spacer)
+            == offset_of!(TermyFfiCell, wide_character_spacer)
+    );
+    assert!(offset_of!(TermyCell, line_wrapped) == offset_of!(TermyFfiCell, line_wrapped));
+    assert!(offset_of!(TermyCell, italic) == offset_of!(TermyFfiCell, italic));
+    assert!(offset_of!(TermyCell, underline) == offset_of!(TermyFfiCell, underline));
+    assert!(offset_of!(TermyCell, strikethrough) == offset_of!(TermyFfiCell, strikethrough));
+    assert!(size_of::<TermyColor>() == size_of::<TermyFfiColor>());
+    assert!(offset_of!(TermyColor, r) == offset_of!(TermyFfiColor, r));
+    assert!(offset_of!(TermyColor, g) == offset_of!(TermyFfiColor, g));
+    assert!(offset_of!(TermyColor, b) == offset_of!(TermyFfiColor, b));
+    assert!(offset_of!(TermyColor, a) == offset_of!(TermyFfiColor, a));
+};
+
+fn ffi_cells(cells: Vec<TermyCell>) -> Vec<TermyFfiCell> {
+    let mut cells = std::mem::ManuallyDrop::new(cells);
+    let (ptr, len, capacity) = (cells.as_mut_ptr(), cells.len(), cells.capacity());
+    // SAFETY: the types have the same size, alignment and field layout
+    // (asserted above), every `TermyCell` is a valid `TermyFfiCell`, and the
+    // allocation is handed over whole, so it is freed with the same layout.
+    unsafe { Vec::from_raw_parts(ptr.cast::<TermyFfiCell>(), len, capacity) }
+}
+
+fn ffi_frame_update_from_update(update: TermyFrameUpdate) -> TermyFfiFrameUpdate {
+    let cells = ffi_cells(update.cells);
+    let (cells_ptr, cells_len, cells_capacity) = leak_vec(cells);
+
+    let (damage_kind, spans) = match update.damage {
+        TerminalDamageSnapshot::Full => (1, Vec::new()),
+        TerminalDamageSnapshot::Partial(spans) if spans.is_empty() => (0, Vec::new()),
+        TerminalDamageSnapshot::Partial(spans) => {
+            let spans = spans
+                .into_iter()
+                .map(
+                    |TerminalDirtySpan {
+                         row,
+                         left_col,
+                         right_col,
+                     }| TermyFfiDirtySpan {
+                        row,
+                        left_col,
+                        right_col,
+                    },
+                )
+                .collect::<Vec<_>>();
+            (2, spans)
+        }
+    };
+    let (spans_ptr, spans_len, spans_capacity) = leak_vec(spans);
+
+    TermyFfiFrameUpdate {
+        cols: update.cols,
+        rows: update.rows,
+        cells_ptr,
+        cells_len,
+        cells_capacity,
+        cursor: ffi_cursor_from_cursor(update.cursor),
+        display_offset: update.display_offset,
+        history_size: update.history_size,
+        damage_kind,
+        spans_ptr,
+        spans_len,
+        spans_capacity,
+    }
+}
+
+fn ffi_bytes_from_vec(mut bytes: Vec<u8>) -> TermyFfiBytes {
+    let result = TermyFfiBytes {
+        ptr: bytes.as_mut_ptr(),
+        len: bytes.len(),
+        capacity: bytes.capacity(),
+    };
+    std::mem::forget(bytes);
+    result
+}
+
+fn ffi_bytes_from_string(value: String) -> TermyFfiBytes {
+    ffi_bytes_from_vec(value.into_bytes())
+}
+
+fn ffi_kitty_graphics_placement_from_placement(
+    placement: KittyGraphicsRenderPlacement,
+    png: TermyFfiBytes,
+    rgba: TermyFfiBytes,
+) -> TermyFfiKittyGraphicsPlacement {
+    TermyFfiKittyGraphicsPlacement {
+        placement_serial: placement.placement_serial,
+        image_id: placement.image_id,
+        placement_id: placement.placement_id,
+        png,
+        image_width: placement.image_width,
+        image_height: placement.image_height,
+        image_generation: placement.image_generation,
+        viewport_row: placement.viewport_row,
+        col: placement.col,
+        source_x: placement.source_x,
+        source_y: placement.source_y,
+        source_width: placement.source_width,
+        source_height: placement.source_height,
+        has_display_cols: placement.display_cols.is_some(),
+        display_cols: placement.display_cols.unwrap_or_default(),
+        has_display_rows: placement.display_rows.is_some(),
+        display_rows: placement.display_rows.unwrap_or_default(),
+        occupied_cols: placement.occupied_cols,
+        occupied_rows: placement.occupied_rows,
+        x_offset: placement.x_offset,
+        y_offset: placement.y_offset,
+        z_index: placement.z_index,
+        col_offset: placement.col_offset,
+        is_virtual_cell: placement.virtual_cell.is_some(),
+        virtual_cell_col: placement.virtual_cell.map_or(0, |cell| cell.0),
+        virtual_cell_row: placement.virtual_cell.map_or(0, |cell| cell.1),
+        clip_top_rows: placement.clip_top_rows,
+        clip_bottom_rows: placement.clip_bottom_rows,
+        next_frame_delay_ms: placement.animation_deadline.map_or(0, |deadline| {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .max(1)
+                .min(u64::MAX as u128) as u64
+        }),
+        rgba,
+    }
+}
+
+fn progress_parts(progress: ProgressState) -> (u8, u8) {
+    match progress {
+        ProgressState::Clear => (0, 0),
+        ProgressState::InProgress(value) => (1, value),
+        ProgressState::Error(value) => (2, value),
+        ProgressState::Indeterminate => (3, 0),
+        ProgressState::Warning(value) => (4, value),
+    }
+}
+
+fn ffi_event_from_event(event: TerminalEvent) -> TermyFfiEvent {
+    match event {
+        TerminalEvent::Wakeup => TermyFfiEvent {
+            kind: 1,
+            ..TermyFfiEvent::default()
+        },
+        TerminalEvent::Title(title) => TermyFfiEvent {
+            kind: 2,
+            payload: ffi_bytes_from_string(title),
+            ..TermyFfiEvent::default()
+        },
+        TerminalEvent::ResetTitle => TermyFfiEvent {
+            kind: 3,
+            ..TermyFfiEvent::default()
+        },
+        TerminalEvent::Bell => TermyFfiEvent {
+            kind: 4,
+            ..TermyFfiEvent::default()
+        },
+        TerminalEvent::Exit => TermyFfiEvent {
+            kind: 5,
+            ..TermyFfiEvent::default()
+        },
+        TerminalEvent::InputDropped => TermyFfiEvent {
+            kind: 14,
+            ..TermyFfiEvent::default()
+        },
+        TerminalEvent::ClipboardStore(text) => TermyFfiEvent {
+            kind: 6,
+            payload: ffi_bytes_from_string(text),
+            ..TermyFfiEvent::default()
+        },
+        TerminalEvent::ShellPromptStart => TermyFfiEvent {
+            kind: 7,
+            ..TermyFfiEvent::default()
+        },
+        TerminalEvent::ShellCommandStart => TermyFfiEvent {
+            kind: 8,
+            ..TermyFfiEvent::default()
+        },
+        TerminalEvent::ShellCommandExecuting => TermyFfiEvent {
+            kind: 9,
+            ..TermyFfiEvent::default()
+        },
+        TerminalEvent::ShellCommandFinished(code) => TermyFfiEvent {
+            kind: 10,
+            exit_code: code.unwrap_or(-1),
+            ..TermyFfiEvent::default()
+        },
+        TerminalEvent::Progress(progress) => {
+            let (progress_state, progress_value) = progress_parts(progress);
+            TermyFfiEvent {
+                kind: 11,
+                progress_state,
+                progress_value,
+                ..TermyFfiEvent::default()
+            }
+        }
+        TerminalEvent::ProgramStatus(records) => TermyFfiEvent {
+            kind: 13,
+            payload: ffi_bytes_from_string(
+                serde_json::to_string(&records).expect("status records serialize"),
+            ),
+            ..TermyFfiEvent::default()
+        },
+        TerminalEvent::WorkingDirectory(path) => TermyFfiEvent {
+            kind: 12,
+            payload: ffi_bytes_from_string(path),
+            ..TermyFfiEvent::default()
+        },
+    }
+}
+
+fn ffi_search_match_from_match(search_match: TermySharedSearchMatch) -> TermyFfiSearchMatch {
+    TermyFfiSearchMatch {
+        row: search_match.row,
+        start_col: search_match.start_col,
+        end_col: search_match.end_col,
+        // The core shares one line across matches. The final match can move the
+        // original allocation into the FFI batch; earlier matches clone only
+        // because the C ABI gives every result independent ownership.
+        line: ffi_bytes_from_string(std::sync::Arc::unwrap_or_clone(search_match.line)),
+    }
+}
+
+fn ffi_glyph_render_kind(kind: TerminalGlyphRenderKind) -> u32 {
+    match kind {
+        TerminalGlyphRenderKind::BlockElement => 1,
+        TerminalGlyphRenderKind::BoxDrawing => 2,
+        TerminalGlyphRenderKind::Sextant => 3,
+        TerminalGlyphRenderKind::Braille => 4,
+        TerminalGlyphRenderKind::RoundedCorner => 5,
+        TerminalGlyphRenderKind::Diagonal => 6,
+    }
+}
+
+fn ffi_glyph_rect(rect: crate::TerminalGlyphRect) -> TermyFfiGlyphRect {
+    TermyFfiGlyphRect {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+        alpha: rect.alpha,
+        snap_kind: match rect.snap {
+            TerminalGlyphRectSnap::Nearest => 1,
+            TerminalGlyphRectSnap::Outward => 2,
+        },
+    }
+}
+
+fn ffi_glyph_stroke(stroke: crate::TerminalGlyphStroke) -> TermyFfiGlyphStroke {
+    let mut points = [TermyFfiGlyphPoint::default(); crate::MAX_TERMINAL_GLYPH_STROKE_POINTS];
+    for (target, source) in points.iter_mut().zip(stroke.points()) {
+        *target = TermyFfiGlyphPoint {
+            x: source.x,
+            y: source.y,
+        };
+    }
+    TermyFfiGlyphStroke {
+        kind: match stroke.kind {
+            TerminalGlyphStrokeKind::Line => 1,
+            TerminalGlyphStrokeKind::RoundedCorner => 2,
+        },
+        point_count: u32::from(stroke.point_count),
+        width: stroke.width,
+        point_0: points[0],
+        point_1: points[1],
+        point_2: points[2],
+        point_3: points[3],
+        point_4: points[4],
+        point_5: points[5],
+    }
+}
+
+#[derive(Default)]
+struct FfiGlyphRenderPlanVectors {
+    entries: Vec<TermyFfiGlyphPlanEntry>,
+    rects: Vec<TermyFfiGlyphRect>,
+    strokes: Vec<TermyFfiGlyphStroke>,
+}
+
+fn push_ffi_glyph_plan_for_cell(
+    output: &mut FfiGlyphRenderPlanVectors,
+    cells: &[TermyFfiCell],
+    cols: usize,
+    cell_index: usize,
+    metrics: TerminalGlyphMetrics,
+) -> Result<(), TermyFfiStatus> {
+    let cell = &cells[cell_index];
+    if !cell.render_text {
+        return Ok(());
+    }
+    let character = char::from_u32(cell.codepoint).ok_or(TermyFfiStatus::InvalidArgument)?;
+    let col = cell_index % cols;
+    let char_at = |candidate: Option<usize>| {
+        candidate
+            .filter(|candidate| *candidate < cols)
+            .and_then(|candidate| cells.get(cell_index - col + candidate))
+            .and_then(|cell| char::from_u32(cell.codepoint))
+    };
+    let neighbors = TerminalGlyphNeighbors {
+        two_before: char_at(col.checked_sub(2)),
+        before: char_at(col.checked_sub(1)),
+        after: char_at(col.checked_add(1)),
+        two_after: char_at(col.checked_add(2)),
+    };
+    let Some(plan) = terminal_glyph_plan(character, metrics, neighbors) else {
+        return Ok(());
+    };
+
+    let rect_start = output.rects.len();
+    output
+        .rects
+        .extend(plan.rects().iter().copied().map(ffi_glyph_rect));
+    let stroke_start = output.strokes.len();
+    output
+        .strokes
+        .extend(plan.strokes().iter().copied().map(ffi_glyph_stroke));
+    output.entries.push(TermyFfiGlyphPlanEntry {
+        cell_index,
+        render_kind: ffi_glyph_render_kind(plan.kind()),
+        rect_start,
+        rect_len: output.rects.len() - rect_start,
+        stroke_start,
+        stroke_len: output.strokes.len() - stroke_start,
+    });
+    Ok(())
+}
+
+fn build_ffi_glyph_render_plan(
+    cells: &[TermyFfiCell],
+    cols: usize,
+    rows: usize,
+    spans: &[TermyFfiDirtySpan],
+    metrics: TerminalGlyphMetrics,
+) -> Result<FfiGlyphRenderPlanVectors, TermyFfiStatus> {
+    if cols == 0
+        || rows == 0
+        || cells.len()
+            != cols
+                .checked_mul(rows)
+                .ok_or(TermyFfiStatus::InvalidArgument)?
+        || !metrics.cell_width.is_finite()
+        || metrics.cell_width <= 0.0
+        || !metrics.cell_height.is_finite()
+        || metrics.cell_height <= 0.0
+        || !metrics.font_size.is_finite()
+        || metrics.font_size <= 0.0
+    {
+        return Err(TermyFfiStatus::InvalidArgument);
+    }
+    if cells
+        .iter()
+        .any(|cell| char::from_u32(cell.codepoint).is_none())
+    {
+        return Err(TermyFfiStatus::InvalidArgument);
+    }
+
+    let mut output = FfiGlyphRenderPlanVectors::default();
+    if spans.is_empty() {
+        for cell_index in 0..cells.len() {
+            push_ffi_glyph_plan_for_cell(&mut output, cells, cols, cell_index, metrics)?;
+        }
+        return Ok(output);
+    }
+
+    let mut cell_indices = BTreeSet::new();
+    for span in spans {
+        if span.row >= rows || span.left_col > span.right_col || span.right_col >= cols {
+            return Err(TermyFfiStatus::InvalidArgument);
+        }
+        let row_start = span
+            .row
+            .checked_mul(cols)
+            .ok_or(TermyFfiStatus::InvalidArgument)?;
+        cell_indices.extend((span.left_col..=span.right_col).map(|col| row_start + col));
+    }
+    for cell_index in cell_indices {
+        push_ffi_glyph_plan_for_cell(&mut output, cells, cols, cell_index, metrics)?;
+    }
+    Ok(output)
+}
+
+fn leak_vec<T>(mut vec: Vec<T>) -> (*mut T, usize, usize) {
+    let ptr = vec.as_mut_ptr();
+    let len = vec.len();
+    let capacity = vec.capacity();
+    std::mem::forget(vec);
+    (ptr, len, capacity)
+}
+
+fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or(default)
+}
+
+fn ffi_status_guard(f: impl FnOnce() -> TermyFfiStatus) -> TermyFfiStatus {
+    ffi_guard(TermyFfiStatus::Panicked, f)
+}
+
+fn ffi_default_size_fallback() -> TermyFfiSize {
+    TermyFfiSize {
+        cols: 80,
+        rows: 24,
+        cell_width: 9.0,
+        cell_height: 18.0,
+    }
+}
+
+fn ffi_default_size() -> TermyFfiSize {
+    let size = TerminalSize::default();
+    TermyFfiSize {
+        cols: size.cols,
+        rows: size.rows,
+        cell_width: size.cell_width,
+        cell_height: size.cell_height,
+    }
+}
+
+unsafe fn optional_utf8<'a>(ptr: *const u8, len: usize) -> Result<Option<&'a str>, TermyFfiStatus> {
+    if ptr.is_null() || len == 0 {
+        return Ok(None);
+    }
+
+    let bytes = unsafe { slice::from_raw_parts(ptr, len) };
+    str::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| TermyFfiStatus::InvalidUtf8)
+}
+
+unsafe fn optional_utf8_owned(
+    ptr: *const u8,
+    len: usize,
+) -> Result<Option<String>, TermyFfiStatus> {
+    unsafe { optional_utf8(ptr, len) }.map(|value| value.map(ToOwned::to_owned))
+}
+
+unsafe fn required_utf8<'a>(ptr: *const u8, len: usize) -> Result<&'a str, TermyFfiStatus> {
+    if ptr.is_null() {
+        return Err(TermyFfiStatus::Null);
+    }
+
+    let bytes = unsafe { slice::from_raw_parts(ptr, len) };
+    str::from_utf8(bytes).map_err(|_| TermyFfiStatus::InvalidUtf8)
+}
+
+unsafe fn contents_utf8<'a>(ptr: *const u8, len: usize) -> Result<&'a str, TermyFfiStatus> {
+    if ptr.is_null() {
+        if len == 0 {
+            return Ok("");
+        }
+        return Err(TermyFfiStatus::Null);
+    }
+
+    unsafe { required_utf8(ptr, len) }
+}
+
+unsafe fn env_vars_from_ffi(
+    ptr: *const TermyFfiEnvVar,
+    len: usize,
+) -> Result<HashMap<String, String>, TermyFfiStatus> {
+    if len == 0 {
+        return Ok(HashMap::new());
+    }
+    if ptr.is_null() {
+        return Err(TermyFfiStatus::Null);
+    }
+
+    let env_vars = unsafe { slice::from_raw_parts(ptr, len) };
+    let mut result = HashMap::with_capacity(env_vars.len());
+    for env_var in env_vars {
+        let key = unsafe { optional_utf8_owned(env_var.key_ptr, env_var.key_len) }?;
+        let Some(key) = key.map(|value| value.trim().to_string()) else {
+            continue;
+        };
+        if key.is_empty() {
+            continue;
+        }
+        let value = unsafe { optional_utf8_owned(env_var.value_ptr, env_var.value_len) }?
+            .unwrap_or_default();
+        result.insert(key, value);
+    }
+    Ok(result)
+}
+
+fn config_diagnostic_kind(kind: ConfigDiagnosticKind) -> u32 {
+    match kind {
+        ConfigDiagnosticKind::UnknownSection => 1,
+        ConfigDiagnosticKind::UnknownRootKey => 2,
+        ConfigDiagnosticKind::UnknownColorKey => 3,
+        ConfigDiagnosticKind::InvalidSyntax => 4,
+        ConfigDiagnosticKind::InvalidValue => 5,
+        ConfigDiagnosticKind::DuplicateRootKey => 6,
+    }
+}
+
+fn mouse_button(button: u32) -> Option<TerminalMouseButton> {
+    match button {
+        1 => Some(TerminalMouseButton::Left),
+        2 => Some(TerminalMouseButton::Middle),
+        3 => Some(TerminalMouseButton::Right),
+        _ => None,
+    }
+}
+
+fn mouse_event(input: TermyFfiMouseInput) -> Option<TerminalMouseEventKind> {
+    match input.kind {
+        1 => Some(TerminalMouseEventKind::Press(mouse_button(input.button)?)),
+        2 => Some(TerminalMouseEventKind::Release(mouse_button(input.button)?)),
+        3 => Some(TerminalMouseEventKind::Drag(mouse_button(input.button)?)),
+        4 => Some(TerminalMouseEventKind::Move),
+        5 => Some(TerminalMouseEventKind::WheelUp),
+        6 => Some(TerminalMouseEventKind::WheelDown),
+        7 => Some(TerminalMouseEventKind::WheelLeft),
+        8 => Some(TerminalMouseEventKind::WheelRight),
+        _ => None,
+    }
+}
+
+fn ffi_config_diagnostic_from_diagnostic(diagnostic: ConfigDiagnostic) -> TermyFfiConfigDiagnostic {
+    TermyFfiConfigDiagnostic {
+        line_number: diagnostic.line_number,
+        kind: config_diagnostic_kind(diagnostic.kind),
+        message: ffi_bytes_from_string(diagnostic.message),
+    }
+}
+
+fn leak_loaded_config(
+    loaded: Result<LoadedTermyConfig, crate::TermyConfigError>,
+    out_config: *mut *mut TermyFfiConfig,
+) -> TermyFfiStatus {
+    if out_config.is_null() {
+        return TermyFfiStatus::Null;
+    }
+
+    let Ok(loaded) = loaded else {
+        return TermyFfiStatus::ConfigLoadFailed;
+    };
+
+    unsafe {
+        *out_config = Box::into_raw(Box::new(TermyFfiConfig { loaded }));
+    }
+    TermyFfiStatus::Ok
+}
+
+fn tab_title_shell_integration_from_config(
+    app_config: &crate::AppConfig,
+) -> crate::TabTitleShellIntegration {
+    crate::TabTitleShellIntegration {
+        enabled: app_config.shell_integration_enabled && app_config.tab_title.shell_integration,
+        explicit_prefix: app_config.tab_title.explicit_prefix.clone(),
+    }
+}
+
+unsafe fn terminal_new_with_runtime_config(
+    size: TermyFfiSize,
+    runtime_config: &TerminalRuntimeConfig,
+    tab_title_shell_integration: Option<&crate::TabTitleShellIntegration>,
+    configured_working_dir: Option<&str>,
+    startup_command_ptr: *const u8,
+    startup_command_len: usize,
+    out_terminal: *mut *mut TermyFfiTerminal,
+) -> TermyFfiStatus {
+    if out_terminal.is_null() {
+        return TermyFfiStatus::Null;
+    }
+
+    let startup_command = match unsafe { optional_utf8(startup_command_ptr, startup_command_len) } {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+
+    let (wakeups_tx, wakeups_rx) = bounded(1);
+    let Ok(terminal) = Terminal::new(
+        size.into(),
+        configured_working_dir,
+        Some(wakeups_tx.clone()),
+        tab_title_shell_integration,
+        Some(runtime_config),
+        startup_command,
+    ) else {
+        return TermyFfiStatus::SpawnFailed;
+    };
+
+    unsafe {
+        *out_terminal = Box::into_raw(Box::new(TermyFfiTerminal {
+            terminal,
+            wakeups_tx: Some(wakeups_tx),
+            wakeups_rx: Some(wakeups_rx),
+            kitty_png_exports: Vec::new(),
+        }));
+    }
+    TermyFfiStatus::Ok
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn termy_size_default() -> TermyFfiSize {
+    ffi_guard(ffi_default_size_fallback(), ffi_default_size)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_new(
+    size: TermyFfiSize,
+    startup_command_ptr: *const u8,
+    startup_command_len: usize,
+    out_terminal: *mut *mut TermyFfiTerminal,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| unsafe {
+        terminal_new_with_runtime_config(
+            size,
+            &TerminalRuntimeConfig::default(),
+            None,
+            None,
+            startup_command_ptr,
+            startup_command_len,
+            out_terminal,
+        )
+    })
+}
+
+/// A display terminal with a wake channel. Output is fed by the host, but a
+/// synchronized update (`?2026`) that times out commits later on its own; the
+/// wake channel is how the host learns to render it and send its replies.
+fn display_terminal(size: TerminalSize) -> TermyFfiTerminal {
+    let (wakeups_tx, wakeups_rx) = bounded(1);
+    let sender = wakeups_tx.clone();
+    let notifier = crate::TerminalWakeupNotifier::new(move || {
+        let _ = sender.try_send(());
+    });
+    TermyFfiTerminal {
+        terminal: Terminal::new_display_with_wakeup_notifier(size, None, Some(notifier)),
+        wakeups_tx: Some(wakeups_tx),
+        wakeups_rx: Some(wakeups_rx),
+        kitty_png_exports: Vec::new(),
+    }
+}
+
+/// Create a display-only terminal: a grid with no PTY/shell, fed via
+/// `termy_terminal_feed_output`. Used for tmux control-mode panes. All other
+/// terminal functions (render, resize, snapshot, free) work on the result.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_display_terminal_new(
+    size: TermyFfiSize,
+    out_terminal: *mut *mut TermyFfiTerminal,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if out_terminal.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        unsafe {
+            *out_terminal = Box::into_raw(Box::new(display_terminal(size.into())));
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_new_with_config(
+    size: TermyFfiSize,
+    config: *const TermyFfiConfig,
+    startup_command_ptr: *const u8,
+    startup_command_len: usize,
+    out_terminal: *mut *mut TermyFfiTerminal,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if config.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        unsafe {
+            let tab_title_shell_integration =
+                tab_title_shell_integration_from_config(&(*config).loaded.app_config);
+            terminal_new_with_runtime_config(
+                size,
+                &(*config).loaded.runtime_config,
+                Some(&tab_title_shell_integration),
+                None,
+                startup_command_ptr,
+                startup_command_len,
+                out_terminal,
+            )
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_new_with_options(
+    size: TermyFfiSize,
+    options: *const TermyFfiTerminalOptions,
+    out_terminal: *mut *mut TermyFfiTerminal,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if options.is_null() || out_terminal.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let options = unsafe { *options };
+        let (mut runtime_config, tab_title_shell_integration) = if options.config.is_null() {
+            (TerminalRuntimeConfig::default(), None)
+        } else {
+            unsafe {
+                (
+                    (*options.config).loaded.runtime_config.clone(),
+                    Some(tab_title_shell_integration_from_config(
+                        &(*options.config).loaded.app_config,
+                    )),
+                )
+            }
+        };
+        let working_directory = match unsafe {
+            optional_utf8(options.working_directory_ptr, options.working_directory_len)
+        } {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let environment =
+            match unsafe { env_vars_from_ffi(options.env_vars_ptr, options.env_vars_len) } {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
+        runtime_config.environment.extend(environment);
+
+        unsafe {
+            terminal_new_with_runtime_config(
+                size,
+                &runtime_config,
+                tab_title_shell_integration.as_ref(),
+                working_directory,
+                options.startup_command_ptr,
+                options.startup_command_len,
+                out_terminal,
+            )
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_load_default(
+    out_config: *mut *mut TermyFfiConfig,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| leak_loaded_config(load_config_from_default_path(), out_config))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_load_path(
+    path_ptr: *const u8,
+    path_len: usize,
+    out_config: *mut *mut TermyFfiConfig,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        let path = match unsafe { required_utf8(path_ptr, path_len) } {
+            Ok(path) => path,
+            Err(status) => return status,
+        };
+        leak_loaded_config(load_config_from_path(Path::new(path)), out_config)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_from_contents(
+    contents_ptr: *const u8,
+    contents_len: usize,
+    out_config: *mut *mut TermyFfiConfig,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if out_config.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let contents = match unsafe { contents_utf8(contents_ptr, contents_len) } {
+            Ok(contents) => contents,
+            Err(status) => return status,
+        };
+
+        let loaded = load_config_from_contents(contents);
+        unsafe {
+            *out_config = Box::into_raw(Box::new(TermyFfiConfig { loaded }));
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_free(config: *mut TermyFfiConfig) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if config.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        unsafe {
+            drop(Box::from_raw(config));
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_loaded_from_disk(config: *const TermyFfiConfig) -> bool {
+    ffi_guard(false, || {
+        if config.is_null() {
+            return false;
+        }
+
+        unsafe { (*config).loaded.loaded_from_disk }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_runtime_scrollback_history(
+    config: *const TermyFfiConfig,
+) -> usize {
+    ffi_guard(0, || {
+        if config.is_null() {
+            return 0;
+        }
+
+        unsafe { (*config).loaded.runtime_config.scrollback_history }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_runtime_inactive_tab_scrollback(
+    config: *const TermyFfiConfig,
+    out_enabled: *mut bool,
+    out_value: *mut usize,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if config.is_null() || out_enabled.is_null() || out_value.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let inactive_tab_scrollback =
+            unsafe { (*config).loaded.app_config.inactive_tab_scrollback };
+        unsafe {
+            *out_enabled = inactive_tab_scrollback.is_some();
+            *out_value = inactive_tab_scrollback.unwrap_or_default();
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_diagnostic_count(config: *const TermyFfiConfig) -> usize {
+    ffi_guard(0, || {
+        if config.is_null() {
+            return 0;
+        }
+
+        unsafe { (*config).loaded.diagnostics.len() }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_window_size(
+    config: *const TermyFfiConfig,
+    out_width: *mut f32,
+    out_height: *mut f32,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if config.is_null() || out_width.is_null() || out_height.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let app_config = unsafe { &(*config).loaded.app_config };
+        unsafe {
+            *out_width = app_config.window_width;
+            *out_height = app_config.window_height;
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_working_directory(
+    config: *const TermyFfiConfig,
+    out_working_directory: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if config.is_null() || out_working_directory.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let working_directory = unsafe { (*config).loaded.app_config.working_dir.as_ref() };
+        let bytes = working_directory.map_or_else(
+            || termy_null_buffer(),
+            |working_directory| ffi_bytes_from_string(working_directory.clone()),
+        );
+        unsafe {
+            *out_working_directory = bytes;
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_safety(
+    config: *const TermyFfiConfig,
+    out_safety: *mut TermyFfiSafetyConfig,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if config.is_null() || out_safety.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let app_config = unsafe { &(*config).loaded.app_config };
+        unsafe {
+            *out_safety = TermyFfiSafetyConfig {
+                warn_on_quit: app_config.warn_on_quit,
+                warn_on_quit_with_running_process: app_config.warn_on_quit_with_running_process,
+            };
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_native(
+    config: *const TermyFfiConfig,
+    out_native: *mut TermyFfiNativeConfig,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if config.is_null() || out_native.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let app_config = unsafe { &(*config).loaded.app_config };
+        unsafe {
+            *out_native = TermyFfiNativeConfig {
+                auto_update: app_config.auto_update,
+                tmux_enabled: app_config.tmux_enabled,
+                tmux_persistence: app_config.tmux_persistence,
+                tmux_exclusive: app_config.tmux_exclusive,
+                tmux_show_active_pane_border: app_config.tmux_show_active_pane_border,
+                simple_mode: app_config.simple_mode,
+                native_tab_persistence: app_config.native_tab_persistence,
+                native_layout_autosave: app_config.native_layout_autosave,
+                native_buffer_persistence: app_config.native_buffer_persistence,
+                show_debug_overlay: app_config.show_debug_overlay,
+                onboarding_complete: app_config.onboarding_complete,
+                tab_close_visibility: match app_config.tab_close_visibility {
+                    cfg::TabCloseVisibility::ActiveHover => 0,
+                    cfg::TabCloseVisibility::Hover => 1,
+                    cfg::TabCloseVisibility::Always => 2,
+                },
+                tab_width_mode: match app_config.tab_width_mode {
+                    cfg::TabWidthMode::Stable => 0,
+                    cfg::TabWidthMode::ActiveGrow => 1,
+                    cfg::TabWidthMode::ActiveGrowSticky => 2,
+                    cfg::TabWidthMode::Uniform => 3,
+                },
+                tab_bar_position: match app_config.tab_bar_position {
+                    cfg::TabBarPosition::Top => 0,
+                    cfg::TabBarPosition::Right => 1,
+                },
+                tab_switch_modifier_hints: app_config.tab_switch_modifier_hints,
+                chrome_contrast: app_config.chrome_contrast,
+                command_palette_show_keybinds: app_config.command_palette_show_keybinds,
+                app_icon: match app_config.app_icon {
+                    cfg::AppIcon::TermyDefault => 0,
+                    cfg::AppIcon::TermyOld => 1,
+                },
+                shell_integration_enabled: app_config.shell_integration_enabled,
+                progress_indicator_enabled: app_config.progress_indicator_enabled,
+                auto_hide_tabbar: app_config.auto_hide_tabbar,
+                show_termy_in_titlebar: app_config.show_termy_in_titlebar,
+                macos_option_as_alt: app_config.macos_option_as_alt,
+            };
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_tmux_binary(
+    config: *const TermyFfiConfig,
+    out_binary: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if config.is_null() || out_binary.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let binary = unsafe { (*config).loaded.app_config.tmux_binary.clone() };
+        unsafe {
+            *out_binary = ffi_bytes_from_string(binary);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_ui_font_family(
+    config: *const TermyFfiConfig,
+    out_font_family: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if config.is_null() || out_font_family.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let font_family = unsafe { (*config).loaded.app_config.ui_font_family.clone() };
+        unsafe {
+            *out_font_family = ffi_bytes_from_string(font_family);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_path(
+    config: *const TermyFfiConfig,
+    out_path: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if config.is_null() || out_path.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let path = unsafe { (*config).loaded.path.as_ref() };
+        let bytes = path.map_or_else(
+            || termy_null_buffer(),
+            |path| ffi_bytes_from_string(path.to_string_lossy().into_owned()),
+        );
+        unsafe {
+            *out_path = bytes;
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_tasks_json(
+    config: *const TermyFfiConfig,
+    out_json: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if config.is_null() || out_json.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let tasks = unsafe { &(*config).loaded.app_config.tasks };
+        let Ok(json) = serde_json::to_string(
+            &tasks
+                .iter()
+                .map(|task| {
+                    serde_json::json!({
+                        "name": task.name,
+                        "command": task.command,
+                        "layout": task.layout,
+                        "working_dir": task.working_dir,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        ) else {
+            return TermyFfiStatus::SerializeFailed;
+        };
+
+        unsafe {
+            *out_json = ffi_bytes_from_string(json);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_keybinds_json(
+    config: *const TermyFfiConfig,
+    out_json: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if config.is_null() || out_json.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let keybind_lines = unsafe { &(*config).loaded.app_config.keybind_lines };
+        let line_refs = keybind_lines
+            .iter()
+            .map(|line| crate::command_core::KeybindLineRef {
+                line_number: line.line_number,
+                value: line.value.as_str(),
+            });
+        let (directives, _warnings) =
+            crate::command_core::parse_keybind_directives_from_iter(line_refs);
+        let resolved = crate::command_core::resolve_keybinds(
+            crate::command_core::default_resolved_keybinds_for_platform(
+                crate::command_core::KeybindPlatform::MacOs,
+            ),
+            &directives,
+        );
+        let Ok(json) = serde_json::to_string(
+            &resolved
+                .iter()
+                .map(|keybind| {
+                    serde_json::json!({
+                        "trigger": keybind.trigger,
+                        "action": keybind.action.config_name(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        ) else {
+            return TermyFfiStatus::SerializeFailed;
+        };
+
+        unsafe {
+            *out_json = ffi_bytes_from_string(json);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_diagnostics(
+    config: *const TermyFfiConfig,
+    out_batch: *mut TermyFfiConfigDiagnosticBatch,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if config.is_null() || out_batch.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let diagnostics = unsafe {
+            (*config)
+                .loaded
+                .diagnostics
+                .clone()
+                .into_iter()
+                .map(ffi_config_diagnostic_from_diagnostic)
+                .collect::<Vec<_>>()
+        };
+        let (diagnostics_ptr, diagnostics_len, diagnostics_capacity) = leak_vec(diagnostics);
+
+        unsafe {
+            *out_batch = TermyFfiConfigDiagnosticBatch {
+                diagnostics_ptr,
+                diagnostics_len,
+                diagnostics_capacity,
+            };
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_diagnostics_free(
+    batch: *mut TermyFfiConfigDiagnosticBatch,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if batch.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let batch = unsafe { &mut *batch };
+        if !batch.diagnostics_ptr.is_null() {
+            let diagnostics = unsafe {
+                Vec::from_raw_parts(
+                    batch.diagnostics_ptr,
+                    batch.diagnostics_len,
+                    batch.diagnostics_capacity,
+                )
+            };
+            for diagnostic in diagnostics {
+                free_bytes(diagnostic.message);
+            }
+        }
+        *batch = TermyFfiConfigDiagnosticBatch::default();
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_render_config(
+    config: *const TermyFfiConfig,
+    out_render_config: *mut TermyFfiRenderConfig,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| unsafe {
+        termy_config_render_config_for_appearance(config, 1, out_render_config)
+    })
+}
+
+fn system_appearance_from_raw(system_appearance: u32) -> crate::SystemAppearance {
+    match system_appearance {
+        0 => crate::SystemAppearance::Light,
+        _ => crate::SystemAppearance::Dark,
+    }
+}
+
+fn terminal_query_colors_for_appearance(
+    loaded: &LoadedTermyConfig,
+    system_appearance: u32,
+) -> TerminalQueryColors {
+    crate::terminal_query_colors_from_resolved_theme(&crate::resolve_theme_colors_from_app_config(
+        &loaded.app_config,
+        loaded.path.as_deref(),
+        system_appearance_from_raw(system_appearance),
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_config_render_config_for_appearance(
+    config: *const TermyFfiConfig,
+    system_appearance: u32,
+    out_render_config: *mut TermyFfiRenderConfig,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if config.is_null() || out_render_config.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let loaded = unsafe { &(*config).loaded };
+        let app_config = &loaded.app_config;
+        let cell_metrics = crate::measure_cell_from_config(app_config);
+        let theme_colors = crate::resolve_theme_colors_from_app_config(
+            app_config,
+            loaded.path.as_deref(),
+            system_appearance_from_raw(system_appearance),
+        );
+        unsafe {
+            *out_render_config = TermyFfiRenderConfig {
+                font_family: ffi_bytes_from_string(app_config.font_family.clone()),
+                active_theme: ffi_bytes_from_string(theme_colors.active_theme),
+                foreground: theme_colors.foreground.into(),
+                background: theme_colors.background.into(),
+                cursor: theme_colors.cursor.into(),
+                font_size: app_config.font_size,
+                line_height: app_config.line_height,
+                padding_x: app_config.padding_x,
+                padding_y: app_config.padding_y,
+                background_opacity: app_config.background_opacity,
+                background_opacity_cells: app_config.background_opacity_cells,
+                cursor_blink: app_config.cursor_blink,
+                cursor_style: match app_config.cursor_style {
+                    crate::AppConfigCursorStyle::Line => 1,
+                    crate::AppConfigCursorStyle::Block => 2,
+                },
+                cell_width: cell_metrics.cell_width,
+                cell_height: cell_metrics.cell_height,
+                background_blur: app_config.background_blur,
+                mouse_scroll_multiplier: app_config.mouse_scroll_multiplier,
+                scrollbar_visibility: match app_config.terminal_scrollbar_visibility {
+                    cfg::TerminalScrollbarVisibility::Off => 0,
+                    cfg::TerminalScrollbarVisibility::Always => 1,
+                    cfg::TerminalScrollbarVisibility::OnScroll => 2,
+                },
+                scrollbar_style: match app_config.terminal_scrollbar_style {
+                    cfg::TerminalScrollbarStyle::Neutral => 0,
+                    cfg::TerminalScrollbarStyle::MutedTheme => 1,
+                    cfg::TerminalScrollbarStyle::Theme => 2,
+                },
+                copy_on_select: app_config.copy_on_select,
+                copy_on_select_toast: app_config.copy_on_select_toast,
+                pane_focus_effect: match app_config.pane_focus_effect {
+                    cfg::PaneFocusEffect::Off => 0,
+                    cfg::PaneFocusEffect::SoftSpotlight => 1,
+                    cfg::PaneFocusEffect::Cinematic => 2,
+                    cfg::PaneFocusEffect::Minimal => 3,
+                },
+                pane_focus_strength: app_config.pane_focus_strength,
+                chrome_contrast: app_config.chrome_contrast,
+            };
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_render_config_free(
+    render_config: *mut TermyFfiRenderConfig,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if render_config.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let render_config = unsafe { &mut *render_config };
+        free_bytes(render_config.font_family);
+        free_bytes(render_config.active_theme);
+        *render_config = TermyFfiRenderConfig::default();
+        TermyFfiStatus::Ok
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Settings (native settings window <-> config.txt bridge)
+// ---------------------------------------------------------------------------
+
+use crate::config_core as cfg;
+
+fn settings_read_contents() -> String {
+    settings_read_contents_from(None)
+}
+
+/// The config at `path`, or the default config file when `path` is `None`.
+fn settings_read_contents_from(path: Option<&Path>) -> String {
+    let path = path.map(Path::to_path_buf).or_else(cfg::config_path);
+    match path.and_then(|path| std::fs::read_to_string(path).ok()) {
+        Some(contents) if !contents.trim().is_empty() => contents,
+        _ => cfg::DEFAULT_CONFIG_TEMPLATE.to_string(),
+    }
+}
+
+fn settings_write_contents(contents: &str) -> Result<(), TermyFfiStatus> {
+    settings_write_contents_into(None, contents)
+}
+
+fn settings_write_contents_into(path: Option<&Path>, contents: &str) -> Result<(), TermyFfiStatus> {
+    if let Some(path) = path {
+        return settings_write_contents_to(path, contents);
+    }
+    let path = cfg::config_path().ok_or(TermyFfiStatus::WriteFailed)?;
+    settings_write_contents_to(&path, contents)
+}
+
+fn settings_write_contents_to(
+    path: &std::path::Path,
+    contents: &str,
+) -> Result<(), TermyFfiStatus> {
+    use std::io::Write as _;
+
+    // Write the file a symlink points at, so dotfile managers (stow, chezmoi)
+    // keep their link.
+    let target = settings_write_target(path);
+    let parent = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent).map_err(|_| TermyFfiStatus::WriteFailed)?;
+    // Replace the file atomically: truncating in place would let a concurrent
+    // read see an empty file, which reads as the default template and could
+    // be written back over the user's config.
+    let mut temp =
+        tempfile::NamedTempFile::new_in(parent).map_err(|_| TermyFfiStatus::WriteFailed)?;
+    if let Ok(metadata) = std::fs::metadata(&target) {
+        let _ = temp.as_file().set_permissions(metadata.permissions());
+    }
+    temp.write_all(contents.as_bytes())
+        .and_then(|()| temp.as_file().sync_all())
+        .map_err(|_| TermyFfiStatus::WriteFailed)?;
+    temp.persist(&target)
+        .map(drop)
+        .map_err(|_| TermyFfiStatus::WriteFailed)
+}
+
+/// The file `path` resolves to through symlinks, or `path` itself.
+fn settings_write_target(path: &Path) -> PathBuf {
+    if let Ok(target) = std::fs::canonicalize(path) {
+        return target;
+    }
+    // A dangling link: create the file it names.
+    let mut target = path.to_path_buf();
+    for _ in 0..40 {
+        let Ok(link) = std::fs::read_link(&target) else {
+            break;
+        };
+        target = match target.parent() {
+            Some(parent) => parent.join(link),
+            None => link,
+        };
+    }
+    target
+}
+
+fn settings_color_hex(app: &cfg::AppConfig, id: cfg::ColorSettingId) -> Option<String> {
+    use cfg::ColorSettingId::*;
+    let rgb = match id {
+        Foreground => app.colors.foreground,
+        Background => app.colors.background,
+        Cursor => app.colors.cursor,
+        Black => app.colors.ansi[0],
+        Red => app.colors.ansi[1],
+        Green => app.colors.ansi[2],
+        Yellow => app.colors.ansi[3],
+        Blue => app.colors.ansi[4],
+        Magenta => app.colors.ansi[5],
+        Cyan => app.colors.ansi[6],
+        White => app.colors.ansi[7],
+        BrightBlack => app.colors.ansi[8],
+        BrightRed => app.colors.ansi[9],
+        BrightGreen => app.colors.ansi[10],
+        BrightYellow => app.colors.ansi[11],
+        BrightBlue => app.colors.ansi[12],
+        BrightMagenta => app.colors.ansi[13],
+        BrightCyan => app.colors.ansi[14],
+        BrightWhite => app.colors.ansi[15],
+    };
+    rgb.map(|c| format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b))
+}
+
+fn settings_themes_dir(config_path: Option<&Path>) -> Option<PathBuf> {
+    Some(config_path?.parent()?.join("themes"))
+}
+
+fn settings_theme_label(theme_id: &str) -> String {
+    if theme_id == cfg::SHELL_DECIDE_THEME_ID {
+        return "Shell Decide".to_string();
+    }
+    if let Some(theme) = crate::themes::find_builtin_theme(theme_id) {
+        return theme.name.to_string();
+    }
+
+    theme_id
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn settings_installed_theme_colors(
+    theme_id: &str,
+    config_path: Option<&Path>,
+) -> Option<crate::themes::ThemeColors> {
+    if crate::themes::normalize_theme_id(theme_id) == cfg::SHELL_DECIDE_THEME_ID {
+        return None;
+    }
+    crate::themes::load_local_theme(&settings_themes_dir(config_path)?, theme_id)
+}
+
+fn settings_theme_swatches(theme_id: &str, config_path: Option<&Path>) -> Vec<String> {
+    let Some(colors) = settings_installed_theme_colors(theme_id, config_path)
+        .or_else(|| crate::themes::builtin_theme(theme_id))
+    else {
+        return Vec::new();
+    };
+    [
+        colors.background,
+        colors.foreground,
+        colors.ansi[1],
+        colors.ansi[2],
+        colors.ansi[4],
+        colors.ansi[5],
+    ]
+    .into_iter()
+    .map(|color| format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b))
+    .collect()
+}
+
+/// Termy's themes and the shell-decided theme first, then the built-in
+/// collection, local themes, and finally a configured value nothing provides.
+fn settings_theme_choices(
+    loaded: &LoadedTermyConfig,
+    current_value: Option<&str>,
+) -> Vec<serde_json::Value> {
+    use serde_json::json;
+
+    let config_path = loaded.path.as_deref();
+    let local_ids =
+        settings_themes_dir(config_path).map_or_default(|dir| crate::themes::local_theme_ids(&dir));
+    let builtins = crate::themes::builtin_themes();
+    let termy_count = crate::themes::TERMY_THEME_IDS.len();
+    let mut ids: Vec<String> = builtins[..termy_count]
+        .iter()
+        .map(|theme| theme.id.to_string())
+        .collect();
+    ids.push(cfg::SHELL_DECIDE_THEME_ID.to_string());
+    ids.extend(
+        builtins[termy_count..]
+            .iter()
+            .map(|theme| theme.id.to_string()),
+    );
+    ids.extend(
+        local_ids
+            .iter()
+            .filter(|id| crate::themes::builtin_theme(id).is_none())
+            .cloned(),
+    );
+    let current = current_value
+        .map(crate::themes::normalize_theme_id)
+        .filter(|value| !value.is_empty());
+    let current_is_available = current.as_ref().is_none_or(|current| ids.contains(current));
+    if let Some(current) = current.filter(|_| !current_is_available) {
+        ids.push(current);
+    }
+
+    ids.into_iter()
+        .map(|theme_id| {
+            // Whether the theme can be applied: built in, a local file, or
+            // the shell-decided theme.
+            let installed = theme_id == cfg::SHELL_DECIDE_THEME_ID
+                || local_ids.contains(&theme_id)
+                || crate::themes::builtin_theme(&theme_id).is_some();
+            json!({
+                "value": theme_id,
+                "label": settings_theme_label(&theme_id),
+                "installed": installed,
+                "swatches": settings_theme_swatches(&theme_id, config_path),
+            })
+        })
+        .collect()
+}
+
+fn settings_schema_json(loaded: &LoadedTermyConfig) -> String {
+    use serde_json::{Value, json};
+
+    let app = &loaded.app_config;
+    let sections_meta = [
+        (
+            cfg::SettingsSection::Appearance,
+            "appearance",
+            "Appearance",
+            "paintbrush",
+        ),
+        (
+            cfg::SettingsSection::Terminal,
+            "terminal",
+            "Terminal",
+            "terminal",
+        ),
+        (
+            cfg::SettingsSection::Tabs,
+            "tabs",
+            "Tabs",
+            "square.on.square",
+        ),
+        (
+            cfg::SettingsSection::Advanced,
+            "advanced",
+            "Advanced",
+            "gearshape.2",
+        ),
+        (
+            cfg::SettingsSection::Colors,
+            "colors",
+            "Colors",
+            "paintpalette",
+        ),
+        (
+            cfg::SettingsSection::Keybindings,
+            "keybindings",
+            "Keybindings",
+            "keyboard",
+        ),
+    ];
+
+    let mut sections = Vec::new();
+    for (section, id, label, icon) in sections_meta {
+        let mut obj = json!({ "id": id, "label": label, "systemImage": icon });
+
+        match section {
+            cfg::SettingsSection::Colors => {
+                let colors: Vec<Value> = cfg::COLOR_SETTING_SPECS
+                    .iter()
+                    .map(|spec| {
+                        json!({
+                            "key": spec.key,
+                            "title": spec.title,
+                            "description": spec.description,
+                            "hex": settings_color_hex(app, spec.id),
+                        })
+                    })
+                    .collect();
+                obj["colors"] = json!(colors);
+            }
+            cfg::SettingsSection::Keybindings => {
+                let lines: Vec<&str> = app
+                    .keybind_lines
+                    .iter()
+                    .map(|line| line.value.as_str())
+                    .collect();
+                obj["keybinds"] = json!(lines);
+            }
+            _ => {
+                let mut groups: Vec<(&str, Vec<Value>)> = Vec::new();
+                for spec in cfg::ROOT_SETTING_SPECS {
+                    if spec.section != section || matches!(spec.id, cfg::RootSettingId::Keybind) {
+                        continue;
+                    }
+                    let kind = match spec.value_kind {
+                        cfg::RootSettingValueKind::Text => "text",
+                        cfg::RootSettingValueKind::Numeric => "numeric",
+                        cfg::RootSettingValueKind::Boolean => "boolean",
+                        cfg::RootSettingValueKind::Enum => "enum",
+                        cfg::RootSettingValueKind::Special => "special",
+                    };
+
+                    let mut setting = json!({
+                        "key": spec.key,
+                        "title": spec.title,
+                        "description": spec.description,
+                        "kind": kind,
+                        "value": cfg::root_setting_default_value(app, spec.id),
+                    });
+
+                    if let Some(choices) = cfg::root_setting_enum_choices(spec.id) {
+                        let choices: Vec<Value> = choices
+                            .iter()
+                            .map(|choice| json!({ "value": choice.value, "label": choice.label }))
+                            .collect();
+                        setting["choices"] = json!(choices);
+                    }
+                    if matches!(
+                        spec.id,
+                        cfg::RootSettingId::Theme
+                            | cfg::RootSettingId::ThemeLight
+                            | cfg::RootSettingId::ThemeDark
+                    ) {
+                        setting["choices"] =
+                            json!(settings_theme_choices(loaded, setting["value"].as_str()));
+                    }
+
+                    match groups.iter_mut().find(|(group, _)| *group == spec.group) {
+                        Some((_, settings)) => settings.push(setting),
+                        None => groups.push((spec.group, vec![setting])),
+                    }
+                }
+
+                let groups: Vec<Value> = groups
+                    .into_iter()
+                    .map(|(group, settings)| json!({ "label": group, "settings": settings }))
+                    .collect();
+                obj["groups"] = json!(groups);
+            }
+        }
+
+        sections.push(obj);
+    }
+
+    json!({
+        "configPath": loaded.path.as_ref().map(|path| path.to_string_lossy().into_owned()),
+        "loadedFromDisk": loaded.loaded_from_disk,
+        "sections": sections,
+    })
+    .to_string()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_settings_schema_json(
+    config: *const TermyFfiConfig,
+    out_bytes: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if config.is_null() || out_bytes.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let loaded = unsafe { &(*config).loaded };
+        let json = settings_schema_json(loaded);
+        unsafe {
+            *out_bytes = ffi_bytes_from_string(json);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+unsafe fn settings_set_root_inner(
+    path: Option<&Path>,
+    key_ptr: *const u8,
+    key_len: usize,
+    value_ptr: *const u8,
+    value_len: usize,
+) -> Result<(), TermyFfiStatus> {
+    let key = unsafe { required_utf8(key_ptr, key_len) }?;
+    let value = unsafe { optional_utf8(value_ptr, value_len) }?.unwrap_or("");
+    let id = cfg::root_setting_from_key(key).ok_or(TermyFfiStatus::UnknownKey)?;
+    let updated = cfg::upsert_root_setting(&settings_read_contents_from(path), id, value.trim());
+    settings_write_contents_into(path, &updated)
+}
+
+/// The config file path a caller passed, for the `_at` settings calls.
+unsafe fn settings_path_arg(
+    path_ptr: *const u8,
+    path_len: usize,
+) -> Result<PathBuf, TermyFfiStatus> {
+    let path = unsafe { required_utf8(path_ptr, path_len) }?;
+    if path.trim().is_empty() {
+        return Err(TermyFfiStatus::InvalidArgument);
+    }
+    Ok(PathBuf::from(path))
+}
+
+/// Like `termy_settings_set_root`, for the config file at `path` instead of
+/// the default one, so an app can keep a config of its own.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_settings_set_root_at(
+    path_ptr: *const u8,
+    path_len: usize,
+    key_ptr: *const u8,
+    key_len: usize,
+    value_ptr: *const u8,
+    value_len: usize,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        let result = unsafe { settings_path_arg(path_ptr, path_len) }.and_then(|path| unsafe {
+            settings_set_root_inner(Some(&path), key_ptr, key_len, value_ptr, value_len)
+        });
+        match result {
+            Ok(()) => TermyFfiStatus::Ok,
+            Err(status) => status,
+        }
+    })
+}
+
+/// Like `termy_settings_reset_root`, for the config file at `path`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_settings_reset_root_at(
+    path_ptr: *const u8,
+    path_len: usize,
+    key_ptr: *const u8,
+    key_len: usize,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        let result = unsafe { settings_path_arg(path_ptr, path_len) }
+            .and_then(|path| unsafe { settings_reset_root_inner(Some(&path), key_ptr, key_len) });
+        match result {
+            Ok(()) => TermyFfiStatus::Ok,
+            Err(status) => status,
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_settings_set_root(
+    key_ptr: *const u8,
+    key_len: usize,
+    value_ptr: *const u8,
+    value_len: usize,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        match unsafe { settings_set_root_inner(None, key_ptr, key_len, value_ptr, value_len) } {
+            Ok(()) => TermyFfiStatus::Ok,
+            Err(status) => status,
+        }
+    })
+}
+
+unsafe fn settings_reset_root_inner(
+    path: Option<&Path>,
+    key_ptr: *const u8,
+    key_len: usize,
+) -> Result<(), TermyFfiStatus> {
+    let key = unsafe { required_utf8(key_ptr, key_len) }?;
+    let id = cfg::root_setting_from_key(key).ok_or(TermyFfiStatus::UnknownKey)?;
+    let updated = cfg::remove_root_setting(&settings_read_contents_from(path), id);
+    settings_write_contents_into(path, &updated)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_settings_reset_root(
+    key_ptr: *const u8,
+    key_len: usize,
+) -> TermyFfiStatus {
+    ffi_status_guard(
+        || match unsafe { settings_reset_root_inner(None, key_ptr, key_len) } {
+            Ok(()) => TermyFfiStatus::Ok,
+            Err(status) => status,
+        },
+    )
+}
+
+unsafe fn settings_set_color_inner(
+    key_ptr: *const u8,
+    key_len: usize,
+    hex_ptr: *const u8,
+    hex_len: usize,
+) -> Result<(), TermyFfiStatus> {
+    let key = unsafe { required_utf8(key_ptr, key_len) }?;
+    let id = cfg::color_setting_from_key(key).ok_or(TermyFfiStatus::UnknownKey)?;
+    let value = unsafe { optional_utf8(hex_ptr, hex_len) }?.map(|hex| hex.trim().to_string());
+    let updated = cfg::apply_color_updates(
+        &settings_read_contents(),
+        &[cfg::ColorSettingUpdate { id, value }],
+    );
+    settings_write_contents(&updated)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_settings_set_color(
+    key_ptr: *const u8,
+    key_len: usize,
+    hex_ptr: *const u8,
+    hex_len: usize,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        match unsafe { settings_set_color_inner(key_ptr, key_len, hex_ptr, hex_len) } {
+            Ok(()) => TermyFfiStatus::Ok,
+            Err(status) => status,
+        }
+    })
+}
+
+unsafe fn settings_set_keybinds_inner(
+    text_ptr: *const u8,
+    text_len: usize,
+) -> Result<(), TermyFfiStatus> {
+    let text = unsafe { optional_utf8(text_ptr, text_len) }?.unwrap_or("");
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    let updated = cfg::replace_keybind_lines(&settings_read_contents(), &lines);
+    settings_write_contents(&updated)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_settings_set_keybinds(
+    text_ptr: *const u8,
+    text_len: usize,
+) -> TermyFfiStatus {
+    ffi_status_guard(
+        || match unsafe { settings_set_keybinds_inner(text_ptr, text_len) } {
+            Ok(()) => TermyFfiStatus::Ok,
+            Err(status) => status,
+        },
+    )
+}
+
+/// Installs the bundled `termy-cli` shim (symlink into a PATH dir + shell PATH
+/// setup), reusing `termy_cli_install_core`. `shell` may be null to use $SHELL.
+/// A human-readable summary (or error) is written to `out_message`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_cli_install(
+    shell_ptr: *const u8,
+    shell_len: usize,
+    out_message: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        let shell = if shell_ptr.is_null() || shell_len == 0 {
+            None
+        } else {
+            match unsafe { required_utf8(shell_ptr, shell_len) } {
+                Ok(value) => Some(value),
+                Err(status) => return status,
+            }
+        };
+        match crate::cli_install_core::install_cli(shell) {
+            Ok(result) => {
+                if !out_message.is_null() {
+                    let message = format!("Installed CLI to {}", result.install_path.display());
+                    unsafe { *out_message = ffi_bytes_from_string(message) };
+                }
+                TermyFfiStatus::Ok
+            }
+            Err(error) => {
+                if !out_message.is_null() {
+                    unsafe { *out_message = ffi_bytes_from_string(error) };
+                }
+                TermyFfiStatus::WriteFailed
+            }
+        }
+    })
+}
+
+// MARK: - tmux control mode (unix only)
+
+#[cfg(unix)]
+#[repr(C)]
+pub struct TermyFfiTmuxNotification {
+    /// 0 = output, 1 = needs-refresh, 2 = warning, 3 = exit.
+    pub kind: u32,
+    pub pane_id: TermyFfiBytes,
+    pub data: TermyFfiBytes,
+}
+
+#[cfg(unix)]
+#[repr(C)]
+pub struct TermyFfiTmuxNotificationBatch {
+    pub notifications_ptr: *mut TermyFfiTmuxNotification,
+    pub notifications_len: usize,
+    pub notifications_capacity: usize,
+}
+
+#[cfg(unix)]
+fn ffi_tmux_notification(
+    notification: crate::tmux_control_core::types::TmuxNotification,
+) -> Option<TermyFfiTmuxNotification> {
+    use crate::tmux_control_core::types::TmuxNotification;
+    Some(match notification {
+        TmuxNotification::Output { pane_id, bytes } => TermyFfiTmuxNotification {
+            kind: 0,
+            pane_id: ffi_bytes_from_string(pane_id),
+            data: ffi_bytes_from_vec(bytes),
+        },
+        TmuxNotification::NeedsRefresh => TermyFfiTmuxNotification {
+            kind: 1,
+            pane_id: ffi_bytes_from_vec(Vec::new()),
+            data: ffi_bytes_from_vec(Vec::new()),
+        },
+        TmuxNotification::Warning(message) => TermyFfiTmuxNotification {
+            kind: 2,
+            pane_id: ffi_bytes_from_vec(Vec::new()),
+            data: ffi_bytes_from_string(message),
+        },
+        TmuxNotification::Exit(reason) => TermyFfiTmuxNotification {
+            kind: 3,
+            pane_id: ffi_bytes_from_vec(Vec::new()),
+            data: ffi_bytes_from_string(reason.unwrap_or_default()),
+        },
+        TmuxNotification::SubscriptionChanged { .. } => {
+            // The Swift/FFI client does not consume format subscriptions yet.
+            // Keep this surface unchanged until it grows fields for the full
+            // subscription payload.
+            return None;
+        }
+    })
+}
+
+/// Opens a `tmux -CC` control session. On success writes a session handle to
+/// `out_session`; free it with `termy_tmux_control_close`.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_tmux_control_open(
+    binary_ptr: *const u8,
+    binary_len: usize,
+    socket_ptr: *const u8,
+    socket_len: usize,
+    session_ptr: *const u8,
+    session_len: usize,
+    out_session: *mut *mut crate::tmux_control_core::session::ControlSession,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if out_session.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let binary = match unsafe { required_utf8(binary_ptr, binary_len) } {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let socket = match unsafe { required_utf8(socket_ptr, socket_len) } {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let session_name = match unsafe { required_utf8(session_ptr, session_len) } {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        match crate::tmux_control_core::session::ControlSession::launch(
+            binary,
+            socket,
+            session_name,
+        ) {
+            Ok(session) => {
+                unsafe { *out_session = Box::into_raw(Box::new(session)) };
+                TermyFfiStatus::Ok
+            }
+            Err(_) => TermyFfiStatus::SpawnFailed,
+        }
+    })
+}
+
+/// Drains pending control notifications into `out_batch`; free with
+/// `termy_tmux_control_notifications_free`.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_tmux_control_poll(
+    session: *mut crate::tmux_control_core::session::ControlSession,
+    out_batch: *mut TermyFfiTmuxNotificationBatch,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if session.is_null() || out_batch.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let session = unsafe { &*session };
+        let notifications: Vec<TermyFfiTmuxNotification> = session
+            .poll()
+            .into_iter()
+            .filter_map(ffi_tmux_notification)
+            .collect();
+        let (ptr, len, capacity) = leak_vec(notifications);
+        unsafe {
+            *out_batch = TermyFfiTmuxNotificationBatch {
+                notifications_ptr: ptr,
+                notifications_len: len,
+                notifications_capacity: capacity,
+            };
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_tmux_control_notifications_free(
+    batch: *mut TermyFfiTmuxNotificationBatch,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if batch.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let batch = unsafe { &mut *batch };
+        if !batch.notifications_ptr.is_null() {
+            let notifications = unsafe {
+                Vec::from_raw_parts(
+                    batch.notifications_ptr,
+                    batch.notifications_len,
+                    batch.notifications_capacity,
+                )
+            };
+            for notification in notifications {
+                free_bytes(notification.pane_id);
+                free_bytes(notification.data);
+            }
+            batch.notifications_ptr = std::ptr::null_mut();
+            batch.notifications_len = 0;
+            batch.notifications_capacity = 0;
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+/// Runs a tmux command over the control channel; writes its output to
+/// `out_output` (free with `termy_buffer_free`). A command containing a
+/// newline, carriage return or NUL is rejected with `InvalidArgument`: tmux
+/// would run each line as a separate command, so text spliced into a command
+/// could inject another one.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_tmux_control_send(
+    session: *mut crate::tmux_control_core::session::ControlSession,
+    command_ptr: *const u8,
+    command_len: usize,
+    out_output: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if session.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let command = match unsafe { required_utf8(command_ptr, command_len) } {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        if crate::tmux_control_core::command::validate_tmux_control_arg(command).is_err() {
+            return TermyFfiStatus::InvalidArgument;
+        }
+        let session = unsafe { &*session };
+        match session.send_command(command) {
+            Ok(output) => {
+                if !out_output.is_null() {
+                    unsafe { *out_output = ffi_bytes_from_string(output) };
+                }
+                TermyFfiStatus::Ok
+            }
+            Err(_) => TermyFfiStatus::WriteFailed,
+        }
+    })
+}
+
+/// Closes and frees a control session handle from `termy_tmux_control_open`.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_tmux_control_close(
+    session: *mut crate::tmux_control_core::session::ControlSession,
+) {
+    ffi_guard((), || {
+        if !session.is_null() {
+            drop(unsafe { Box::from_raw(session) });
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_settings_prettify_config() -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        let contents = settings_read_contents();
+        let prettified = cfg::prettify_config_contents(&contents);
+        match settings_write_contents(&prettified) {
+            Ok(()) => TermyFfiStatus::Ok,
+            Err(status) => status,
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_reload_default_config_colors(
+    terminal: *mut TermyFfiTerminal,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let Ok(loaded) = load_config_from_default_path() else {
+            return TermyFfiStatus::ConfigLoadFailed;
+        };
+        let query_colors = terminal_query_colors_for_appearance(&loaded, 1);
+        unsafe {
+            (*terminal).terminal.set_query_colors(query_colors);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+/// Apply the palette resolved from `config` for the host's current appearance
+/// to an existing terminal. This updates default and ANSI colors used by frame
+/// snapshots and terminal color-query replies without restarting the PTY.
+///
+/// `system_appearance` uses the same ABI as
+/// [`termy_config_render_config_for_appearance`]: `0` is light and every other
+/// value is dark.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_apply_config_colors_for_appearance(
+    terminal: *mut TermyFfiTerminal,
+    config: *const TermyFfiConfig,
+    system_appearance: u32,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || config.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let query_colors =
+            unsafe { terminal_query_colors_for_appearance(&(*config).loaded, system_appearance) };
+        unsafe {
+            (*terminal).terminal.set_query_colors(query_colors);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+/// Destroy a terminal handle created by one of the `*_new` constructors.
+///
+/// See [`TermyFfiTerminal`] for the full lifetime contract: the caller must
+/// guarantee no other function is running on `terminal` — in particular that
+/// any wakeup thread has been woken (via `termy_terminal_notify_wakeup`) and
+/// **joined** — before calling this. Freeing a handle while a thread is parked
+/// in `termy_terminal_wait_for_wakeup` is a use-after-free. Passing null is a
+/// no-op that returns `Null`; every non-null handle must be freed exactly once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_free(terminal: *mut TermyFfiTerminal) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        unsafe {
+            drop(Box::from_raw(terminal));
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_write(
+    terminal: *mut TermyFfiTerminal,
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        // An empty payload is a no-op, not an error. A zero-length Swift array
+        // yields a null `baseAddress`, so treat (null, 0) as empty rather than
+        // rejecting it (matches the other byte-buffer entry points).
+        if bytes_len == 0 {
+            return TermyFfiStatus::Ok;
+        }
+        if bytes_ptr.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let bytes = unsafe { slice::from_raw_parts(bytes_ptr, bytes_len) };
+        unsafe {
+            (*terminal).terminal.write(bytes);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+/// The process ID of the program a terminal started in its own PTY. Writes 0
+/// and returns `TERMY_FFI_NOT_FOUND` for a display terminal or a session-host
+/// pane, whose program the host runs, and once the PTY is gone.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_child_pid(
+    terminal: *mut TermyFfiTerminal,
+    out_pid: *mut i32,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_pid.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let pid = unsafe { (*terminal).terminal.local_child_pid() }
+            .and_then(|pid| i32::try_from(pid).ok())
+            .filter(|pid| *pid > 0);
+        unsafe { *out_pid = pid.unwrap_or(0) };
+        if pid.is_some() {
+            TermyFfiStatus::Ok
+        } else {
+            TermyFfiStatus::NotFound
+        }
+    })
+}
+
+/// Writes a mouse motion or drag report. Motion may fill only half of the
+/// input backlog (see `Terminal::write_mouse_motion`), so a program that
+/// stops reading while the pointer moves cannot starve the keys typed next.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_write_mouse_motion(
+    terminal: *mut TermyFfiTerminal,
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        if bytes_len == 0 {
+            return TermyFfiStatus::Ok;
+        }
+        if bytes_ptr.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let bytes = unsafe { slice::from_raw_parts(bytes_ptr, bytes_len) };
+        unsafe {
+            (*terminal).terminal.write_mouse_motion(bytes.to_vec());
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+/// Advance a display-only terminal's grid with output bytes (e.g. tmux
+/// `%output`), without sending input to a PTY.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_feed_output(
+    terminal: *mut TermyFfiTerminal,
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        // Empty `%output` payloads are valid no-ops; don't fail on (null, 0).
+        if bytes_len == 0 {
+            return TermyFfiStatus::Ok;
+        }
+        if bytes_ptr.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let bytes = unsafe { slice::from_raw_parts(bytes_ptr, bytes_len) };
+        #[cfg(test)]
+        if PANIC_NEXT_FEED_OUTPUT.swap(false, Ordering::SeqCst) {
+            panic!("test-only feed_output panic");
+        }
+        unsafe {
+            (*terminal).terminal.feed_output(bytes);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_feed_output_with_replies(
+    terminal: *mut TermyFfiTerminal,
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+    out_replies: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_replies.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        if bytes_len != 0 && bytes_ptr.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let bytes = if bytes_len == 0 {
+            &[][..]
+        } else {
+            unsafe { slice::from_raw_parts(bytes_ptr, bytes_len) }
+        };
+        let replies = unsafe { (*terminal).terminal.feed_output_with_replies(bytes) };
+        unsafe {
+            *out_replies = if replies.is_empty() {
+                TermyFfiBytes::default()
+            } else {
+                ffi_bytes_from_vec(replies)
+            };
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_set_protocol_replies_enabled(
+    terminal: *mut TermyFfiTerminal,
+    enabled: bool,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        unsafe { (*terminal).terminal.set_protocol_replies_enabled(enabled) };
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_snapshot_encode(
+    terminal: *mut TermyFfiTerminal,
+    out_snapshot: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_snapshot.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let Some(snapshot) = (unsafe { (*terminal).terminal.encode_snapshot() }) else {
+            return TermyFfiStatus::InvalidArgument;
+        };
+        unsafe { *out_snapshot = ffi_bytes_from_vec(snapshot) };
+        TermyFfiStatus::Ok
+    })
+}
+
+fn ffi_snapshot_status(error: &crate::terminal_engine::SnapshotError) -> TermyFfiStatus {
+    match error {
+        crate::terminal_engine::SnapshotError::UnsupportedVersion(_) => {
+            TermyFfiStatus::UnsupportedSnapshotVersion
+        }
+        _ => TermyFfiStatus::InvalidSnapshot,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_snapshot_decode(
+    snapshot_ptr: *const u8,
+    snapshot_len: usize,
+    out_terminal: *mut *mut TermyFfiTerminal,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if out_terminal.is_null() || snapshot_ptr.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        unsafe { *out_terminal = ptr::null_mut() };
+        let bytes = unsafe { slice::from_raw_parts(snapshot_ptr, snapshot_len) };
+        let terminal = display_terminal(TerminalSize::default());
+        match terminal.terminal.restore_snapshot(bytes) {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return ffi_snapshot_status(&error),
+            None => return TermyFfiStatus::InvalidArgument,
+        }
+        unsafe {
+            *out_terminal = Box::into_raw(Box::new(terminal));
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_snapshot_restore(
+    terminal: *mut TermyFfiTerminal,
+    snapshot_ptr: *const u8,
+    snapshot_len: usize,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || snapshot_ptr.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let bytes = unsafe { slice::from_raw_parts(snapshot_ptr, snapshot_len) };
+        match unsafe { (*terminal).terminal.restore_snapshot(bytes) } {
+            Some(Ok(())) => TermyFfiStatus::Ok,
+            Some(Err(error)) => ffi_snapshot_status(&error),
+            None => TermyFfiStatus::InvalidArgument,
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_encode_key(
+    terminal: *mut TermyFfiTerminal,
+    keystroke: *const TermyFfiKeystroke,
+    out_bytes: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| unsafe {
+        termy_terminal_encode_key_impl(terminal, keystroke, false, out_bytes)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_encode_key_with_options(
+    terminal: *mut TermyFfiTerminal,
+    keystroke: *const TermyFfiKeystroke,
+    macos_option_as_alt: bool,
+    out_bytes: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| unsafe {
+        termy_terminal_encode_key_impl(terminal, keystroke, macos_option_as_alt, out_bytes)
+    })
+}
+
+unsafe fn termy_terminal_encode_key_impl(
+    terminal: *mut TermyFfiTerminal,
+    keystroke: *const TermyFfiKeystroke,
+    macos_option_as_alt: bool,
+    out_bytes: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    if terminal.is_null() || keystroke.is_null() || out_bytes.is_null() {
+        return TermyFfiStatus::Null;
+    }
+
+    let keystroke = unsafe { *keystroke };
+    let key = match unsafe { required_utf8(keystroke.key_ptr, keystroke.key_len) } {
+        Ok(key) => key.to_owned(),
+        Err(status) => return status,
+    };
+    let key_char = match unsafe { optional_utf8(keystroke.key_char_ptr, keystroke.key_char_len) } {
+        Ok(key_char) => key_char.map(ToOwned::to_owned),
+        Err(status) => return status,
+    };
+    let event_kind = match keystroke.event_kind {
+        2 => TerminalKeyEventKind::Repeat,
+        3 => TerminalKeyEventKind::Release,
+        _ => TerminalKeyEventKind::Press,
+    };
+    let input = unsafe {
+        let terminal = &(*terminal).terminal;
+        keystroke_to_input_with_options(
+            &TermyKeystroke {
+                modifiers: TermyModifiers {
+                    control: keystroke.control,
+                    alt: keystroke.alt,
+                    shift: keystroke.shift,
+                    platform: keystroke.platform,
+                    function: keystroke.function,
+                },
+                key,
+                key_char,
+            },
+            event_kind,
+            terminal.keyboard_mode(),
+            true,
+            macos_option_as_alt,
+        )
+    };
+
+    unsafe {
+        *out_bytes = input.map_or_else(|| termy_null_buffer(), ffi_bytes_from_vec);
+    }
+    TermyFfiStatus::Ok
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_encode_mouse(
+    terminal: *mut TermyFfiTerminal,
+    input: *const TermyFfiMouseInput,
+    out_bytes: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || input.is_null() || out_bytes.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let input = unsafe { *input };
+        let Some(event) = mouse_event(input) else {
+            return TermyFfiStatus::UnknownKey;
+        };
+
+        let encoded = unsafe {
+            let terminal = &(*terminal).terminal;
+            encode_mouse_report(
+                terminal.mouse_mode(),
+                event,
+                TerminalMousePosition {
+                    col: input.col,
+                    row: input.row,
+                },
+                TerminalMouseModifiers {
+                    shift: input.shift,
+                    alt: input.alt,
+                    control: input.control,
+                },
+            )
+        };
+
+        unsafe {
+            *out_bytes = encoded.map_or_else(|| termy_null_buffer(), ffi_bytes_from_vec);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_encode_paste(
+    terminal: *mut TermyFfiTerminal,
+    text_ptr: *const u8,
+    text_len: usize,
+    out_bytes: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_bytes.is_null() || (text_ptr.is_null() && text_len > 0) {
+            return TermyFfiStatus::Null;
+        }
+        // (null, 0) is an empty paste, as for `termy_terminal_write`.
+        let text = if text_len == 0 {
+            &[][..]
+        } else {
+            unsafe { slice::from_raw_parts(text_ptr, text_len) }
+        };
+        let bracketed = unsafe { (*terminal).terminal.bracketed_paste_mode() };
+        let encoded = crate::encode_paste(&String::from_utf8_lossy(text), bracketed);
+        unsafe {
+            *out_bytes = if encoded.is_empty() {
+                termy_null_buffer()
+            } else {
+                ffi_bytes_from_vec(encoded)
+            };
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_resize(
+    terminal: *mut TermyFfiTerminal,
+    size: TermyFfiSize,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        #[cfg(test)]
+        if PANIC_NEXT_RESIZE.swap(false, Ordering::SeqCst) {
+            panic!("test-only resize panic");
+        }
+
+        unsafe {
+            let terminal = &mut (*terminal).terminal;
+            let next_size = size.into();
+            if terminal.size() == next_size {
+                // Preserve the legacy C/Swift contract: embedders may resend
+                // the current dimensions solely to deliver SIGWINCH to a TUI.
+                terminal.nudge_resize();
+            } else {
+                terminal.resize(next_size);
+            }
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_set_wakeup_enabled(
+    terminal: *mut TermyFfiTerminal,
+    enabled: bool,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        unsafe {
+            (*terminal).terminal.set_wakeup_enabled(enabled);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+/// Block up to `timeout_ms` (0 = poll without blocking) for a terminal wake
+/// signal, coalescing all pending signals into a single `*out_woke = true`.
+///
+/// This is the one function designed to run on a **dedicated** thread
+/// concurrently with the serialized terminal calls — it reads only the internal
+/// wake channel, never terminal state. It must not still be executing when the
+/// handle is freed; see [`TermyFfiTerminal`] for the teardown ordering.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_wait_for_wakeup(
+    terminal: *mut TermyFfiTerminal,
+    timeout_ms: u64,
+    out_woke: *mut bool,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_woke.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let receiver = unsafe { (*terminal).wakeups_rx.as_ref() };
+        let woke = match receiver {
+            Some(receiver) => {
+                let received = if timeout_ms == 0 {
+                    receiver.try_recv().is_ok()
+                } else {
+                    receiver
+                        .recv_timeout(Duration::from_millis(timeout_ms))
+                        .is_ok()
+                };
+                if received {
+                    while receiver.try_recv().is_ok() {}
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
+
+        unsafe {
+            *out_woke = woke;
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+/// Wake a thread blocked in `termy_terminal_wait_for_wakeup`. Safe to call from
+/// any thread; used both to nudge the host to drain events and, during teardown,
+/// to release the wakeup thread so it can be joined before `termy_terminal_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_notify_wakeup(
+    terminal: *mut TermyFfiTerminal,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        if let Some(sender) = unsafe { (*terminal).wakeups_tx.as_ref() } {
+            let _ = sender.try_send(());
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_scroll_display(
+    terminal: *mut TermyFfiTerminal,
+    delta_lines: i32,
+    out_changed: *mut bool,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_changed.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        unsafe {
+            *out_changed = (*terminal).terminal.scroll_display(delta_lines);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_scroll_to_bottom(
+    terminal: *mut TermyFfiTerminal,
+    out_changed: *mut bool,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_changed.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        unsafe {
+            *out_changed = (*terminal).terminal.scroll_to_bottom();
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_clear_scrollback(
+    terminal: *mut TermyFfiTerminal,
+    out_changed: *mut bool,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_changed.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        unsafe {
+            *out_changed = (*terminal).terminal.clear_scrollback();
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_set_scrollback_history(
+    terminal: *mut TermyFfiTerminal,
+    scrollback_history: usize,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        unsafe {
+            (*terminal)
+                .terminal
+                .set_scrollback_history(scrollback_history);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+/// Writes whether the terminal currently has bracketed-paste mode enabled into
+/// `out_enabled`. Hosts use this to wrap pasted text in the bracketed-paste
+/// markers (and to strip an embedded terminator) so a multi-line paste cannot
+/// be executed line-by-line by the foreground program.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_bracketed_paste_mode(
+    terminal: *mut TermyFfiTerminal,
+    out_enabled: *mut bool,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_enabled.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        unsafe {
+            *out_enabled = (*terminal).terminal.bracketed_paste_mode();
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_snapshot(
+    terminal: *mut TermyFfiTerminal,
+    out_frame: *mut TermyFfiFrame,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_frame.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let frame = unsafe { (*terminal).terminal.snapshot() };
+        let (cells_ptr, cells_len, cells_capacity) = leak_vec(ffi_cells(frame.cells));
+        let cursor = ffi_cursor_from_cursor(frame.cursor);
+
+        unsafe {
+            *out_frame = TermyFfiFrame {
+                cols: frame.cols,
+                rows: frame.rows,
+                cells_ptr,
+                cells_len,
+                cells_capacity,
+                cursor,
+                display_offset: frame.display_offset,
+                history_size: frame.history_size,
+            };
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_frame_free(frame: *mut TermyFfiFrame) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if frame.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let frame = unsafe { &mut *frame };
+        if !frame.cells_ptr.is_null() {
+            unsafe {
+                drop(Vec::from_raw_parts(
+                    frame.cells_ptr,
+                    frame.cells_len,
+                    frame.cells_capacity,
+                ));
+            }
+        }
+        *frame = TermyFfiFrame::default();
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_take_frame_update(
+    terminal: *mut TermyFfiTerminal,
+    force_full: bool,
+    out_update: *mut TermyFfiFrameUpdate,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_update.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let update = unsafe { (*terminal).terminal.frame_update(force_full) };
+        unsafe {
+            *out_update = ffi_frame_update_from_update(update);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+/// Like `termy_terminal_take_frame_update`, for a host that keeps the frame
+/// it shows: output that scrolled comes back as `out_scrolls`, to apply in
+/// order to that frame before the update's spans patch it, instead of as
+/// damage on every row it moved. Scrolls only accompany partial damage, and
+/// none come when they would not fit the viewport. Free the scrolls with
+/// `termy_viewport_scrolls_free` and the update as usual.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_take_frame_update_with_scrolls(
+    terminal: *mut TermyFfiTerminal,
+    force_full: bool,
+    out_update: *mut TermyFfiFrameUpdate,
+    out_scrolls: *mut TermyFfiViewportScrollBatch,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_update.is_null() || out_scrolls.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let (update, scrolls) =
+            unsafe { (*terminal).terminal.frame_update_with_scrolls(force_full) };
+        let scrolls = scrolls
+            .into_iter()
+            .map(|scroll| TermyFfiViewportScroll {
+                top: scroll.top,
+                bottom: scroll.bottom,
+                count: scroll.count,
+                direction: match scroll.direction {
+                    crate::TerminalViewportScrollDirection::Up => 1,
+                    crate::TerminalViewportScrollDirection::Down => 2,
+                },
+            })
+            .collect::<Vec<_>>();
+        let (scrolls_ptr, scrolls_len, scrolls_capacity) = leak_vec(scrolls);
+        unsafe {
+            *out_update = ffi_frame_update_from_update(update);
+            *out_scrolls = TermyFfiViewportScrollBatch {
+                scrolls_ptr,
+                scrolls_len,
+                scrolls_capacity,
+            };
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_viewport_scrolls_free(
+    scrolls: *mut TermyFfiViewportScrollBatch,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if scrolls.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let scrolls = unsafe { &mut *scrolls };
+        if !scrolls.scrolls_ptr.is_null() {
+            unsafe {
+                drop(Vec::from_raw_parts(
+                    scrolls.scrolls_ptr,
+                    scrolls.scrolls_len,
+                    scrolls.scrolls_capacity,
+                ));
+            }
+        }
+        *scrolls = TermyFfiViewportScrollBatch::default();
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_frame_update_free(
+    update: *mut TermyFfiFrameUpdate,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if update.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let update = unsafe { &mut *update };
+        if !update.cells_ptr.is_null() {
+            // SAFETY: the cells were allocated as a `Vec<TermyCell>` (see
+            // `ffi_cells`), whose layout `TermyFfiCell` shares. No cell is
+            // read: the buffer is taken back empty.
+            let cells = unsafe {
+                Vec::<TermyCell>::from_raw_parts(update.cells_ptr.cast(), 0, update.cells_capacity)
+            };
+            crate::frame::recycle_frame_cells(cells);
+        }
+        if !update.spans_ptr.is_null() {
+            unsafe {
+                drop(Vec::from_raw_parts(
+                    update.spans_ptr,
+                    update.spans_len,
+                    update.spans_capacity,
+                ));
+            }
+        }
+        *update = TermyFfiFrameUpdate::default();
+        TermyFfiStatus::Ok
+    })
+}
+
+/// Builds a sparse renderer-neutral glyph plan from a host's retained full frame.
+///
+/// `cells` must contain `cols * rows` row-major cells. When `spans_len` is zero,
+/// the full frame is planned; otherwise only the inclusive dirty spans are emitted.
+/// Entries use absolute row-major cell indices and reference the flattened rect and
+/// stroke arrays. Release every successful result with
+/// `termy_glyph_render_plan_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_cells_build_glyph_render_plan(
+    cells_ptr: *const TermyFfiCell,
+    cells_len: usize,
+    cols: u16,
+    rows: u16,
+    spans_ptr: *const TermyFfiDirtySpan,
+    spans_len: usize,
+    metrics: TermyFfiGlyphMetrics,
+    out_plan: *mut TermyFfiGlyphRenderPlan,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if out_plan.is_null() || cells_ptr.is_null() || (spans_len > 0 && spans_ptr.is_null()) {
+            return TermyFfiStatus::Null;
+        }
+        unsafe {
+            *out_plan = TermyFfiGlyphRenderPlan::default();
+        }
+
+        let cells = unsafe { slice::from_raw_parts(cells_ptr, cells_len) };
+        let spans = if spans_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(spans_ptr, spans_len) }
+        };
+        let plan = match build_ffi_glyph_render_plan(
+            cells,
+            usize::from(cols),
+            usize::from(rows),
+            spans,
+            TerminalGlyphMetrics {
+                cell_width: metrics.cell_width,
+                cell_height: metrics.cell_height,
+                font_size: metrics.font_size,
+            },
+        ) {
+            Ok(plan) => plan,
+            Err(status) => return status,
+        };
+        let (entries_ptr, entries_len, entries_capacity) = leak_vec(plan.entries);
+        let (rects_ptr, rects_len, rects_capacity) = leak_vec(plan.rects);
+        let (strokes_ptr, strokes_len, strokes_capacity) = leak_vec(plan.strokes);
+        unsafe {
+            *out_plan = TermyFfiGlyphRenderPlan {
+                entries_ptr,
+                entries_len,
+                entries_capacity,
+                rects_ptr,
+                rects_len,
+                rects_capacity,
+                strokes_ptr,
+                strokes_len,
+                strokes_capacity,
+            };
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_glyph_render_plan_free(
+    plan: *mut TermyFfiGlyphRenderPlan,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if plan.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let plan = unsafe { &mut *plan };
+        if !plan.entries_ptr.is_null() {
+            unsafe {
+                drop(Vec::from_raw_parts(
+                    plan.entries_ptr,
+                    plan.entries_len,
+                    plan.entries_capacity,
+                ));
+            }
+        }
+        if !plan.rects_ptr.is_null() {
+            unsafe {
+                drop(Vec::from_raw_parts(
+                    plan.rects_ptr,
+                    plan.rects_len,
+                    plan.rects_capacity,
+                ));
+            }
+        }
+        if !plan.strokes_ptr.is_null() {
+            unsafe {
+                drop(Vec::from_raw_parts(
+                    plan.strokes_ptr,
+                    plan.strokes_len,
+                    plan.strokes_capacity,
+                ));
+            }
+        }
+        *plan = TermyFfiGlyphRenderPlan::default();
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_kitty_graphics_revision(
+    terminal: *mut TermyFfiTerminal,
+    out_revision: *mut u64,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_revision.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        unsafe {
+            *out_revision = (*terminal).terminal.kitty_graphics_revision();
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_kitty_graphics_placements(
+    terminal: *mut TermyFfiTerminal,
+    out_batch: *mut TermyFfiKittyGraphicsBatch,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_batch.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let terminal = unsafe { &mut *terminal };
+        unsafe { *out_batch = kitty_graphics_batch(terminal, None) };
+        TermyFfiStatus::Ok
+    })
+}
+
+/// Like `termy_terminal_kitty_graphics_placements`, without the PNG
+/// round trip: an image's pixels arrive as raw RGBA8 in `rgba` (or, for the
+/// rare image stored only as a PNG, in `png`), and an image listed in `known`
+/// arrives with neither, since the host has its pixels already.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_kitty_graphics_placements_rgba(
+    terminal: *mut TermyFfiTerminal,
+    known_ptr: *const TermyFfiKittyImageKey,
+    known_len: usize,
+    out_batch: *mut TermyFfiKittyGraphicsBatch,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_batch.is_null() || (known_ptr.is_null() && known_len != 0) {
+            return TermyFfiStatus::Null;
+        }
+
+        let known = if known_len == 0 {
+            std::collections::HashSet::new()
+        } else {
+            unsafe { slice::from_raw_parts(known_ptr, known_len) }
+                .iter()
+                .copied()
+                .collect()
+        };
+        let terminal = unsafe { &mut *terminal };
+        unsafe { *out_batch = kitty_graphics_batch(terminal, Some(&known)) };
+        TermyFfiStatus::Ok
+    })
+}
+
+/// The terminal's placements. With `known` (the RGBA export), images in it
+/// carry no pixels and the others carry RGBA when they have it; without, every
+/// image carries its PNG.
+fn kitty_graphics_batch(
+    terminal: &mut TermyFfiTerminal,
+    known: Option<&std::collections::HashSet<TermyFfiKittyImageKey>>,
+) -> TermyFfiKittyGraphicsBatch {
+    let (revision, placements) = terminal.terminal.kitty_graphics_snapshot();
+    let size = terminal.terminal.size();
+    // An image may have thousands of Unicode placeholder placements. They
+    // all share one C copy of its pixels, which the batch frees once.
+    let mut pixel_exports = HashMap::new();
+    let mut exports = Vec::new();
+    let placements = placements
+        .into_iter()
+        .map(|placement| {
+            let key = TermyFfiKittyImageKey {
+                image_id: placement.image_id,
+                image_generation: placement.image_generation,
+            };
+            let empty = (TermyFfiBytes::default(), TermyFfiBytes::default());
+            let (png, rgba) = if known.is_some_and(|known| known.contains(&key)) {
+                empty
+            } else {
+                *pixel_exports
+                    .entry(std::sync::Arc::as_ptr(&placement.image))
+                    .or_insert_with(|| match placement.image.rgba() {
+                        Some(rgba) if known.is_some() => {
+                            (empty.0, ffi_bytes_from_vec(rgba.to_vec()))
+                        }
+                        _ => {
+                            let png = placement.image.png();
+                            let bytes = ffi_bytes_from_vec(png.to_vec());
+                            exports.push(png);
+                            (bytes, empty.1)
+                        }
+                    })
+            };
+            ffi_kitty_graphics_placement_from_placement(placement, png, rgba)
+        })
+        .collect::<Vec<_>>();
+    // Hold the encodings of images still placed until the next batch.
+    terminal.kitty_png_exports = exports;
+    let (placements_ptr, placements_len, placements_capacity) = leak_vec(placements);
+    TermyFfiKittyGraphicsBatch {
+        revision,
+        placements_ptr,
+        placements_len,
+        placements_capacity,
+        cell_width: size.cell_width,
+        cell_height: size.cell_height,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_kitty_graphics_batch_free(
+    batch: *mut TermyFfiKittyGraphicsBatch,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if batch.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let batch = unsafe { &mut *batch };
+        if !batch.placements_ptr.is_null() {
+            let placements = unsafe {
+                Vec::from_raw_parts(
+                    batch.placements_ptr,
+                    batch.placements_len,
+                    batch.placements_capacity,
+                )
+            };
+            // Placements of one image share a buffer; free each one once.
+            let mut freed = std::collections::HashSet::new();
+            for placement in placements {
+                for bytes in [placement.png, placement.rgba] {
+                    if freed.insert(bytes.ptr) {
+                        free_bytes(bytes);
+                    }
+                }
+            }
+        }
+        *batch = TermyFfiKittyGraphicsBatch::default();
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_kitty_clipboard_paste_events_enabled(
+    terminal: *mut TermyFfiTerminal,
+    out_enabled: *mut bool,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_enabled.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        unsafe {
+            *out_enabled = (*terminal).terminal.kitty_clipboard_paste_events_enabled();
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_send_kitty_clipboard_paste_event(
+    terminal: *mut TermyFfiTerminal,
+    location: u32,
+    available_formats_ptr: *const TermyFfiByteSlice,
+    available_formats_len: usize,
+    out_sent: *mut bool,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_sent.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        if available_formats_len > 0 && available_formats_ptr.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let Some(location) = clipboard_location_from_ffi(location) else {
+            return TermyFfiStatus::InvalidArgument;
+        };
+        let Some(available_formats) =
+            (unsafe { copied_ffi_strings(available_formats_ptr, available_formats_len) })
+        else {
+            return TermyFfiStatus::InvalidArgument;
+        };
+        unsafe {
+            *out_sent = (*terminal)
+                .terminal
+                .send_kitty_clipboard_paste_event(location, &available_formats);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+/// Look up the OSC 8 hyperlink under a viewport cell. Sets `out_found` and,
+/// when found, fills `out_link` with the contiguous link run on that row.
+/// A found link's `uri` must be released with `termy_hyperlink_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_hyperlink_at(
+    terminal: *mut TermyFfiTerminal,
+    row: usize,
+    col: usize,
+    out_found: *mut bool,
+    out_link: *mut TermyFfiHyperlink,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_found.is_null() || out_link.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let link = unsafe { (*terminal).terminal.hyperlink_at(row, col) };
+        unsafe {
+            if let Some(link) = link {
+                *out_found = true;
+                *out_link = TermyFfiHyperlink {
+                    start_col: link.start_col,
+                    end_col: link.end_col,
+                    uri: ffi_bytes_from_string(link.target),
+                };
+            } else {
+                *out_found = false;
+                *out_link = TermyFfiHyperlink::default();
+            }
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_hyperlink_free(link: *mut TermyFfiHyperlink) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if link.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let link = unsafe { &mut *link };
+        if !link.uri.ptr.is_null() {
+            free_bytes(link.uri);
+        }
+        *link = TermyFfiHyperlink::default();
+        TermyFfiStatus::Ok
+    })
+}
+
+/// Look up the link under a viewport cell: an OSC 8 hyperlink, or a URL,
+/// domain or existing file path in the text (relative paths resolve against
+/// the pane's working directory). File paths become `file://` URLs. Sets
+/// `out_found` and, when found, fills `out_link`, whose `uri` must be released
+/// with `termy_link_free`. Path lookups touch the filesystem, and a session
+/// host terminal asks its host, so call it on demand (a modifier hover or a
+/// click), not on every mouse move.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_link_at(
+    terminal: *mut TermyFfiTerminal,
+    row: usize,
+    col: usize,
+    out_found: *mut bool,
+    out_link: *mut TermyFfiLink,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_found.is_null() || out_link.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let link = unsafe { (*terminal).terminal.link_at(row, col) };
+        unsafe {
+            if let Some(link) = link {
+                *out_found = true;
+                *out_link = TermyFfiLink {
+                    start_row: link.start_row,
+                    start_col: link.start_col,
+                    end_row: link.end_row,
+                    end_col: link.end_col,
+                    uri: ffi_bytes_from_string(link.target),
+                };
+            } else {
+                *out_found = false;
+                *out_link = TermyFfiLink::default();
+            }
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_link_free(link: *mut TermyFfiLink) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if link.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let link = unsafe { &mut *link };
+        if !link.uri.ptr.is_null() {
+            free_bytes(link.uri);
+        }
+        *link = TermyFfiLink::default();
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_take_damage(
+    terminal: *mut TermyFfiTerminal,
+    out_damage: *mut TermyFfiDamage,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_damage.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let damage = unsafe { (*terminal).terminal.take_damage_snapshot() };
+        let result = match damage {
+            TerminalDamageSnapshot::Full => TermyFfiDamage {
+                kind: 1,
+                ..TermyFfiDamage::default()
+            },
+            TerminalDamageSnapshot::Partial(spans) if spans.is_empty() => TermyFfiDamage::default(),
+            TerminalDamageSnapshot::Partial(spans) => {
+                let spans = spans
+                    .into_iter()
+                    .map(
+                        |TerminalDirtySpan {
+                             row,
+                             left_col,
+                             right_col,
+                         }| TermyFfiDirtySpan {
+                            row,
+                            left_col,
+                            right_col,
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                let (spans_ptr, spans_len, spans_capacity) = leak_vec(spans);
+                TermyFfiDamage {
+                    kind: 2,
+                    spans_ptr,
+                    spans_len,
+                    spans_capacity,
+                }
+            }
+        };
+
+        unsafe {
+            *out_damage = result;
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_damage_free(damage: *mut TermyFfiDamage) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if damage.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let damage = unsafe { &mut *damage };
+        if !damage.spans_ptr.is_null() {
+            unsafe {
+                drop(Vec::from_raw_parts(
+                    damage.spans_ptr,
+                    damage.spans_len,
+                    damage.spans_capacity,
+                ));
+            }
+        }
+        *damage = TermyFfiDamage::default();
+        TermyFfiStatus::Ok
+    })
+}
+
+unsafe fn drain_events_with_host(
+    terminal: *mut TermyFfiTerminal,
+    host: &mut impl TerminalReplyHost,
+    out_batch: *mut TermyFfiEventBatch,
+) -> TermyFfiStatus {
+    if terminal.is_null() || out_batch.is_null() {
+        return TermyFfiStatus::Null;
+    }
+
+    let (events, has_more) = unsafe { (*terminal).terminal.drain_events(host) };
+    let events = events
+        .into_iter()
+        .map(ffi_event_from_event)
+        .collect::<Vec<_>>();
+    let (events_ptr, events_len, events_capacity) = leak_vec(events);
+    unsafe {
+        *out_batch = TermyFfiEventBatch {
+            events_ptr,
+            events_len,
+            events_capacity,
+            has_more,
+        };
+    }
+    TermyFfiStatus::Ok
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_drain_events(
+    terminal: *mut TermyFfiTerminal,
+    out_batch: *mut TermyFfiEventBatch,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| unsafe { drain_events_with_host(terminal, &mut EmptyReplyHost, out_batch) })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_drain_events_with_clipboard(
+    terminal: *mut TermyFfiTerminal,
+    user_data: TermyFfiUserData,
+    read_callback: Option<TermyFfiClipboardReadCallback>,
+    write_callback: Option<TermyFfiClipboardWriteCallback>,
+    protocol_reply_callback: Option<TermyFfiProtocolReplyCallback>,
+    out_batch: *mut TermyFfiEventBatch,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        let mut host = FfiClipboardReplyHost {
+            user_data,
+            read_callback,
+            write_callback,
+            protocol_reply_callback,
+        };
+        unsafe { drain_events_with_host(terminal, &mut host, out_batch) }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_event_batch_free(batch: *mut TermyFfiEventBatch) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if batch.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let batch = unsafe { &mut *batch };
+        if !batch.events_ptr.is_null() {
+            let events = unsafe {
+                Vec::from_raw_parts(batch.events_ptr, batch.events_len, batch.events_capacity)
+            };
+            for event in events {
+                free_bytes(event.payload);
+            }
+        }
+        *batch = TermyFfiEventBatch::default();
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_search(
+    terminal: *mut TermyFfiTerminal,
+    query_ptr: *const u8,
+    query_len: usize,
+    out_batch: *mut TermyFfiSearchBatch,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| unsafe {
+        termy_terminal_search_with_options(
+            terminal,
+            query_ptr,
+            query_len,
+            TermyFfiSearchOptions::default(),
+            out_batch,
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_search_with_options(
+    terminal: *mut TermyFfiTerminal,
+    query_ptr: *const u8,
+    query_len: usize,
+    options: TermyFfiSearchOptions,
+    out_batch: *mut TermyFfiSearchBatch,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_batch.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let query = match unsafe { contents_utf8(query_ptr, query_len) } {
+            Ok(query) => query,
+            Err(status) => return status,
+        };
+
+        let matches = unsafe {
+            (*terminal).terminal.search_shared_with_options(
+                query,
+                TermySearchOptions {
+                    case_sensitive: options.case_sensitive,
+                    regex: options.regex,
+                },
+            )
+        }
+        .into_iter()
+        .map(ffi_search_match_from_match)
+        .collect::<Vec<_>>();
+        let (matches_ptr, matches_len, matches_capacity) = leak_vec(matches);
+
+        unsafe {
+            *out_batch = TermyFfiSearchBatch {
+                matches_ptr,
+                matches_len,
+                matches_capacity,
+            };
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+/// A search that may run on any thread; see `TerminalSearcher`.
+pub struct TermyFfiSearcher {
+    searcher: crate::TerminalSearcher,
+}
+
+/// Makes a search handle for `terminal`. This is a serialized terminal call;
+/// the handle's searches may then run on any thread, alongside any other call
+/// on the terminal, and after it is freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_searcher_new(
+    terminal: *mut TermyFfiTerminal,
+    out_searcher: *mut *mut TermyFfiSearcher,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_searcher.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let searcher = unsafe { (*terminal).terminal.searcher() };
+        unsafe { *out_searcher = Box::into_raw(Box::new(TermyFfiSearcher { searcher })) };
+        TermyFfiStatus::Ok
+    })
+}
+
+/// Searches like `termy_terminal_search_with_options`, from any thread. One
+/// handle may run several searches at once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_searcher_search(
+    searcher: *const TermyFfiSearcher,
+    query_ptr: *const u8,
+    query_len: usize,
+    options: TermyFfiSearchOptions,
+    out_batch: *mut TermyFfiSearchBatch,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if searcher.is_null() || out_batch.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let query = match unsafe { contents_utf8(query_ptr, query_len) } {
+            Ok(query) => query,
+            Err(status) => return status,
+        };
+        let matches = unsafe { &(*searcher).searcher }
+            .search(
+                query,
+                TermySearchOptions {
+                    case_sensitive: options.case_sensitive,
+                    regex: options.regex,
+                },
+            )
+            .into_iter()
+            .map(ffi_search_match_from_match)
+            .collect::<Vec<_>>();
+        let (matches_ptr, matches_len, matches_capacity) = leak_vec(matches);
+        unsafe {
+            *out_batch = TermyFfiSearchBatch {
+                matches_ptr,
+                matches_len,
+                matches_capacity,
+            };
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_searcher_free(searcher: *mut TermyFfiSearcher) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if searcher.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        drop(unsafe { Box::from_raw(searcher) });
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_search_batch_free(
+    batch: *mut TermyFfiSearchBatch,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if batch.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let batch = unsafe { &mut *batch };
+        if !batch.matches_ptr.is_null() {
+            let matches = unsafe {
+                Vec::from_raw_parts(batch.matches_ptr, batch.matches_len, batch.matches_capacity)
+            };
+            for search_match in matches {
+                free_bytes(search_match.line);
+            }
+        }
+        *batch = TermyFfiSearchBatch::default();
+        TermyFfiStatus::Ok
+    })
+}
+
+fn free_bytes(bytes: TermyFfiBytes) {
+    if bytes.ptr.is_null() {
+        return;
+    }
+
+    unsafe {
+        drop(Vec::from_raw_parts(bytes.ptr, bytes.len, bytes.capacity));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_buffer_free(bytes: TermyFfiBytes) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if bytes.ptr.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        free_bytes(bytes);
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn termy_null_buffer() -> TermyFfiBytes {
+    ffi_guard(TermyFfiBytes::default(), || TermyFfiBytes {
+        ptr: ptr::null_mut(),
+        len: 0,
+        capacity: 0,
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn termy_runtime_config_default_scrollback() -> usize {
+    ffi_guard(0, || TerminalRuntimeConfig::default().scrollback_history)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn termy_terminal_options_default_scrollback() -> usize {
+    ffi_guard(0, || TerminalOptions::default().scrollback_history)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_query_color_default_foreground(
+    out_color: *mut TermyFfiColor,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if out_color.is_null() {
+            return TermyFfiStatus::Null;
+        }
+
+        let color = TerminalQueryColors::default().foreground;
+        unsafe {
+            *out_color = TermyFfiColor {
+                r: color.r,
+                g: color.g,
+                b: color.b,
+                a: 255,
+            };
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graphics_batch_encodes_each_shared_image_once() {
+        let mut terminal = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_display_terminal_new(termy_size_default(), &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+        let commands = b"\x1b_Ga=T,f=32,s=1,v=1,i=1,p=1,c=1,r=1,C=1,q=2;AQID/w==\x1b\\\x1b[1;2H\x1b_Ga=p,i=1,p=2,c=1,r=1,C=1,q=2;\x1b\\";
+        assert_eq!(
+            unsafe { termy_terminal_feed_output(terminal, commands.as_ptr(), commands.len()) },
+            TermyFfiStatus::Ok
+        );
+        let image = unsafe {
+            (*terminal).terminal.kitty_graphics_placements()[0]
+                .image
+                .clone()
+        };
+        assert_eq!(image.png_encoding_count(), 0);
+
+        let mut batch = TermyFfiKittyGraphicsBatch::default();
+        assert_eq!(
+            unsafe { termy_terminal_kitty_graphics_placements(terminal, &mut batch) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(batch.placements_len, 2);
+        assert_eq!(image.png_encoding_count(), 1);
+        let placements =
+            unsafe { slice::from_raw_parts(batch.placements_ptr, batch.placements_len) };
+        for placement in placements {
+            let png = unsafe { slice::from_raw_parts(placement.png.ptr, placement.png.len) };
+            assert!(png.starts_with(b"\x89PNG"));
+        }
+        // Placements of one image share one C copy of its PNG.
+        assert_eq!(placements[0].png, placements[1].png);
+        assert_eq!(
+            unsafe { termy_kitty_graphics_batch_free(&mut batch) },
+            TermyFfiStatus::Ok
+        );
+
+        // The export outlives the batch, so polling again does not re-encode.
+        assert_eq!(
+            unsafe { termy_terminal_kitty_graphics_placements(terminal, &mut batch) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(image.png_encoding_count(), 1);
+        assert_eq!(
+            unsafe { termy_kitty_graphics_batch_free(&mut batch) },
+            TermyFfiStatus::Ok
+        );
+
+        // The RGBA export never encodes, shares one copy per image, and
+        // leaves out the pixels of images the host already holds.
+        assert_eq!(
+            unsafe {
+                termy_terminal_kitty_graphics_placements_rgba(
+                    terminal,
+                    std::ptr::null(),
+                    0,
+                    &mut batch,
+                )
+            },
+            TermyFfiStatus::Ok
+        );
+        let placements =
+            unsafe { slice::from_raw_parts(batch.placements_ptr, batch.placements_len) };
+        assert_eq!(placements.len(), 2);
+        assert!(placements[0].png.ptr.is_null());
+        let rgba = unsafe { slice::from_raw_parts(placements[0].rgba.ptr, placements[0].rgba.len) };
+        assert_eq!(rgba, [1, 2, 3, 255]);
+        assert_eq!(placements[0].rgba, placements[1].rgba);
+        let known = [TermyFfiKittyImageKey {
+            image_id: placements[0].image_id,
+            image_generation: placements[0].image_generation,
+        }];
+        assert_eq!(
+            unsafe { termy_kitty_graphics_batch_free(&mut batch) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(
+            unsafe {
+                termy_terminal_kitty_graphics_placements_rgba(
+                    terminal,
+                    known.as_ptr(),
+                    known.len(),
+                    &mut batch,
+                )
+            },
+            TermyFfiStatus::Ok
+        );
+        let placements =
+            unsafe { slice::from_raw_parts(batch.placements_ptr, batch.placements_len) };
+        assert_eq!(placements.len(), 2);
+        for placement in placements {
+            assert!(placement.png.ptr.is_null() && placement.rgba.ptr.is_null());
+        }
+        assert_eq!(image.png_encoding_count(), 1);
+        assert_eq!(
+            unsafe { termy_kitty_graphics_batch_free(&mut batch) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    fn glyph_test_cell(character: char) -> TermyFfiCell {
+        TermyFfiCell {
+            codepoint: character as u32,
+            render_text: true,
+            ..TermyFfiCell::default()
+        }
+    }
+
+    #[test]
+    fn default_size_is_nonzero() {
+        let size = termy_size_default();
+        assert!(size.cols > 0);
+        assert!(size.rows > 0);
+        assert!(size.cell_width > 0.0);
+        assert!(size.cell_height > 0.0);
+    }
+
+    #[test]
+    fn glyph_render_plan_is_sparse_batched_and_row_aware() {
+        let cells = [
+            glyph_test_cell('\u{2580}'),
+            glyph_test_cell('\u{28FF}'),
+            glyph_test_cell('\u{28FF}'),
+            glyph_test_cell('\u{28FF}'),
+            glyph_test_cell('\u{256D}'),
+            glyph_test_cell('\u{2573}'),
+        ];
+        let metrics = TermyFfiGlyphMetrics {
+            cell_width: 10.0,
+            cell_height: 20.0,
+            font_size: 14.0,
+        };
+        let mut plan = TermyFfiGlyphRenderPlan::default();
+        assert_eq!(
+            unsafe {
+                termy_cells_build_glyph_render_plan(
+                    cells.as_ptr(),
+                    cells.len(),
+                    cells.len() as u16,
+                    1,
+                    ptr::null(),
+                    0,
+                    metrics,
+                    &mut plan,
+                )
+            },
+            TermyFfiStatus::Ok
+        );
+        let entries = unsafe { slice::from_raw_parts(plan.entries_ptr, plan.entries_len) };
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.render_kind)
+                .collect::<Vec<_>>(),
+            vec![1, 4, 4, 4, 5, 6]
+        );
+        assert_eq!(plan.rects_len, 25);
+        assert_eq!(plan.strokes_len, 3);
+        assert_eq!(
+            unsafe { termy_glyph_render_plan_free(&mut plan) },
+            TermyFfiStatus::Ok
+        );
+        assert!(plan.entries_ptr.is_null());
+
+        let dirty = TermyFfiDirtySpan {
+            row: 0,
+            left_col: 1,
+            right_col: 1,
+        };
+        assert_eq!(
+            unsafe {
+                termy_cells_build_glyph_render_plan(
+                    cells.as_ptr(),
+                    cells.len(),
+                    cells.len() as u16,
+                    1,
+                    &dirty,
+                    1,
+                    metrics,
+                    &mut plan,
+                )
+            },
+            TermyFfiStatus::Ok
+        );
+        let entries = unsafe { slice::from_raw_parts(plan.entries_ptr, plan.entries_len) };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cell_index, 1);
+        assert_eq!(entries[0].render_kind, 4);
+        assert_eq!(entries[0].rect_len, 8);
+        assert_eq!(
+            unsafe { termy_glyph_render_plan_free(&mut plan) },
+            TermyFfiStatus::Ok
+        );
+    }
+
+    #[test]
+    fn glyph_render_plan_rejects_mismatched_frame_dimensions() {
+        let cells = [glyph_test_cell('\u{2580}')];
+        let mut plan = TermyFfiGlyphRenderPlan::default();
+        assert_eq!(
+            unsafe {
+                termy_cells_build_glyph_render_plan(
+                    cells.as_ptr(),
+                    cells.len(),
+                    2,
+                    1,
+                    ptr::null(),
+                    0,
+                    TermyFfiGlyphMetrics {
+                        cell_width: 10.0,
+                        cell_height: 20.0,
+                        font_size: 14.0,
+                    },
+                    &mut plan,
+                )
+            },
+            TermyFfiStatus::InvalidArgument
+        );
+        assert!(plan.entries_ptr.is_null());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_write_replaces_the_symlink_target_atomically() {
+        let root = tempfile::tempdir().expect("temporary settings root");
+        let dotfiles = root.path().join("dotfiles");
+        std::fs::create_dir(&dotfiles).expect("create dotfiles directory");
+        let target = dotfiles.join("config.txt");
+        std::fs::write(&target, "font_size = 12\n").expect("seed config");
+        let config_dir = root.path().join("termy");
+        std::fs::create_dir(&config_dir).expect("create config directory");
+        let link = config_dir.join("config.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("link config");
+
+        settings_write_contents_to(&link, "font_size = 14\n").expect("write settings");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            "font_size = 14\n"
+        );
+        // No temporary files are left next to either file.
+        assert_eq!(std::fs::read_dir(&dotfiles).expect("list").count(), 1);
+        assert_eq!(std::fs::read_dir(&config_dir).expect("list").count(), 1);
+
+        // A dangling link still writes the file it names.
+        std::fs::remove_file(&target).expect("remove target");
+        settings_write_contents_to(&link, "font_size = 16\n").expect("write settings");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            "font_size = 16\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_write_never_exposes_a_truncated_file() {
+        let root = tempfile::tempdir().expect("temporary settings root");
+        let path = root.path().join("config.txt");
+        let contents = "font_size = 14\n".repeat(4096);
+        settings_write_contents_to(&path, &contents).expect("seed config");
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (path, contents, done) = (path.clone(), contents.clone(), done.clone());
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    settings_write_contents_to(&path, &contents).expect("write settings");
+                }
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        while !done.load(Ordering::SeqCst) {
+            let read = std::fs::read_to_string(&path).expect("read config");
+            assert_eq!(read.len(), contents.len(), "a reader saw a partial config");
+        }
+        writer.join().expect("writer thread");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_write_reports_read_only_config_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary settings root");
+        let config_dir = root.path().join("termy");
+        std::fs::create_dir(&config_dir).expect("create config directory");
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("make config directory read-only");
+
+        let result = settings_write_contents_to(&config_dir.join("config.txt"), "font_size = 14\n");
+
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore config directory permissions");
+        assert_eq!(result, Err(TermyFfiStatus::WriteFailed));
+    }
+
+    #[test]
+    fn settings_schema_json_covers_sections_and_values() {
+        let contents = b"font_size = 18\ncursor_style = line\ntmux_enabled = true\n[colors]\nforeground = #abcdef\n";
+        let mut config = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_config_from_contents(contents.as_ptr(), contents.len(), &mut config) },
+            TermyFfiStatus::Ok
+        );
+
+        let mut bytes = TermyFfiBytes::default();
+        assert_eq!(
+            unsafe { termy_settings_schema_json(config, &mut bytes) },
+            TermyFfiStatus::Ok
+        );
+        let json = unsafe {
+            str::from_utf8(slice::from_raw_parts(bytes.ptr, bytes.len)).expect("schema utf8")
+        };
+        let value: serde_json::Value = serde_json::from_str(json).expect("valid json");
+
+        let sections = value["sections"].as_array().expect("sections array");
+        let ids: Vec<&str> = sections
+            .iter()
+            .map(|section| section["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "appearance",
+                "terminal",
+                "tabs",
+                "advanced",
+                "colors",
+                "keybindings"
+            ]
+        );
+
+        // Appearance carries the edited font size value.
+        let appearance = &sections[0];
+        let font_size = appearance["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["settings"].as_array().unwrap())
+            .find(|setting| setting["key"] == "font_size")
+            .expect("font_size setting");
+        assert_eq!(font_size["value"], "18");
+        assert_eq!(font_size["kind"], "numeric");
+        let theme = appearance["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["settings"].as_array().unwrap())
+            .find(|setting| setting["key"] == "theme")
+            .expect("theme setting");
+        assert_eq!(theme["kind"], "special");
+        let theme_choices = theme["choices"].as_array().expect("theme choices");
+        assert!(
+            theme_choices
+                .iter()
+                .any(|choice| choice["value"] == cfg::SHELL_DECIDE_THEME_ID)
+        );
+        assert!(
+            theme_choices
+                .iter()
+                .any(|choice| choice["value"] == "termy")
+        );
+        let values: Vec<&str> = theme_choices
+            .iter()
+            .filter_map(|choice| choice["value"].as_str())
+            .collect();
+        assert_eq!(
+            &values[..3],
+            ["termy", "termy-light", cfg::SHELL_DECIDE_THEME_ID],
+            "Termy's themes and shell-decide lead the list"
+        );
+        assert!(
+            values.contains(&"dracula"),
+            "the built-in collection is offered"
+        );
+        assert!(
+            sections
+                .iter()
+                .flat_map(|section| section["groups"].as_array().into_iter().flatten())
+                .flat_map(|group| group["settings"].as_array().into_iter().flatten())
+                .any(|setting| setting["key"] == "tmux_enabled")
+        );
+
+        // Colors section reflects the override hex.
+        let colors = &sections[4]["colors"].as_array().unwrap();
+        let foreground = colors
+            .iter()
+            .find(|color| color["key"] == "foreground")
+            .expect("foreground color");
+        assert_eq!(foreground["hex"], "#abcdef");
+
+        assert_eq!(unsafe { termy_buffer_free(bytes) }, TermyFfiStatus::Ok);
+        assert_eq!(unsafe { termy_config_free(config) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn settings_schema_json_exposes_all_shared_root_settings() {
+        let mut config = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_config_from_contents(b"".as_ptr(), 0, &mut config) },
+            TermyFfiStatus::Ok
+        );
+
+        let mut bytes = TermyFfiBytes::default();
+        assert_eq!(
+            unsafe { termy_settings_schema_json(config, &mut bytes) },
+            TermyFfiStatus::Ok
+        );
+        let json = unsafe {
+            str::from_utf8(slice::from_raw_parts(bytes.ptr, bytes.len)).expect("schema json utf8")
+        };
+        let value: serde_json::Value = serde_json::from_str(json).expect("valid schema json");
+        let exposed_keys = value["sections"]
+            .as_array()
+            .expect("sections array")
+            .iter()
+            .flat_map(|section| section["groups"].as_array().into_iter().flatten())
+            .flat_map(|group| group["settings"].as_array().into_iter().flatten())
+            .filter_map(|setting| setting["key"].as_str())
+            .collect::<std::collections::HashSet<_>>();
+
+        for spec in cfg::ROOT_SETTING_SPECS {
+            if matches!(spec.id, cfg::RootSettingId::Keybind) {
+                continue;
+            }
+            assert!(
+                exposed_keys.contains(spec.key),
+                "settings schema omitted shared config key {}",
+                spec.key
+            );
+        }
+
+        assert_eq!(unsafe { termy_buffer_free(bytes) }, TermyFfiStatus::Ok);
+        assert_eq!(unsafe { termy_config_free(config) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn config_from_contents_exposes_safety_config() {
+        let contents = b"warn_on_quit = true\nwarn_on_quit_with_running_process = false\nauto_update = false\ntmux_enabled = true\ntmux_persistence = false\ntmux_exclusive = true\ntmux_binary = /opt/homebrew/bin/tmux\ntmux_show_active_pane_border = false\nsimple_mode = true\nnative_tab_persistence = true\nnative_layout_autosave = true\nnative_buffer_persistence = true\nshow_debug_overlay = true\nonboarding_complete = false\ntab_close_visibility = always\ntab_width_mode = active_grow_sticky\ntab_bar_position = right\ntab_switch_modifier_hints = false\nui_font_family = Avenir Next\nchrome_contrast = true\ncommand_palette_show_keybinds = false\napp_icon = old\nshell_integration_enabled = false\nprogress_indicator_enabled = false\nauto_hide_tabbar = false\nshow_termy_in_titlebar = false\n";
+        let mut config = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_config_from_contents(contents.as_ptr(), contents.len(), &mut config) },
+            TermyFfiStatus::Ok
+        );
+
+        let mut safety = TermyFfiSafetyConfig::default();
+        assert_eq!(
+            unsafe { termy_config_safety(config, &mut safety) },
+            TermyFfiStatus::Ok
+        );
+        assert!(safety.warn_on_quit);
+        assert!(!safety.warn_on_quit_with_running_process);
+
+        let mut native = TermyFfiNativeConfig::default();
+        assert_eq!(
+            unsafe { termy_config_native(config, &mut native) },
+            TermyFfiStatus::Ok
+        );
+        assert!(!native.auto_update);
+        assert!(native.tmux_enabled);
+        assert!(!native.tmux_persistence);
+        assert!(native.tmux_exclusive);
+        assert!(!native.tmux_show_active_pane_border);
+        assert!(native.simple_mode);
+        assert!(native.native_tab_persistence);
+        assert!(native.native_layout_autosave);
+        assert!(native.native_buffer_persistence);
+        assert!(native.show_debug_overlay);
+        assert!(!native.onboarding_complete);
+        assert_eq!(native.tab_close_visibility, 2);
+        assert_eq!(native.tab_width_mode, 2);
+        assert_eq!(native.tab_bar_position, 1);
+        assert!(!native.tab_switch_modifier_hints);
+        assert!(native.chrome_contrast);
+        assert!(!native.command_palette_show_keybinds);
+        assert_eq!(native.app_icon, 1);
+        assert!(!native.shell_integration_enabled);
+        assert!(!native.progress_indicator_enabled);
+        assert!(!native.auto_hide_tabbar);
+        assert!(!native.show_termy_in_titlebar);
+
+        let mut tmux_binary = TermyFfiBytes::default();
+        assert_eq!(
+            unsafe { termy_config_tmux_binary(config, &mut tmux_binary) },
+            TermyFfiStatus::Ok
+        );
+        let tmux_binary_value = unsafe {
+            str::from_utf8(slice::from_raw_parts(tmux_binary.ptr, tmux_binary.len))
+                .expect("tmux binary utf8")
+        };
+        assert_eq!(tmux_binary_value, "/opt/homebrew/bin/tmux");
+        assert_eq!(
+            unsafe { termy_buffer_free(tmux_binary) },
+            TermyFfiStatus::Ok
+        );
+
+        let mut ui_font_family = TermyFfiBytes::default();
+        assert_eq!(
+            unsafe { termy_config_ui_font_family(config, &mut ui_font_family) },
+            TermyFfiStatus::Ok
+        );
+        let ui_font_family_value = unsafe {
+            str::from_utf8(slice::from_raw_parts(
+                ui_font_family.ptr,
+                ui_font_family.len,
+            ))
+            .expect("ui font utf8")
+        };
+        assert_eq!(ui_font_family_value, "Avenir Next");
+        assert_eq!(
+            unsafe { termy_buffer_free(ui_font_family) },
+            TermyFfiStatus::Ok
+        );
+
+        assert_eq!(unsafe { termy_config_free(config) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn config_from_contents_exposes_tasks_json() {
+        let contents = b"task.build.command = cargo build\ntask.build.working_dir = crates/cli\ntask.dev.layout = dashboard\ntask.dev.command = cargo run\n";
+        let mut config = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_config_from_contents(contents.as_ptr(), contents.len(), &mut config) },
+            TermyFfiStatus::Ok
+        );
+
+        let mut bytes = TermyFfiBytes::default();
+        assert_eq!(
+            unsafe { termy_config_tasks_json(config, &mut bytes) },
+            TermyFfiStatus::Ok
+        );
+        let json = unsafe {
+            str::from_utf8(slice::from_raw_parts(bytes.ptr, bytes.len)).expect("tasks json utf8")
+        };
+        let tasks: serde_json::Value = serde_json::from_str(json).expect("valid tasks json");
+        assert_eq!(tasks[0]["name"], "build");
+        assert_eq!(tasks[0]["command"], "cargo build");
+        assert_eq!(tasks[0]["working_dir"], "crates/cli");
+        assert_eq!(tasks[0]["layout"], serde_json::Value::Null);
+        assert_eq!(tasks[1]["name"], "dev");
+        assert_eq!(tasks[1]["layout"], "dashboard");
+
+        assert_eq!(unsafe { termy_buffer_free(bytes) }, TermyFfiStatus::Ok);
+        assert_eq!(unsafe { termy_config_free(config) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn config_from_contents_exposes_resolved_keybinds_json() {
+        let contents = b"keybind = clear\nkeybind = cmd-p=toggle_command_palette\nkeybind = cmd-d=split_pane_vertical\n";
+        let mut config = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_config_from_contents(contents.as_ptr(), contents.len(), &mut config) },
+            TermyFfiStatus::Ok
+        );
+
+        let mut bytes = TermyFfiBytes::default();
+        assert_eq!(
+            unsafe { termy_config_keybinds_json(config, &mut bytes) },
+            TermyFfiStatus::Ok
+        );
+        let json = unsafe {
+            str::from_utf8(slice::from_raw_parts(bytes.ptr, bytes.len)).expect("keybind json utf8")
+        };
+        let keybinds: serde_json::Value = serde_json::from_str(json).expect("valid keybind json");
+        assert_eq!(keybinds.as_array().map(Vec::len), Some(2));
+        assert_eq!(keybinds[0]["trigger"], "cmd-p");
+        assert_eq!(keybinds[0]["action"], "toggle_command_palette");
+        assert_eq!(keybinds[1]["trigger"], "cmd-d");
+        assert_eq!(keybinds[1]["action"], "split_pane_vertical");
+
+        assert_eq!(unsafe { termy_buffer_free(bytes) }, TermyFfiStatus::Ok);
+        assert_eq!(unsafe { termy_config_free(config) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn settings_prettify_config_function_is_exported() {
+        let _function: unsafe extern "C" fn() -> TermyFfiStatus = termy_settings_prettify_config;
+    }
+
+    #[test]
+    fn config_from_contents_exposes_runtime_fields_and_diagnostics() {
+        let contents = b"scrollback = 77\nwindow_width = 1440\nwindow_height = 900\nworking_dir = /tmp\nunknown_key = true\n";
+        let mut config = ptr::null_mut();
+
+        let status =
+            unsafe { termy_config_from_contents(contents.as_ptr(), contents.len(), &mut config) };
+        assert_eq!(status, TermyFfiStatus::Ok);
+        assert!(!config.is_null());
+
+        assert_eq!(
+            unsafe { termy_config_runtime_scrollback_history(config) },
+            77
+        );
+        assert_eq!(unsafe { termy_config_diagnostic_count(config) }, 1);
+
+        let mut width = 0.0;
+        let mut height = 0.0;
+        assert_eq!(
+            unsafe { termy_config_window_size(config, &mut width, &mut height) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(width, 1440.0);
+        assert_eq!(height, 900.0);
+
+        let mut working_directory = TermyFfiBytes::default();
+        assert_eq!(
+            unsafe { termy_config_working_directory(config, &mut working_directory) },
+            TermyFfiStatus::Ok
+        );
+        let working_directory_text = unsafe {
+            str::from_utf8(slice::from_raw_parts(
+                working_directory.ptr,
+                working_directory.len,
+            ))
+            .expect("working directory utf8")
+        };
+        assert_eq!(working_directory_text, "/tmp");
+        assert_eq!(
+            unsafe { termy_buffer_free(working_directory) },
+            TermyFfiStatus::Ok
+        );
+
+        let mut diagnostics = TermyFfiConfigDiagnosticBatch::default();
+        assert_eq!(
+            unsafe { termy_config_diagnostics(config, &mut diagnostics) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(diagnostics.diagnostics_len, 1);
+        let first = unsafe { *diagnostics.diagnostics_ptr };
+        assert_eq!(first.line_number, 5);
+        assert_eq!(first.kind, 2);
+        assert!(!first.message.ptr.is_null());
+
+        assert_eq!(
+            unsafe { termy_config_diagnostics_free(&mut diagnostics) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(unsafe { termy_config_free(config) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn config_from_contents_exposes_inactive_tab_scrollback() {
+        let contents = b"inactive_tab_scrollback = 123\n";
+        let mut config = ptr::null_mut();
+
+        let status =
+            unsafe { termy_config_from_contents(contents.as_ptr(), contents.len(), &mut config) };
+        assert_eq!(status, TermyFfiStatus::Ok);
+        assert!(!config.is_null());
+
+        let mut enabled = false;
+        let mut value = 0;
+        assert_eq!(
+            unsafe {
+                termy_config_runtime_inactive_tab_scrollback(config, &mut enabled, &mut value)
+            },
+            TermyFfiStatus::Ok
+        );
+        assert!(enabled);
+        assert_eq!(value, 123);
+
+        assert_eq!(unsafe { termy_config_free(config) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn config_from_contents_exposes_disabled_inactive_tab_scrollback() {
+        let contents = b"inactive_tab_scrollback = none\n";
+        let mut config = ptr::null_mut();
+
+        let status =
+            unsafe { termy_config_from_contents(contents.as_ptr(), contents.len(), &mut config) };
+        assert_eq!(status, TermyFfiStatus::Ok);
+        assert!(!config.is_null());
+
+        let mut enabled = true;
+        let mut value = 999;
+        assert_eq!(
+            unsafe {
+                termy_config_runtime_inactive_tab_scrollback(config, &mut enabled, &mut value)
+            },
+            TermyFfiStatus::Ok
+        );
+        assert!(!enabled);
+        assert_eq!(value, 0);
+
+        assert_eq!(unsafe { termy_config_free(config) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn config_from_contents_exposes_render_config() {
+        let contents = b"theme = nord\nfont_family = Example Mono\nfont_size = 18\nline_height = 1.25\npadding_x = 3\npadding_y = 5\nbackground_opacity = 0.5\nbackground_opacity_cells = true\nbackground_blur = true\nmouse_scroll_multiplier = 4.5\nscrollbar_visibility = always\nscrollbar_style = theme\ncopy_on_select = true\ncopy_on_select_toast = false\npane_focus_effect = cinematic\npane_focus_strength = 1.25\nchrome_contrast = true\ncursor_blink = false\ncursor_style = line\n[colors]\nbackground = #010203\ncursor = #040506\n";
+        let mut config = ptr::null_mut();
+
+        let status =
+            unsafe { termy_config_from_contents(contents.as_ptr(), contents.len(), &mut config) };
+        assert_eq!(status, TermyFfiStatus::Ok);
+        assert!(!config.is_null());
+
+        let mut render_config = TermyFfiRenderConfig::default();
+        assert_eq!(
+            unsafe { termy_config_render_config(config, &mut render_config) },
+            TermyFfiStatus::Ok
+        );
+        let font_family = unsafe {
+            str::from_utf8(slice::from_raw_parts(
+                render_config.font_family.ptr,
+                render_config.font_family.len,
+            ))
+            .expect("font family utf8")
+        };
+        let active_theme = unsafe {
+            str::from_utf8(slice::from_raw_parts(
+                render_config.active_theme.ptr,
+                render_config.active_theme.len,
+            ))
+            .expect("active theme utf8")
+        };
+
+        assert_eq!(font_family, "Example Mono");
+        assert_eq!(active_theme, "nord");
+        assert_eq!(
+            render_config.background,
+            TermyFfiColor {
+                r: 1,
+                g: 2,
+                b: 3,
+                a: 255,
+            }
+        );
+        assert_eq!(
+            render_config.cursor,
+            TermyFfiColor {
+                r: 4,
+                g: 5,
+                b: 6,
+                a: 255,
+            }
+        );
+        assert_eq!(render_config.font_size, 18.0);
+        assert_eq!(render_config.line_height, 1.25);
+        assert_eq!(render_config.padding_x, 3.0);
+        assert_eq!(render_config.padding_y, 5.0);
+        assert_eq!(render_config.background_opacity, 0.5);
+        assert!(render_config.background_opacity_cells);
+        assert!(!render_config.cursor_blink);
+        assert_eq!(render_config.cursor_style, 1);
+        assert!(render_config.cell_width >= 1.0);
+        assert_eq!(render_config.cell_height, 22.5);
+        assert!(render_config.background_blur);
+        assert_eq!(render_config.mouse_scroll_multiplier, 4.5);
+        assert_eq!(render_config.scrollbar_visibility, 1);
+        assert_eq!(render_config.scrollbar_style, 2);
+        assert!(render_config.copy_on_select);
+        assert!(!render_config.copy_on_select_toast);
+        assert_eq!(render_config.pane_focus_effect, 2);
+        assert_eq!(render_config.pane_focus_strength, 1.25);
+        assert!(render_config.chrome_contrast);
+
+        assert_eq!(
+            unsafe { termy_render_config_free(&mut render_config) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(unsafe { termy_config_free(config) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn render_config_respects_requested_system_appearance() {
+        let contents = b"theme_mode = system\ntheme_light = nord\ntheme_dark = termy\n";
+        let mut config = ptr::null_mut();
+
+        let status =
+            unsafe { termy_config_from_contents(contents.as_ptr(), contents.len(), &mut config) };
+        assert_eq!(status, TermyFfiStatus::Ok);
+        assert!(!config.is_null());
+
+        let mut light = TermyFfiRenderConfig::default();
+        let mut dark = TermyFfiRenderConfig::default();
+        assert_eq!(
+            unsafe { termy_config_render_config_for_appearance(config, 0, &mut light) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(
+            unsafe { termy_config_render_config_for_appearance(config, 1, &mut dark) },
+            TermyFfiStatus::Ok
+        );
+
+        let light_theme = unsafe {
+            str::from_utf8(slice::from_raw_parts(
+                light.active_theme.ptr,
+                light.active_theme.len,
+            ))
+            .expect("light theme utf8")
+        };
+        let dark_theme = unsafe {
+            str::from_utf8(slice::from_raw_parts(
+                dark.active_theme.ptr,
+                dark.active_theme.len,
+            ))
+            .expect("dark theme utf8")
+        };
+
+        assert_eq!(light_theme, "nord");
+        assert_eq!(dark_theme, "termy");
+
+        assert_eq!(
+            unsafe { termy_render_config_free(&mut light) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(
+            unsafe { termy_render_config_free(&mut dark) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(unsafe { termy_config_free(config) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn terminal_search_returns_visible_matches() {
+        let size = TermyFfiSize {
+            cols: 16,
+            rows: 4,
+            cell_width: 9.0,
+            cell_height: 18.0,
+        };
+        let mut terminal = ptr::null_mut();
+
+        assert_eq!(
+            unsafe { termy_display_terminal_new(size, &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+        let output = b"alpha beta\r\nbeta gamma";
+        assert_eq!(
+            unsafe { termy_terminal_feed_output(terminal, output.as_ptr(), output.len()) },
+            TermyFfiStatus::Ok
+        );
+
+        let query = b"beta";
+        let mut batch = TermyFfiSearchBatch::default();
+        assert_eq!(
+            unsafe { termy_terminal_search(terminal, query.as_ptr(), query.len(), &mut batch) },
+            TermyFfiStatus::Ok
+        );
+        assert!(batch.matches_len >= 1);
+
+        let matches = unsafe { slice::from_raw_parts(batch.matches_ptr, batch.matches_len) };
+        assert!(
+            matches
+                .iter()
+                .any(|search_match| search_match.start_col == 6)
+        );
+
+        assert_eq!(
+            unsafe { termy_search_batch_free(&mut batch) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn terminal_wakeup_wait_is_coalesced_and_notifiable() {
+        let size = TermyFfiSize {
+            cols: 16,
+            rows: 4,
+            cell_width: 9.0,
+            cell_height: 18.0,
+        };
+        #[cfg(target_os = "windows")]
+        let command: &[u8] = b"";
+        #[cfg(not(target_os = "windows"))]
+        let command: &[u8] = b"sleep 1";
+        let mut terminal = ptr::null_mut();
+
+        assert_eq!(
+            unsafe { termy_terminal_new(size, command.as_ptr(), command.len(), &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+
+        let mut woke = false;
+        loop {
+            assert_eq!(
+                unsafe { termy_terminal_wait_for_wakeup(terminal, 0, &mut woke) },
+                TermyFfiStatus::Ok
+            );
+            if !woke {
+                break;
+            }
+        }
+
+        assert_eq!(
+            unsafe { termy_terminal_notify_wakeup(terminal) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(
+            unsafe { termy_terminal_notify_wakeup(terminal) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(
+            unsafe { termy_terminal_wait_for_wakeup(terminal, 50, &mut woke) },
+            TermyFfiStatus::Ok
+        );
+        assert!(woke);
+        assert_eq!(
+            unsafe { termy_terminal_wait_for_wakeup(terminal, 0, &mut woke) },
+            TermyFfiStatus::Ok
+        );
+        assert!(!woke);
+
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    /// The frame a host keeps, patched with updates that replay scrolls.
+    struct ScrollingReplica {
+        cols: usize,
+        cells: Vec<TermyFfiCell>,
+    }
+
+    impl ScrollingReplica {
+        /// Applies one update; returns its scrolls and the rows it patched.
+        fn update(
+            &mut self,
+            terminal: *mut TermyFfiTerminal,
+        ) -> (Vec<TermyFfiViewportScroll>, Vec<usize>) {
+            let mut update = TermyFfiFrameUpdate::default();
+            let mut batch = TermyFfiViewportScrollBatch::default();
+            assert_eq!(
+                unsafe {
+                    termy_terminal_take_frame_update_with_scrolls(
+                        terminal,
+                        self.cells.is_empty(),
+                        &mut update,
+                        &mut batch,
+                    )
+                },
+                TermyFfiStatus::Ok
+            );
+            let cells = unsafe { slice::from_raw_parts(update.cells_ptr, update.cells_len) };
+            let scrolls =
+                unsafe { slice::from_raw_parts(batch.scrolls_ptr, batch.scrolls_len) }.to_vec();
+            let mut rows = Vec::new();
+            match update.damage_kind {
+                1 => {
+                    assert!(scrolls.is_empty(), "full frames carry no scrolls");
+                    self.cols = usize::from(update.cols);
+                    self.cells = cells.to_vec();
+                    rows = (0..usize::from(update.rows)).collect();
+                }
+                2 => {
+                    for scroll in &scrolls {
+                        let region = &mut self.cells
+                            [scroll.top * self.cols..(scroll.bottom + 1) * self.cols];
+                        match scroll.direction {
+                            1 => region.rotate_left(scroll.count * self.cols),
+                            2 => region.rotate_right(scroll.count * self.cols),
+                            other => panic!("unknown direction {other}"),
+                        }
+                    }
+                    let spans =
+                        unsafe { slice::from_raw_parts(update.spans_ptr, update.spans_len) };
+                    let mut source = 0;
+                    for span in spans {
+                        let start = span.row * self.cols + span.left_col;
+                        let width = span.right_col - span.left_col + 1;
+                        self.cells[start..start + width]
+                            .copy_from_slice(&cells[source..source + width]);
+                        source += width;
+                        rows.push(span.row);
+                    }
+                }
+                _ => assert!(scrolls.is_empty()),
+            }
+            assert_eq!(
+                unsafe { termy_viewport_scrolls_free(&mut batch) },
+                TermyFfiStatus::Ok
+            );
+            assert_eq!(
+                unsafe { termy_frame_update_free(&mut update) },
+                TermyFfiStatus::Ok
+            );
+            rows.dedup();
+            (scrolls, rows)
+        }
+
+        fn matches_snapshot(&self, terminal: *mut TermyFfiTerminal) -> bool {
+            let mut frame = TermyFfiFrame::default();
+            assert_eq!(
+                unsafe { termy_terminal_snapshot(terminal, &mut frame) },
+                TermyFfiStatus::Ok
+            );
+            let same =
+                unsafe { slice::from_raw_parts(frame.cells_ptr, frame.cells_len) } == self.cells;
+            assert_eq!(unsafe { termy_frame_free(&mut frame) }, TermyFfiStatus::Ok);
+            same
+        }
+    }
+
+    fn scrolling_display_terminal(cols: u16, rows: u16) -> *mut TermyFfiTerminal {
+        let size = TermyFfiSize {
+            cols,
+            rows,
+            cell_width: 9.0,
+            cell_height: 18.0,
+        };
+        let mut terminal = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_display_terminal_new(size, &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+        terminal
+    }
+
+    fn feed(terminal: *mut TermyFfiTerminal, output: &[u8]) {
+        assert_eq!(
+            unsafe { termy_terminal_feed_output(terminal, output.as_ptr(), output.len()) },
+            TermyFfiStatus::Ok
+        );
+    }
+
+    #[test]
+    fn scrolled_output_sends_the_scroll_and_only_the_new_rows() {
+        let terminal = scrolling_display_terminal(10, 5);
+        let mut replica = ScrollingReplica {
+            cols: 0,
+            cells: Vec::new(),
+        };
+        feed(terminal, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        replica.update(terminal);
+        feed(terminal, b"\r\nsix");
+        let (scrolls, rows) = replica.update(terminal);
+        assert_eq!(
+            scrolls,
+            [TermyFfiViewportScroll {
+                top: 0,
+                bottom: 4,
+                count: 1,
+                direction: 1,
+            }]
+        );
+        // The new bottom row, and the cursor's old row once it moved up.
+        assert!(rows.iter().all(|row| *row >= 3), "patched rows {rows:?}");
+        assert!(rows.contains(&4));
+        assert!(replica.matches_snapshot(terminal));
+
+        // The old path still reports the moved rows as damage instead.
+        feed(terminal, b"\r\nseven");
+        let mut update = TermyFfiFrameUpdate::default();
+        assert_eq!(
+            unsafe { termy_terminal_take_frame_update(terminal, false, &mut update) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(update.damage_kind, 2);
+        assert_eq!(update.spans_len, 5);
+        assert_eq!(
+            unsafe { termy_frame_update_free(&mut update) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn replayed_scrolls_keep_the_frame_equal_to_a_snapshot() {
+        let terminal = scrolling_display_terminal(12, 6);
+        let mut replica = ScrollingReplica {
+            cols: 0,
+            cells: Vec::new(),
+        };
+        replica.update(terminal);
+        // Lines, colors, wide text, scroll regions, scrolls both ways,
+        // inserted and deleted lines, erases and the alternate screen.
+        let steps: [&[u8]; 14] = [
+            b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh",
+            b"\x1b[31mred\x1b[0m\r\n\xe7\x95\x8c\xe7\x95\x8c\r\nx",
+            b"\x1b[2;5r\x1b[5;1Hin\r\nregion\r\nmore",
+            b"\x1b[2S",
+            b"\x1b[1T",
+            b"\x1b[3;1H\x1b[2L",
+            b"\x1b[2;1H\x1b[1M",
+            b"\x1b[r\x1b[6;1H\r\nfull\r\nwidth\r\nagain",
+            b"\x1b[?1049h\x1b[Halt\r\nscreen",
+            b"\r\n\r\n\r\n\r\n\r\n\r\nscrolled",
+            b"\x1b[?1049l",
+            b"\x1b[3;1H\x1b[J\r\nafter\r\nerase",
+            b"\x1b[4;6r\x1b[6;1H\x1b[44mblue\r\n\r\n\x1b[0m",
+            b"\x1b[r\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7",
+        ];
+        let mut scrolled = 0;
+        for (index, step) in steps.iter().enumerate() {
+            feed(terminal, step);
+            let (scrolls, _) = replica.update(terminal);
+            scrolled += scrolls.len();
+            assert!(replica.matches_snapshot(terminal), "step {index} diverged");
+        }
+        assert!(scrolled >= 4, "only {scrolled} scrolls replayed");
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    struct SendSearcher(*mut TermyFfiSearcher);
+    // SAFETY: a searcher may be used from any thread; see its docs.
+    unsafe impl Send for SendSearcher {}
+
+    #[test]
+    fn searchers_run_on_other_threads_while_the_terminal_is_fed_and_read() {
+        let terminal = scrolling_display_terminal(40, 10);
+        assert_eq!(
+            unsafe { termy_terminal_set_scrollback_history(terminal, 4_000) },
+            TermyFfiStatus::Ok
+        );
+        let history: Vec<u8> = (0..3000)
+            .flat_map(|line| format!("needle {line}\r\n").into_bytes())
+            .collect();
+        feed(terminal, &history);
+        let mut searcher = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_terminal_searcher_new(terminal, &mut searcher) },
+            TermyFfiStatus::Ok
+        );
+        let handle = SendSearcher(searcher);
+        let worker = std::thread::spawn(move || {
+            let handle = handle;
+            let mut counts = Vec::new();
+            for _ in 0..20 {
+                let query = b"needle";
+                let mut batch = TermyFfiSearchBatch::default();
+                assert_eq!(
+                    unsafe {
+                        termy_searcher_search(
+                            handle.0,
+                            query.as_ptr(),
+                            query.len(),
+                            TermyFfiSearchOptions::default(),
+                            &mut batch,
+                        )
+                    },
+                    TermyFfiStatus::Ok
+                );
+                counts.push(batch.matches_len);
+                assert_eq!(
+                    unsafe { termy_search_batch_free(&mut batch) },
+                    TermyFfiStatus::Ok
+                );
+            }
+            counts
+        });
+        // Meanwhile output streams and frames are taken on this thread.
+        for line in 0..2000 {
+            feed(terminal, format!("other {line}\r\n").as_bytes());
+            let mut update = TermyFfiFrameUpdate::default();
+            assert_eq!(
+                unsafe { termy_terminal_take_frame_update(terminal, false, &mut update) },
+                TermyFfiStatus::Ok
+            );
+            assert_eq!(
+                unsafe { termy_frame_update_free(&mut update) },
+                TermyFfiStatus::Ok
+            );
+        }
+        let counts = worker.join().expect("searches finish");
+        // Each search finds the needles still in history; output only pushes
+        // them out, never adds them.
+        assert!(counts[0] > 0, "{counts:?}");
+        assert!(counts.iter().all(|count| *count <= 3000), "{counts:?}");
+        // The handle outlives its terminal.
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+        let query = b"other 1999";
+        let mut batch = TermyFfiSearchBatch::default();
+        assert_eq!(
+            unsafe {
+                termy_searcher_search(
+                    searcher,
+                    query.as_ptr(),
+                    query.len(),
+                    TermyFfiSearchOptions::default(),
+                    &mut batch,
+                )
+            },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(batch.matches_len, 1);
+        assert_eq!(
+            unsafe { termy_search_batch_free(&mut batch) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(unsafe { termy_searcher_free(searcher) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn chunked_searches_number_lines_as_when_they_began() {
+        // More lines than one chunk, so the copy releases the lock between chunks.
+        let terminal = scrolling_display_terminal(20, 5);
+        assert_eq!(
+            unsafe { termy_terminal_set_scrollback_history(terminal, 10_000) },
+            TermyFfiStatus::Ok
+        );
+        let output: Vec<u8> = (0..5000)
+            .flat_map(|line| format!("row {line}\r\n").into_bytes())
+            .collect();
+        feed(terminal, &output);
+        let query = b"row 4321";
+        let mut direct = TermyFfiSearchBatch::default();
+        assert_eq!(
+            unsafe {
+                termy_terminal_search_with_options(
+                    terminal,
+                    query.as_ptr(),
+                    query.len(),
+                    TermyFfiSearchOptions::default(),
+                    &mut direct,
+                )
+            },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(direct.matches_len, 1);
+        let mut searcher = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_terminal_searcher_new(terminal, &mut searcher) },
+            TermyFfiStatus::Ok
+        );
+        let mut batch = TermyFfiSearchBatch::default();
+        assert_eq!(
+            unsafe {
+                termy_searcher_search(
+                    searcher,
+                    query.as_ptr(),
+                    query.len(),
+                    TermyFfiSearchOptions::default(),
+                    &mut batch,
+                )
+            },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(batch.matches_len, 1);
+        assert_eq!(unsafe { (*batch.matches_ptr).row }, unsafe {
+            (*direct.matches_ptr).row
+        });
+        assert_eq!(
+            unsafe { termy_search_batch_free(&mut batch) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(
+            unsafe { termy_search_batch_free(&mut direct) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(unsafe { termy_searcher_free(searcher) }, TermyFfiStatus::Ok);
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_pid_is_the_ptys_program_and_none_for_display_terminals() {
+        let display = scrolling_display_terminal(10, 3);
+        let mut pid = -1;
+        assert_eq!(
+            unsafe { termy_terminal_child_pid(display, &mut pid) },
+            TermyFfiStatus::NotFound
+        );
+        assert_eq!(pid, 0);
+        assert_eq!(
+            unsafe { termy_terminal_child_pid(display, ptr::null_mut()) },
+            TermyFfiStatus::Null
+        );
+        assert_eq!(unsafe { termy_terminal_free(display) }, TermyFfiStatus::Ok);
+
+        let size = TermyFfiSize {
+            cols: 24,
+            rows: 6,
+            cell_width: 9.0,
+            cell_height: 18.0,
+        };
+        let command: &[u8] = b"sleep 30";
+        let mut terminal = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_terminal_new(size, command.as_ptr(), command.len(), &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(
+            unsafe { termy_terminal_child_pid(terminal, &mut pid) },
+            TermyFfiStatus::Ok
+        );
+        assert!(pid > 0);
+        // It is this process's child.
+        let parent = std::process::Command::new("ps")
+            .args(["-o", "ppid=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps runs");
+        assert_eq!(
+            String::from_utf8_lossy(&parent.stdout).trim(),
+            std::process::id().to_string()
+        );
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_motion_writes_leave_room_for_keys_when_the_program_stops_reading() {
+        let size = TermyFfiSize {
+            cols: 24,
+            rows: 6,
+            cell_width: 9.0,
+            cell_height: 18.0,
+        };
+        // `sleep` never reads its terminal, so input piles up in the backlog.
+        let command: &[u8] = b"sleep 30";
+        let mut terminal = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_terminal_new(size, command.as_ptr(), command.len(), &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(
+            unsafe { termy_terminal_write_mouse_motion(ptr::null_mut(), ptr::null(), 0) },
+            TermyFfiStatus::Null
+        );
+        assert_eq!(
+            unsafe { termy_terminal_write_mouse_motion(terminal, ptr::null(), 0) },
+            TermyFfiStatus::Ok
+        );
+        // More motion reports than the whole backlog holds entries.
+        let motion = b"\x1b[<35;10;5M";
+        for _ in 0..6_000 {
+            assert_eq!(
+                unsafe {
+                    termy_terminal_write_mouse_motion(terminal, motion.as_ptr(), motion.len())
+                },
+                TermyFfiStatus::Ok
+            );
+        }
+        let key = b"q";
+        for _ in 0..100 {
+            assert_eq!(
+                unsafe { termy_terminal_write(terminal, key.as_ptr(), key.len()) },
+                TermyFfiStatus::Ok
+            );
+        }
+        let mut batch = TermyFfiEventBatch::default();
+        assert_eq!(
+            unsafe { termy_terminal_drain_events(terminal, &mut batch) },
+            TermyFfiStatus::Ok
+        );
+        let events = unsafe { slice::from_raw_parts(batch.events_ptr, batch.events_len) };
+        assert!(
+            events.iter().all(|event| event.kind != 14),
+            "keys after a motion flood were dropped"
+        );
+        assert_eq!(
+            unsafe { termy_event_batch_free(&mut batch) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    /// Wraps the raw handle so it can cross a thread boundary. The FFI contract
+    /// permits `termy_terminal_wait_for_wakeup` on a dedicated thread
+    /// concurrently with serialized terminal calls elsewhere.
+    struct SendTerminal(*mut TermyFfiTerminal);
+    // SAFETY: the wait thread only calls `wait_for_wakeup`, which touches the
+    // internal wake channel and never the terminal state mutated by the main
+    // thread. The handle is freed only after this thread is joined.
+    unsafe impl Send for SendTerminal {}
+
+    #[test]
+    fn wakeup_thread_runs_concurrently_with_terminal_calls_then_tears_down() {
+        let size = TermyFfiSize {
+            cols: 24,
+            rows: 6,
+            cell_width: 9.0,
+            cell_height: 18.0,
+        };
+        #[cfg(target_os = "windows")]
+        let command: &[u8] = b"";
+        #[cfg(not(target_os = "windows"))]
+        let command: &[u8] = b"sleep 1";
+        let mut terminal = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_terminal_new(size, command.as_ptr(), command.len(), &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+
+        // A dedicated thread parks on the wake channel — the contract's wakeup
+        // thread — until told to stop.
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let waiter_shutdown = std::sync::Arc::clone(&shutdown);
+        let handle = SendTerminal(terminal);
+        let waiter = std::thread::spawn(move || {
+            // Rebind the whole wrapper so the closure captures `SendTerminal`
+            // (which is `Send`) rather than disjointly capturing the raw pointer
+            // field, which is not.
+            let handle = handle;
+            let mut woke = false;
+            while !waiter_shutdown.load(Ordering::Acquire) {
+                assert_eq!(
+                    unsafe { termy_terminal_wait_for_wakeup(handle.0, 25, &mut woke) },
+                    TermyFfiStatus::Ok
+                );
+            }
+        });
+
+        // Meanwhile drive the terminal from this thread only (serialized access
+        // to terminal state), concurrent with the parked wait thread above.
+        let input = b"echo hi\n";
+        for _ in 0..100 {
+            assert_eq!(
+                unsafe { termy_terminal_write(terminal, input.as_ptr(), input.len()) },
+                TermyFfiStatus::Ok
+            );
+            assert_eq!(
+                unsafe { termy_terminal_resize(terminal, size) },
+                TermyFfiStatus::Ok
+            );
+        }
+
+        // Teardown ordering from the contract: signal, wake the waiter, join it,
+        // then free — so nothing is inside `wait_for_wakeup` when the handle dies.
+        shutdown.store(true, Ordering::Release);
+        assert_eq!(
+            unsafe { termy_terminal_notify_wakeup(terminal) },
+            TermyFfiStatus::Ok
+        );
+        waiter.join().expect("wakeup thread joins cleanly");
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn terminal_feed_output_panic_returns_status() {
+        let size = TermyFfiSize {
+            cols: 8,
+            rows: 2,
+            cell_width: 9.0,
+            cell_height: 18.0,
+        };
+        let mut terminal = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_display_terminal_new(size, &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+
+        PANIC_NEXT_FEED_OUTPUT.store(true, Ordering::SeqCst);
+        let bytes = b"x";
+        assert_eq!(
+            unsafe { termy_terminal_feed_output(terminal, bytes.as_ptr(), bytes.len()) },
+            TermyFfiStatus::Panicked
+        );
+        assert!(!terminal.is_null());
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn terminal_resize_panic_returns_status() {
+        let size = TermyFfiSize {
+            cols: 8,
+            rows: 2,
+            cell_width: 9.0,
+            cell_height: 18.0,
+        };
+        let mut terminal = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_display_terminal_new(size, &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+
+        PANIC_NEXT_RESIZE.store(true, Ordering::SeqCst);
+        assert_eq!(
+            unsafe { termy_terminal_resize(terminal, size) },
+            TermyFfiStatus::Panicked
+        );
+        assert!(!terminal.is_null());
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn terminal_search_with_options_supports_case_sensitive_matching() {
+        let size = TermyFfiSize {
+            cols: 16,
+            rows: 4,
+            cell_width: 9.0,
+            cell_height: 18.0,
+        };
+        let mut terminal = ptr::null_mut();
+
+        assert_eq!(
+            unsafe { termy_display_terminal_new(size, &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+        let output = b"alpha beta Beta";
+        assert_eq!(
+            unsafe { termy_terminal_feed_output(terminal, output.as_ptr(), output.len()) },
+            TermyFfiStatus::Ok
+        );
+
+        let query = b"beta";
+        let mut batch = TermyFfiSearchBatch::default();
+        assert_eq!(
+            unsafe {
+                termy_terminal_search_with_options(
+                    terminal,
+                    query.as_ptr(),
+                    query.len(),
+                    TermyFfiSearchOptions {
+                        case_sensitive: true,
+                        regex: false,
+                    },
+                    &mut batch,
+                )
+            },
+            TermyFfiStatus::Ok
+        );
+
+        let matches = unsafe { slice::from_raw_parts(batch.matches_ptr, batch.matches_len) };
+        assert_eq!(
+            matches.len(),
+            1,
+            "case-sensitive search must exclude uppercase Beta"
+        );
+        assert_eq!(matches[0].start_col, 6);
+
+        assert_eq!(
+            unsafe { termy_search_batch_free(&mut batch) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn terminal_take_frame_update_supports_full_path() {
+        let size = TermyFfiSize {
+            cols: 8,
+            rows: 2,
+            cell_width: 9.0,
+            cell_height: 18.0,
+        };
+        let mut terminal = ptr::null_mut();
+
+        assert_eq!(
+            unsafe { termy_display_terminal_new(size, &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+        // Frame extraction is independent of PTY startup and shell timing.
+        let output = b"abc";
+        assert_eq!(
+            unsafe { termy_terminal_feed_output(terminal, output.as_ptr(), output.len()) },
+            TermyFfiStatus::Ok
+        );
+
+        let mut update = TermyFfiFrameUpdate::default();
+        assert_eq!(
+            unsafe { termy_terminal_take_frame_update(terminal, true, &mut update) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(update.damage_kind, 1);
+        assert_eq!(
+            update.cells_len,
+            usize::from(size.cols) * usize::from(size.rows)
+        );
+        let cells = unsafe { slice::from_raw_parts(update.cells_ptr, update.cells_len) };
+        assert!(cells.iter().any(|cell| cell.codepoint == u32::from(b'a')));
+        assert_eq!(
+            unsafe { termy_frame_update_free(&mut update) },
+            TermyFfiStatus::Ok
+        );
+
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn terminal_hyperlink_at_reports_osc8_links() {
+        let size = TermyFfiSize {
+            cols: 24,
+            rows: 2,
+            cell_width: 9.0,
+            cell_height: 18.0,
+        };
+        // printf expands \033 to ESC; emits "docs" wrapped in an OSC 8 link.
+        let command: &[u8] =
+            b"printf '\\033]8;;https://example.com\\033\\\\docs\\033]8;;\\033\\\\'";
+        let mut terminal = ptr::null_mut();
+
+        assert_eq!(
+            unsafe { termy_terminal_new(size, command.as_ptr(), command.len(), &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let mut found = false;
+        let mut link = TermyFfiHyperlink::default();
+        assert_eq!(
+            unsafe { termy_terminal_hyperlink_at(terminal, 0, 1, &mut found, &mut link) },
+            TermyFfiStatus::Ok
+        );
+        assert!(found);
+        assert_eq!(link.start_col, 0);
+        assert_eq!(link.end_col, 3);
+        let uri = unsafe { slice::from_raw_parts(link.uri.ptr, link.uri.len) };
+        assert_eq!(uri, b"https://example.com");
+        assert_eq!(
+            unsafe { termy_hyperlink_free(&mut link) },
+            TermyFfiStatus::Ok
+        );
+
+        assert_eq!(
+            unsafe { termy_terminal_hyperlink_at(terminal, 0, 10, &mut found, &mut link) },
+            TermyFfiStatus::Ok
+        );
+        assert!(!found);
+        assert!(link.uri.ptr.is_null());
+
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn terminal_link_at_detects_plain_urls_and_paths() {
+        let size = TermyFfiSize {
+            cols: 40,
+            rows: 2,
+            cell_width: 9.0,
+            cell_height: 18.0,
+        };
+        // Row 0: a plain URL; row 1: an absolute path that exists.
+        let command: &[u8] = b"printf 'see https://example.com/a ok\\r\\n/tmp x'";
+        let mut terminal = ptr::null_mut();
+
+        assert_eq!(
+            unsafe { termy_terminal_new(size, command.as_ptr(), command.len(), &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let mut found = false;
+        let mut link = TermyFfiLink::default();
+        assert_eq!(
+            unsafe { termy_terminal_link_at(terminal, 0, 8, &mut found, &mut link) },
+            TermyFfiStatus::Ok
+        );
+        assert!(found);
+        assert_eq!((link.start_row, link.start_col), (0, 4));
+        assert_eq!((link.end_row, link.end_col), (0, 24));
+        let uri = unsafe { slice::from_raw_parts(link.uri.ptr, link.uri.len) };
+        assert_eq!(uri, b"https://example.com/a");
+        assert_eq!(unsafe { termy_link_free(&mut link) }, TermyFfiStatus::Ok);
+        assert!(link.uri.ptr.is_null());
+
+        assert_eq!(
+            unsafe { termy_terminal_link_at(terminal, 1, 2, &mut found, &mut link) },
+            TermyFfiStatus::Ok
+        );
+        assert!(found);
+        let uri = unsafe { slice::from_raw_parts(link.uri.ptr, link.uri.len) };
+        assert!(
+            uri.starts_with(b"file:///") && uri.ends_with(b"/tmp"),
+            "{}",
+            String::from_utf8_lossy(uri)
+        );
+        assert_eq!(unsafe { termy_link_free(&mut link) }, TermyFfiStatus::Ok);
+
+        assert_eq!(
+            unsafe { termy_terminal_link_at(terminal, 0, 1, &mut found, &mut link) },
+            TermyFfiStatus::Ok
+        );
+        assert!(!found);
+
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn terminal_encode_key_uses_core_keyboard_mapping() {
+        let size = TermyFfiSize {
+            cols: 16,
+            rows: 4,
+            cell_width: 9.0,
+            cell_height: 18.0,
+        };
+        let mut terminal = ptr::null_mut();
+
+        assert_eq!(
+            unsafe { termy_terminal_new(size, ptr::null(), 0, &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+
+        let key = b"tab";
+        let keystroke = TermyFfiKeystroke {
+            shift: true,
+            key_ptr: key.as_ptr(),
+            key_len: key.len(),
+            event_kind: 1,
+            ..TermyFfiKeystroke::default()
+        };
+        let mut bytes = TermyFfiBytes::default();
+        assert_eq!(
+            unsafe { termy_terminal_encode_key(terminal, &keystroke, &mut bytes) },
+            TermyFfiStatus::Ok
+        );
+        let encoded = unsafe { slice::from_raw_parts(bytes.ptr, bytes.len) };
+        assert_eq!(encoded, b"\x1b[Z");
+
+        assert_eq!(unsafe { termy_buffer_free(bytes) }, TermyFfiStatus::Ok);
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn terminal_encode_key_with_options_applies_macos_option_as_alt() {
+        let size = TermyFfiSize {
+            cols: 16,
+            rows: 4,
+            cell_width: 9.0,
+            cell_height: 18.0,
+        };
+        let mut terminal = ptr::null_mut();
+
+        assert_eq!(
+            unsafe { termy_terminal_new(size, ptr::null(), 0, &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+
+        let key = b"space";
+        let key_char = "\u{a0}".as_bytes();
+        let keystroke = TermyFfiKeystroke {
+            alt: true,
+            key_ptr: key.as_ptr(),
+            key_len: key.len(),
+            key_char_ptr: key_char.as_ptr(),
+            key_char_len: key_char.len(),
+            event_kind: 1,
+            ..TermyFfiKeystroke::default()
+        };
+        let mut bytes = TermyFfiBytes::default();
+        assert_eq!(
+            unsafe {
+                termy_terminal_encode_key_with_options(terminal, &keystroke, true, &mut bytes)
+            },
+            TermyFfiStatus::Ok
+        );
+        let encoded = unsafe { slice::from_raw_parts(bytes.ptr, bytes.len) };
+        assert_eq!(encoded, b"\x1b ");
+
+        assert_eq!(unsafe { termy_buffer_free(bytes) }, TermyFfiStatus::Ok);
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn terminal_encode_mouse_uses_live_mouse_mode() {
+        let size = TermyFfiSize {
+            cols: 16,
+            rows: 4,
+            cell_width: 9.0,
+            cell_height: 18.0,
+        };
+        let mut terminal = ptr::null_mut();
+
+        assert_eq!(
+            unsafe { termy_terminal_new(size, ptr::null(), 0, &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+
+        let input = TermyFfiMouseInput {
+            kind: 1,
+            button: 1,
+            col: 4,
+            row: 2,
+            ..TermyFfiMouseInput::default()
+        };
+        let mut bytes = TermyFfiBytes::default();
+        assert_eq!(
+            unsafe { termy_terminal_encode_mouse(terminal, &input, &mut bytes) },
+            TermyFfiStatus::Ok
+        );
+        assert!(bytes.ptr.is_null());
+
+        unsafe {
+            (*terminal)
+                .terminal
+                .hydrate_output(b"\x1b[?1000h\x1b[?1006h");
+        }
+        assert_eq!(
+            unsafe { termy_terminal_encode_mouse(terminal, &input, &mut bytes) },
+            TermyFfiStatus::Ok
+        );
+        let encoded = unsafe { slice::from_raw_parts(bytes.ptr, bytes.len) };
+        assert_eq!(encoded, b"\x1b[<0;5;3M");
+
+        assert_eq!(unsafe { termy_buffer_free(bytes) }, TermyFfiStatus::Ok);
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn display_terminal_wakes_when_a_synchronized_update_times_out() {
+        let mut terminal = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_display_terminal_new(termy_size_default(), &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+        let output = b"\x1b[?2026hframe";
+        assert_eq!(
+            unsafe { termy_terminal_feed_output(terminal, output.as_ptr(), output.len()) },
+            TermyFfiStatus::Ok
+        );
+        let mut woke = false;
+        // Drop any signal from the feed itself.
+        assert_eq!(
+            unsafe { termy_terminal_wait_for_wakeup(terminal, 0, &mut woke) },
+            TermyFfiStatus::Ok
+        );
+        // The timed-out update is committed without further output, so only
+        // the wake channel can tell the host to render it.
+        assert_eq!(
+            unsafe { termy_terminal_wait_for_wakeup(terminal, 5_000, &mut woke) },
+            TermyFfiStatus::Ok
+        );
+        assert!(woke);
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn terminal_encode_paste_cannot_escape_the_bracket() {
+        let mut terminal = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_display_terminal_new(termy_size_default(), &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+        let paste = |text: &[u8]| {
+            let mut bytes = TermyFfiBytes::default();
+            assert_eq!(
+                unsafe {
+                    termy_terminal_encode_paste(terminal, text.as_ptr(), text.len(), &mut bytes)
+                },
+                TermyFfiStatus::Ok
+            );
+            let encoded = if bytes.ptr.is_null() {
+                Vec::new()
+            } else {
+                unsafe { slice::from_raw_parts(bytes.ptr, bytes.len) }.to_vec()
+            };
+            unsafe { termy_buffer_free(bytes) };
+            encoded
+        };
+
+        assert_eq!(paste(b"a\r\nb\x1b[201~\x03\tc"), b"a\rb[201~\tc");
+        unsafe { (*terminal).terminal.hydrate_output(b"\x1b[?2004h") };
+        // A single-pass marker strip would collapse this into a real end marker.
+        assert_eq!(
+            paste(b"x\x1b[20\x1b[201~1~rm -rf ~\n"),
+            b"\x1b[200~x[20[201~1~rm -rf ~\r\x1b[201~"
+        );
+        assert_eq!(paste("\u{9b}201~".as_bytes()), b"\x1b[200~201~\x1b[201~");
+        let mut bytes = TermyFfiBytes::default();
+        assert_eq!(
+            unsafe { termy_terminal_encode_paste(terminal, ptr::null(), 0, &mut bytes) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(unsafe { termy_buffer_free(bytes) }, TermyFfiStatus::Ok);
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn program_status_ffi_event_has_json_snapshot_and_empty_clear() {
+    let mut engine = crate::terminal_engine::Engine::new(Default::default(), Default::default());
+    engine.feed(b"\x1b]7501;state=blocked:kind=auth:app=deploy:msg=SGk=\x07");
+    let event = ffi_event_from_event(TerminalEvent::ProgramStatus(engine.program_status()));
+    assert_eq!(event.kind, 13);
+    // SAFETY: the event owns this live allocation until free_bytes below.
+    let bytes = unsafe { std::slice::from_raw_parts(event.payload.ptr, event.payload.len) };
+    let json: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(json[0]["state"], "blocked");
+    assert_eq!(json[0]["kind"], "auth");
+    assert_eq!(json[0]["msg"], "Hi");
+    assert!(json[0]["progress"].is_null());
+    free_bytes(event.payload);
+    let event = ffi_event_from_event(TerminalEvent::ProgramStatus(vec![]));
+    // SAFETY: the clear event owns this live allocation until free_bytes below.
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(event.payload.ptr, event.payload.len) },
+        b"[]"
+    );
+    free_bytes(event.payload);
+}
+
+#[cfg(test)]
+#[test]
+fn settings_at_path_edits_only_that_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("own").join("config.txt");
+    let path_str = path.to_str().unwrap();
+    let set = |key: &str, value: &str| unsafe {
+        termy_settings_set_root_at(
+            path_str.as_ptr(),
+            path_str.len(),
+            key.as_ptr(),
+            key.len(),
+            value.as_ptr(),
+            value.len(),
+        )
+    };
+    assert_eq!(set("font_size", "17"), TermyFfiStatus::Ok);
+    assert_eq!(set("theme", "dracula"), TermyFfiStatus::Ok);
+    let contents = std::fs::read_to_string(&path).expect("written");
+    assert!(contents.contains("font_size = 17"), "{contents}");
+    assert!(contents.contains("theme = dracula"), "{contents}");
+
+    let key = "font_size";
+    let status = unsafe {
+        termy_settings_reset_root_at(path_str.as_ptr(), path_str.len(), key.as_ptr(), key.len())
+    };
+    assert_eq!(status, TermyFfiStatus::Ok);
+    let contents = std::fs::read_to_string(&path).expect("written");
+    assert!(!contents.contains("font_size = 17"), "{contents}");
+    assert!(contents.contains("theme = dracula"), "{contents}");
+
+    assert_eq!(set("no_such_key", "1"), TermyFfiStatus::UnknownKey);
+    let empty = "";
+    let status = unsafe {
+        termy_settings_set_root_at(empty.as_ptr(), 0, key.as_ptr(), key.len(), b"1".as_ptr(), 1)
+    };
+    assert_ne!(status, TermyFfiStatus::Ok);
+}

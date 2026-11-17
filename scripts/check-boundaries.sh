@@ -57,9 +57,9 @@ forbid_pattern() {
   local path="$2"
   local message="$3"
 
-  if rg -n "$pattern" "$path" >/dev/null; then
+  if rg -n -- "$pattern" "$path" >/dev/null; then
     echo "Boundary check failed: $message" >&2
-    rg -n "$pattern" "$path" >&2
+    rg -n -- "$pattern" "$path" >&2
     exit 1
   fi
 }
@@ -69,7 +69,7 @@ require_pattern() {
   local path="$2"
   local message="$3"
 
-  if ! rg -n "$pattern" "$path" >/dev/null; then
+  if ! rg -n -- "$pattern" "$path" >/dev/null; then
     echo "Boundary check failed: $message" >&2
     exit 1
   fi
@@ -82,7 +82,7 @@ require_issue_url_for_pattern() {
   local matches
   local violations
 
-  matches="$(rg -n "$pattern" "$path" || true)"
+  matches="$(rg -n -- "$pattern" "$path" || true)"
   if [[ -z "$matches" ]]; then
     return
   fi
@@ -96,7 +96,10 @@ require_issue_url_for_pattern() {
 }
 
 require_ignored_test_budget() {
-  local max_ignored_tests=10
+  # #388 adds a desktop tmux cwd regression, run by test-tmux-integration in CI.
+  # #452 adds a desktop tmux snapshot decoding regression, run there too.
+  # A desktop tmux regression for queries answered twice runs there too.
+  local max_ignored_tests=13
   local ignored_count
 
   ignored_count="$(rg -n '#\[ignore' crates | wc -l | tr -d ' ')"
@@ -162,25 +165,55 @@ if unexpected_dependencies:
 
 require_path "crates/desktop_app/Cargo.toml"
 require_path "scripts/build-dmg.sh"
+require_path "scripts/build-dmg-signed.sh"
+require_path "scripts/setup-macos-signing.sh"
 require_path "scripts/build-setup.ps1"
 require_path "scripts/build-linux.sh"
 require_path "scripts/check-platform-builds.sh"
-require_path "crates/README.md"
 require_path "scripts/README.md"
 require_path "docs/architecture/project-layout.md"
 require_path "docs/architecture/release-packaging.md"
+require_path ".github/workflows/finalize-stable-release.yml"
 
 while IFS= read -r manifest; do
   crate_dir="$(dirname "$manifest")"
   require_crate_readme_metadata "$crate_dir"
 done < <(find crates -mindepth 2 -maxdepth 2 -name Cargo.toml | sort)
 
-require_pattern './scripts/build-dmg\.sh' \
+# The @termysh/pty addon ships only termy_core's PTY layer.
+for forbidden_dep in gpui keyring ureq fontdb termy; do
+  check_forbidden_all_target_dep termy_pty "$forbidden_dep"
+done
+
+# libtermy_engine is the engine alone: no PTY transport, config, keyring,
+# fonts, network, plugins or multiplexer.
+for forbidden_dep in gpui keyring ureq fontdb flume polling dirs uuid termy; do
+  check_forbidden_all_target_dep termy_engine_ffi "$forbidden_dep"
+done
+
+# The relay only routes sealed bytes: no terminal, no UI.
+for forbidden_dep in "gpui(-kit|-pre)?" termy_core termy_pty; do
+  check_forbidden_all_target_dep termy_relay "$forbidden_dep"
+done
+
+require_pattern './scripts/build-dmg-signed\.sh' \
   ".github/workflows/release.yml" \
-  "release workflow must call scripts/build-dmg.sh"
-require_pattern 'dist/Termy-\$\{\{ env.VERSION \}\}-macos-\$\{\{ matrix.arch \}\}\.dmg' \
+  "release workflow must call scripts/build-dmg-signed.sh"
+require_pattern 'dist/Termy-\$\{\{ env.VERSION \}\}-macos-\$\{\{ matrix.arch \}\}-signed\.dmg' \
   ".github/workflows/release.yml" \
-  "release workflow must upload the documented macOS DMG path"
+  "release workflow must upload the documented signed macOS DMG path"
+require_pattern 'types: \[released\]' \
+  ".github/workflows/finalize-stable-release.yml" \
+  "stable release finalization must run for initial stable releases and prerelease promotions"
+require_pattern 'Termy-\$\{tag\}-linux-x86_64\.tar\.gz' \
+  ".github/workflows/finalize-stable-release.yml" \
+  "stable release finalization must wait for the AUR source asset"
+require_pattern 'createWorkflowDispatch' \
+  ".github/workflows/finalize-stable-release.yml" \
+  "stable release finalization must trigger the AUR workflow"
+forbid_pattern 'name: Trigger AUR publish' \
+  ".github/workflows/release.yml" \
+  "artifact publishing must not race stable release finalization"
 forbid_pattern '^wry = ' \
   "crates/desktop_app/Cargo.toml" \
   "desktop app must not reintroduce the removed embedded browser runtime"
@@ -205,6 +238,47 @@ require_pattern 'pkg-config' \
 require_pattern 'pkg-config' \
   ".github/workflows/release.yml" \
   "release workflow must install pkg-config for Linux desktop builds"
+require_path "scripts/file-manager/termy-open-tab.desktop"
+require_path "scripts/file-manager/termy-open-tab.nemo_action"
+require_path "scripts/file-manager/nautilus-open-tab.sh"
+require_path "scripts/file-manager/macos/Info.plist"
+require_path "scripts/file-manager/macos/document.wflow"
+require_pattern 'TermyOpenTab' \
+  "scripts/installer/termy.iss" \
+  "Windows installer must register the Explorer Open new Termy tab here verb"
+require_pattern 'Open new Termy tab here' \
+  "scripts/installer/termy.iss" \
+  "Windows installer Explorer verb must use the Open new Termy tab here label"
+require_pattern '--working-directory ""%V\\\.""' \
+  "scripts/installer/termy.iss" \
+  "Windows installer Explorer verb must pass the selected folder as --working-directory"
+require_pattern 'MimeType=inode/directory;x-scheme-handler/termy;' \
+  "scripts/aur/termy.desktop" \
+  "Linux desktop file must advertise directory and termy:// handlers"
+require_pattern 'Actions=open-tab-here' \
+  "scripts/aur/termy.desktop" \
+  "Linux desktop file must expose the Open new Termy tab here action"
+require_pattern 'Name=Open new Termy tab here' \
+  "scripts/aur/termy.desktop" \
+  "Linux desktop action must use the Open new Termy tab here label"
+require_pattern 'install_linux_file_manager_share' \
+  "scripts/build-linux.sh" \
+  "Linux packages must install file-manager Open new Termy tab here entries"
+require_pattern 'scripts/aur/\$\{APP_NAME_LOWER\}\.desktop' \
+  "scripts/build-linux.sh" \
+  "Linux AppImage packaging must use the shared desktop file"
+require_pattern 'ensure_folder_document_type' \
+  "scripts/build-dmg.sh" \
+  "macOS DMG packaging must register folders for Open With"
+require_pattern 'NSLocalNetworkUsageDescription' \
+  "scripts/build-dmg.sh" \
+  "macOS DMG packaging must declare local network usage permission"
+require_pattern 'public.folder' \
+  "scripts/build-dmg.sh" \
+  "macOS DMG packaging must declare public.folder document support"
+require_pattern 'Open new Termy tab here' \
+  "scripts/build-dmg.sh" \
+  "macOS DMG packaging must install the Finder Open new Termy tab here service"
 require_pattern './scripts/check-platform-builds\.sh --native' \
   ".github/workflows/architecture-checks.yml" \
   "architecture checks must run the shared native platform verifier"
@@ -220,6 +294,12 @@ require_pattern 'cargo xwin check --cross-compiler clang' \
 require_pattern 'cp "\$BINARY_PATH" "\$STAGING_DIR/\$APP_NAME_LOWER/termy-bin"' \
   "scripts/build-linux.sh" \
   "Linux tarballs must ship the real GUI binary as termy-bin behind the launcher"
+require_pattern 'TERMY_LINUX_BACKEND:-x11' \
+  "scripts/build-linux.sh" \
+  "Linux release launchers must prefer X11/XWayland for native window decorations"
+require_pattern 'TERMY_LINUX_BACKEND:-x11' \
+  "scripts/install-linux.sh" \
+  "Linux installer launchers must preserve the release backend policy"
 require_pattern 'rm -f "\$INSTALL_DIR/termy" "\$INSTALL_DIR/termy-bin" "\$INSTALL_DIR/termy-cli"' \
   "scripts/build-linux.sh" \
   "Linux tarball installer must unlink existing install targets before writing replacements"
@@ -238,37 +318,35 @@ require_pattern 'grep -Eo.*\|\| true' \
 require_pattern 'grep -Ev.*x86_64.*aarch64' \
   "scripts/install-linux.sh" \
   "Linux install helper generic fallback must not install an asset for the wrong architecture"
-check_forbidden_dep "termy_command_core" "gpui"
-check_forbidden_dep "termy_command_core" "termy_config_core"
-check_forbidden_dep "termy_config_core" "termy_themes"
-check_forbidden_dep "termy_cli_install_core" "gpui"
-check_forbidden_dep "termy_cli" "gpui"
-check_forbidden_dep "termy_core" "gpui"
-check_forbidden_all_target_dep "tmon" "termy_core"
-check_forbidden_all_target_dep "tmon" "termy"
-check_forbidden_all_target_dep "tmon" "termy_terminal_ui"
-check_forbidden_all_target_dep "tmon" "termy_ui"
-check_forbidden_all_target_dep "tmon" "gpui"
-check_forbidden_all_target_dep "tmon" "gpui_platform"
-check_forbidden_all_target_dep "tmon" "termy_ffi"
-check_forbidden_dep "termy_ffi" "gpui"
-check_forbidden_dep "termy_ffi" "termy_terminal_ui"
-check_forbidden_dep "termy_plugin_runtime" "gpui"
-check_forbidden_dep "termy_plugin_runtime" "termy_command_core"
-check_forbidden_dep "termy_plugin_runtime" "termy_config_core"
-check_forbidden_dep "termy_plugin_runtime" "termy_terminal_ui"
-check_forbidden_dep "termy_ssh_core" "gpui"
-check_forbidden_dep "termy_ssh_core" "termy_terminal_ui"
-check_forbidden_all_target_dep "termy_herdr_core" "gpui"
+require_pattern 'file-manager' \
+  "scripts/install-linux.sh" \
+  "Linux install helper must install file-manager Open new Termy tab here entries"
+# Only core, desktop, CLI and Herdr core are Cargo packages; helpers are ordinary modules.
+# Check the entire workspace, including optional, platform and test dependencies.
+# Capture first: with pipefail, an early rg -q match can SIGPIPE cargo and hide
+# a forbidden dependency by making the pipeline fail.
+workspace_dependencies="$(cargo tree --locked --workspace --all-features --target all --edges normal,build,dev --prefix none)"
+if rg -q '^alacritty(_[[:alnum:]_]+)? v' <<< "$workspace_dependencies"; then
+  echo "Boundary check failed: the workspace must not depend on Alacritty" >&2
+  exit 1
+fi
+check_forbidden_all_target_dep "termy_core" "gpui(-kit|-pre)?"
+check_forbidden_all_target_dep "termy_core" "termy"
+check_forbidden_all_target_dep "termy_cli" "gpui(-kit|-pre)?"
+check_forbidden_all_target_dep "termy_cli" "termy"
+check_forbidden_all_target_dep "termy_herdr_core" "gpui(-kit|-pre)?"
 check_forbidden_all_target_dep "termy_herdr_core" "termy"
-check_forbidden_all_target_dep "termy_herdr_core" "termy_config_core"
-check_forbidden_all_target_dep "termy_herdr_core" "termy_terminal_ui"
+check_forbidden_all_target_dep "termy_herdr_core" "termy_core"
 require_herdr_core_direct_dependency_allowlist
-check_forbidden_dep "termy_ui" "termy_terminal_ui"
-check_forbidden_dep "termy_ui" "termy_config_core"
-check_forbidden_dep "termy_ui" "termy_command_core"
-check_forbidden_dep "termy_ui" "termy_plugin_runtime"
-check_forbidden_dep "termy_ui" "termy_ssh_core"
+forbid_pattern 'termy_core::|crate::(multiplexer|ffi|runtime|config_core|plugin_runtime)|alacritty_terminal' \
+  "crates/core/src/terminal_engine" \
+  "the custom terminal engine must remain independent of host modules and external engines"
+forbid_pattern 'crate::(config_core|runtime|multiplexer)|gpui(_kit)?::' \
+  "crates/core/src/command_core" \
+  "the command catalog must remain independent of configuration and runtime"
+forbid_pattern 'termy_core::|crate::(terminal_view|settings_view|terminal_ui)' \
+  "crates/desktop_app/src/design_system" \
+  "the design system must remain presentation-only"
 
 require_issue_url_for_pattern \
   'clippy::cognitive_complexity' \
@@ -276,9 +354,9 @@ require_issue_url_for_pattern \
   "clippy::cognitive_complexity allows must link a tracking issue on the same line"
 require_ignored_test_budget
 
-cargo run -p xtask -- generate-keybindings-doc --check
-cargo run -p xtask -- generate-config-doc --check
-cargo run -p xtask -- check-dependency-policy
+cargo run -p termy_cli --bin xtask -- generate-keybindings-doc --check
+cargo run -p termy_cli --bin xtask -- generate-config-doc --check
+cargo run -p termy_cli --bin xtask -- check-dependency-policy
 
 "$(dirname "${BASH_SOURCE[0]}")/check-file-sizes.sh"
 

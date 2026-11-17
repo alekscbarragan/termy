@@ -4,7 +4,10 @@ Reusable headless libtermy runtime and API.
 
 ## Owner
 
-This crate owns terminal lifecycle, frame snapshots, keyboard/mouse protocol helpers, search over frames, config-to-runtime conversion, shell integration state, and embedder-facing render metrics. It must remain independent of GPUI and desktop app chrome.
+This package also owns the multiplexer, shared domain helpers, plugin runtime, SSH,
+terminal engine, and C ABI as modules. See [Project Layout](../../docs/architecture/project-layout.md).
+
+This crate owns terminal lifecycle, frame snapshots, keyboard/mouse protocol helpers, search over frames, config-to-runtime conversion, shell integration state, renderer-neutral special-glyph geometry, and embedder-facing render metrics. It must remain independent of GPUI and desktop app chrome.
 
 Use this crate when behavior should be available to FFI, WASM, JS, or non-GPUI host examples.
 
@@ -12,21 +15,16 @@ Use this crate when behavior should be available to FFI, WASM, JS, or non-GPUI h
 
 ```sh
 cargo test -p termy_core
-TERMY_CORE_TEST_BACKEND=alacritty cargo test -p termy_core
-TERMY_CORE_TEST_BACKEND=tmon cargo test -p termy_core
+cargo run --release -p termy_core --example terminal_engine_bench -- 32
 ```
 
-Display-only terminals use Tmon. Native terminals retain Alacritty unless the
-desktop rollout's exact `TERMY_EXPERIMENTAL_TMON_ENGINE=1` opt-in is present.
-The two explicit commands force the semantic suite through one private backend
-at a time. `TERMY_CORE_TEST_BACKEND` is test-only plumbing, not a supported
-embedder or desktop configuration surface.
+Native, display-only, tmux, and persistent sessions use the custom engine in
+`src/terminal_engine`. There is one runtime engine and no environment selector.
 
 ## Forbidden Dependencies
 
 - `gpui`
-- `termy_terminal_ui`
-- `termy_ffi`
+- `termy::terminal_ui`
 - `termy` / `crates/desktop_app`
 
 ## Rust render contracts
@@ -37,13 +35,24 @@ underline variants and colors, live palette revisions, ordered viewport scroll
 damage, or generation-checked range reads should use `Terminal::render_read`,
 `Terminal::take_render_damage_snapshot`, and the `visit_*` methods instead.
 
-The terminal engine is deliberately private. During the Tmon migration the
-facade can dispatch to either retained Alacritty state or Tmon without exposing
-either engine's types. `termy_core` 0.2 removed
-`Terminal::with_term`, `TerminalOptions::term_config`, and the exported raw
-Alacritty conversion helpers. Embedders should use core-owned types such as
-`TerminalColor`, `TerminalRenderCell`, and `TerminalQueryColors`, plus the
-neutral `Terminal` methods, rather than depending on an engine grid or parser.
+The facade keeps engine types out of the embedding contract. Embedders should
+use core-owned `TerminalColor`, `TerminalRenderCell`, and `TerminalQueryColors`
+with the neutral `Terminal` methods. The standalone `terminal_engine::Engine`
+is also available for headless parsing and direct borrowed row access.
+
+The viewport visitor methods preserve reentrant callbacks by capturing a coherent
+read first. Renderers can opt into `visit_viewport_cells_locked` and
+`visit_viewport_ranges_locked_at_generation` to stream borrowed cells without an
+intermediate frame allocation; those callbacks must not reenter the terminal.
+Incremental renderers should prefer `Terminal::with_render_damage`, which takes
+the damage and reads the cells it names under one lock. Taking damage first and
+reading at a generation later fails whenever output lands in between.
+
+`terminal_glyph_plan` owns the terminal-specific rendering semantics for block
+elements, box drawing, sextants, long Braille runs, rounded corners, and
+diagonals. It returns allocation-free, cell-relative rectangle and stroke plans.
+Renderers transform those primitives and perform final backend/device-pixel
+snapping; they should not shape these special cells as ordinary font glyphs.
 
 ## Why libtermy instead of a VT engine directly?
 
@@ -55,14 +64,53 @@ primitives with the harness every embedder ends up writing anyway:
 - **Input encoding** — `keystroke_to_input`, mouse report encoder, and keyboard/mouse mode state (xterm, SGR, kitty, etc.).
 - **Search** — `search_frame` over snapshots without re-implementing grid traversal.
 - **Shell integration** — OSC 133 / 633 / 1337 command lifecycle, progress state, and tab title resolution.
-- **OSC interception** — clipboard, color queries, and a reply-host abstraction so embedders do not parse OSC themselves.
+- **OSC interception** — OSC 52 and Kitty OSC 5522 clipboard operations, color queries, and a reply-host abstraction so embedders do not parse terminal protocols themselves. Rust hosts can expose arbitrary MIME data through `TerminalReplyHost::read_clipboard` and `write_clipboard`, or take a request with `defer_clipboard_request` and answer it later through `Terminal::complete_clipboard_request` (replies keep request order); display-only hosts forward generated bytes from `protocol_reply`.
 - **Link detection** — URL and path classification for click-to-open.
 - **Config bridge** — `AppConfig` → `TerminalRuntimeConfig`, theme color resolution, terminal query colors.
 - **Font + cell metrics** — `measure_cell` backed by fontdb / ttf-parser for embedder layout.
 - **Render metrics** — span timings (grid paint, text shaping, cache hit/miss) for performance debugging.
+- **Special-glyph plans** — shared block, box-drawing, sextant, Braille, rounded-corner, and diagonal geometry without a renderer dependency.
 - **Launch resolution** — working directory normalization, fallbacks, locale, and PATH setup.
 - **PTY plumbing** — `rustix-openpty` on Unix, shell discovery via `winreg` on Windows.
-- **Portable surface** — no GPUI dependency. The same crate powers the desktop app, `termy_ffi` (C ABI), WASM hosts, JS bindings, and headless tests. Wrap the engine once, host many times.
+- **Portable surface** — no GPUI dependency. The same crate powers the desktop app, its `ffi` module (C ABI), WASM hosts, JS bindings, and headless tests. Wrap the engine once, host many times.
 
 In short: the VT engine is an implementation detail; libtermy is the portable
 terminal contract plus the harness embedders actually need.
+
+## Remote terminals
+
+`Terminal::from_remote` accepts a renderer-neutral `RemoteTransport`. The
+`termy_core::multiplexer` crate supplies the desktop transport and keeps the parser,
+PTY, both screens, scrollback, and graphics in a background process. The core
+facade exposes the same input, rendering, query, and clipboard APIs to attached
+views; it has no socket, desktop, or session-discovery dependency.
+
+## Kitty graphics
+
+The protocol pipeline separates command interception, bounded upload assembly,
+pixel decoding, placement/deletion, and animation. The engine exposes
+`GraphicsImage` pixels with shared geometry, frame composition, animation timing,
+and shared-memory transport. Raw uploads avoid PNG encoding; PNG uploads decode
+once. `image.png()` is an explicit lazy export for clipboard and C hosts.
+It returns an owned `Arc<Vec<u8>>`. Raw-image exports share their encoding while
+a consumer holds that handle and release the encoded buffer when the last
+consumer drops it; keep the handle alive for a batch of placements. Original
+PNG uploads retain their encoded source within the graphics memory budget.
+The C API continues to return host-owned copies with the existing free functions.
+
+`KittyGraphicsRenderPlacement` includes signed column offsets, optional Unicode
+placeholder cell coordinates, clipped margin rows, and an animation deadline.
+Use `graphics_display_layout` with the current cell metrics and pixel offsets.
+Its `image_size` preserves aspect ratio, `placement_size` retains the requested
+box, and `image_offset` centers the image within that box. `graphics_display_size`
+returns only the fitted image dimensions; `occupied_cols/rows` describe the full
+cursor occupancy. Clip the scaled source rectangle before clipping to the box,
+so cropped pixels cannot appear in its letterbox area. For a virtual cell, lay
+out the full prototype and clip to that cell. Paint z values below -1073741824
+below non-default backgrounds, other negative values below text, and nonnegative
+values above text.
+
+Run protocol regressions with `cargo test -p termy_core kitty_graphics` and run
+runtime regressions with `cargo test -p termy_core runtime`. The `measure_raw_upload_cost` test reports a
+bounded upload benchmark; it does not measure GPU time or establish acceptance
+in every third-party application.

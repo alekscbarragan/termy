@@ -1,0 +1,332 @@
+//! A minimal, UI-agnostic tmux control-mode (`tmux -CC`) session driver built on
+//! the shared protocol core. Spawns tmux over a PTY, runs the control worker, and
+//! exposes non-blocking notification polling plus request/response commands — the
+//! piece the FFI/native host wraps to bring tmux control mode to the macOS app.
+
+#![cfg(unix)]
+
+use std::fs::File;
+use std::io;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use flume::{Receiver, Sender};
+
+use crate::tmux_control_core::command::next_control_completion_token;
+use crate::tmux_control_core::control::{
+    ControlRequest, FATAL_EXIT_QUEUE_BOUND, NOTIFICATION_QUEUE_BOUND, PENDING_QUEUE_BOUND,
+    REQUEST_QUEUE_BOUND, spawn_control_threads, try_enqueue_control_request,
+};
+use crate::tmux_control_core::types::{TmuxControlError, TmuxNotification};
+
+const COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub struct ControlSession {
+    child: Child,
+    request_tx: Sender<ControlRequest>,
+    notifications_rx: Receiver<TmuxNotification>,
+    fatal_exit_rx: Receiver<Option<String>>,
+}
+
+impl ControlSession {
+    /// Launches `tmux -L <socket> -CC new-session -s <name>` over a PTY (tmux
+    /// control mode requires a tty) and starts the control worker threads.
+    pub fn launch(tmux_binary: &str, socket_name: &str, session_name: &str) -> io::Result<Self> {
+        let pty = rustix_openpty::openpty(None, None)
+            .map_err(|error| io::Error::other(format!("failed to allocate tmux pty: {error}")))?;
+        let controller = File::from(pty.controller);
+        let user = File::from(pty.user);
+
+        let child_stdin = user.try_clone()?;
+        let child_stdout = user.try_clone()?;
+        let child_stderr = user;
+
+        let child = Command::new(tmux_binary)
+            .args(["-L", socket_name, "-CC", "new-session", "-s", session_name])
+            // Don't inherit an outer tmux client; nested `TMUX` redirects startup.
+            .env_remove("TMUX")
+            .env("PROMPT_EOL_MARK", "")
+            .stdin(Stdio::from(child_stdin))
+            .stdout(Stdio::from(child_stdout))
+            .stderr(Stdio::from(child_stderr))
+            .spawn()?;
+
+        // The PTY controller (master) is both the read and write side of the
+        // control channel.
+        let writer = controller.try_clone()?;
+        let reader = controller;
+
+        let (request_tx, request_rx) = flume::bounded::<ControlRequest>(REQUEST_QUEUE_BOUND);
+        let (pending_tx, pending_rx) = flume::bounded(PENDING_QUEUE_BOUND);
+        let (notifications_tx, notifications_rx) =
+            flume::bounded::<TmuxNotification>(NOTIFICATION_QUEUE_BOUND);
+        let (fatal_exit_tx, fatal_exit_rx) =
+            flume::bounded::<Option<String>>(FATAL_EXIT_QUEUE_BOUND);
+
+        // The child is owned here and reaped on drop, so the worker is told not
+        // to wait on it (None).
+        spawn_control_threads(
+            None,
+            writer,
+            reader,
+            request_rx,
+            pending_tx,
+            pending_rx,
+            notifications_tx,
+            fatal_exit_tx,
+            None,
+        );
+
+        Ok(Self {
+            child,
+            request_tx,
+            notifications_rx,
+            fatal_exit_rx,
+        })
+    }
+
+    /// Non-blocking drain of pending control notifications (`%output`,
+    /// `%layout-change`, `%window-*`, …).
+    pub fn poll(&self) -> Vec<TmuxNotification> {
+        let mut notifications = Vec::new();
+        while let Ok(notification) = self.notifications_rx.try_recv() {
+            notifications.push(notification);
+        }
+        notifications
+    }
+
+    /// Runs a tmux command over the control channel and returns its output,
+    /// bounded by a response timeout so a dead server can't hang the caller.
+    pub fn send_command(&self, command: &str) -> Result<String, TmuxControlError> {
+        let (response_tx, response_rx) = flume::bounded(1);
+        let request = ControlRequest {
+            command: command.to_string(),
+            completion_token: next_control_completion_token(),
+            response_tx: Some(response_tx),
+        };
+        try_enqueue_control_request(&self.request_tx, request)?;
+        match response_rx.recv_timeout(COMMAND_RESPONSE_TIMEOUT) {
+            Ok(Ok(result)) => Ok(result.output),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(TmuxControlError::channel(
+                "tmux control command timed out or the channel closed",
+            )),
+        }
+    }
+
+    /// Returns a fatal-exit reason if the control connection has died.
+    pub fn fatal_exit(&self) -> Option<Option<String>> {
+        self.fatal_exit_rx.try_recv().ok()
+    }
+}
+
+impl Drop for ControlSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires tmux >= 3.3"]
+    fn launches_and_drives_control_mode() {
+        let socket = format!("termy-ctrl-test-{}", std::process::id());
+        let session =
+            ControlSession::launch("tmux", &socket, "termytest").expect("launch tmux -CC");
+
+        // The control stream should produce startup notifications (window/pane).
+        let mut notifications = Vec::new();
+        for _ in 0..40 {
+            notifications.extend(session.poll());
+            if !notifications.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !notifications.is_empty(),
+            "expected tmux control-mode startup notifications"
+        );
+
+        // A request/response round-trip over the control channel.
+        let output = session.send_command("display-message -p termy-ok");
+        assert!(output.is_ok(), "send_command failed: {output:?}");
+
+        // Text that consumes the rest of its line must not hide the completion
+        // token: a trailing comment, an unquoted `#{...}` (also a comment), an
+        // unterminated quote (closed at the end of the line), and a line that
+        // is nothing but a comment.
+        let output = session
+            .send_command("display-message -p termy-commented # note ; display-message -p x")
+            .expect("command ending in a comment must complete");
+        assert_eq!(output.trim_end(), "termy-commented");
+        session
+            .send_command("display-message -p #{pane_id}")
+            .expect("unquoted format is a comment, the command still completes");
+        let output = session
+            .send_command("display-message -p 'termy-open ; display-message -p x")
+            .expect("unterminated quote must complete");
+        assert_eq!(output.trim_end(), "termy-open ; display-message -p x");
+        let output = session
+            .send_command("# only a comment")
+            .expect("comment-only command must complete");
+        assert_eq!(output, "");
+
+        // A failing command makes tmux skip the rest of its `;` list; the
+        // completion token is on its own line, so the request still completes,
+        // with the error, and the channel stays usable.
+        let failed = session.send_command("select-pane -t %999 ; display-message -p x");
+        let error = failed.expect_err("select-pane on a missing pane should fail");
+        assert!(
+            error.message.contains("can't find pane"),
+            "unexpected error: {error:?}"
+        );
+        let output = session
+            .send_command("display-message -p termy-after-error")
+            .expect("channel must stay usable after a failed command");
+        assert_eq!(output.trim_end(), "termy-after-error");
+
+        // Pane text that looks like protocol lines comes back verbatim inside
+        // the capture-pane block; it must stay command output.
+        session
+            .send_command(r#"send-keys 'clear; printf "%%exit\n%%output %%3 x\n"' Enter"#)
+            .expect("send-keys");
+        let mut captured = String::new();
+        for _ in 0..40 {
+            captured = session.send_command("capture-pane -p").expect("capture");
+            if captured.contains("%output %3 x") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(captured.contains("%exit\n%output %3 x"), "{captured:?}");
+        assert!(
+            session.fatal_exit().is_none(),
+            "pane text ended control mode"
+        );
+        assert!(
+            !session
+                .poll()
+                .iter()
+                .any(|notification| match notification {
+                    TmuxNotification::Exit(_) => true,
+                    TmuxNotification::Output { pane_id, .. } => pane_id == "%3",
+                    _ => false,
+                })
+        );
+
+        // Live output keeps a bare LF: with ONLCR off it means "cursor down,
+        // same column", and tmux forwards it unchanged.
+        session
+            .send_command(r#"send-keys -l 'stty -onlcr; printf "termy-lf:a\\nb\\n"; stty onlcr'"#)
+            .expect("type onlcr-off printf");
+        session.send_command("send-keys Enter").expect("send-keys");
+        let mut live = Vec::new();
+        for _ in 0..40 {
+            for notification in session.poll() {
+                if let TmuxNotification::Output { bytes, .. } = notification {
+                    live.extend_from_slice(&bytes);
+                }
+            }
+            if live.windows(12).any(|w| w == b"termy-lf:a\nb") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            live.windows(12).any(|w| w == b"termy-lf:a\nb"),
+            "bare LF was rewritten: {:?}",
+            String::from_utf8_lossy(&live)
+        );
+
+        // Non-UTF-8 bytes must not end control mode. For a directory named with
+        // a raw 0xff byte, tmux octal-escapes the byte in formats but writes it
+        // raw in `%subscription-changed`; `show-buffer` prints stored bytes raw
+        // inside its %begin/%end block (to a UTF-8 client).
+        let raw_dir_prefix = format!("/tmp/termy-ctrl-{}-", std::process::id());
+        let raw_dir = {
+            use std::os::unix::ffi::OsStringExt;
+            let mut bytes = raw_dir_prefix.clone().into_bytes();
+            bytes.extend_from_slice(b"a\xffb");
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes))
+        };
+        // APFS (macOS) refuses names that are not valid UTF-8, so the
+        // directory half of this check only runs where the filesystem allows it.
+        let raw_dir_created = match std::fs::create_dir_all(&raw_dir) {
+            Ok(()) => true,
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => false,
+            Err(error) => panic!("create non-utf8 directory: {error}"),
+        };
+        if raw_dir_created {
+            session
+                .send_command("refresh-client -B 'termy_path:%*:#{pane_current_path}'")
+                .expect("subscribe to pane path");
+            session
+                .send_command(&format!(
+                    r#"send-keys -l 'cd "$(printf "{raw_dir_prefix}a\\377b")"'"#
+                ))
+                .expect("type cd into non-utf8 directory");
+            session.send_command("send-keys Enter").expect("send-keys");
+            let mut path = String::new();
+            let mut subscription = None;
+            for _ in 0..80 {
+                for notification in session.poll() {
+                    if let TmuxNotification::SubscriptionChanged { name, value, .. } = notification
+                        && name == "termy_path"
+                        && value.ends_with("a\u{fffd}b")
+                    {
+                        subscription = Some(value);
+                    }
+                }
+                path = session
+                    .send_command("display-message -p '#{q:pane_current_path}'")
+                    .expect("query pane path");
+                if path.contains(r"a\377b") && subscription.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(path.contains(r"a\377b"), "{path:?}");
+            assert!(
+                subscription.is_some(),
+                "non-utf8 subscription value was dropped"
+            );
+        }
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let status = Command::new("tmux")
+                .args(["-L", &socket, "set-buffer", "-b", "termy-raw"])
+                .arg(std::ffi::OsStr::from_bytes(b"b\xffb"))
+                .status()
+                .expect("run tmux set-buffer");
+            assert!(status.success(), "tmux set-buffer failed: {status}");
+        }
+        // tmux prints the byte raw to a UTF-8 client and as `_` otherwise; the
+        // client is UTF-8 when this test runs under a UTF-8 locale.
+        let buffer = session
+            .send_command("show-buffer -b termy-raw")
+            .expect("show-buffer with a non-utf8 byte must complete");
+        assert!(
+            matches!(buffer.trim_end(), "b\u{fffd}b" | "b_b"),
+            "{buffer:?}"
+        );
+        let output = session
+            .send_command("display-message -p termy-after-raw-bytes")
+            .expect("channel must stay usable after non-utf8 output");
+        assert_eq!(output.trim_end(), "termy-after-raw-bytes");
+        assert!(
+            session.fatal_exit().is_none(),
+            "non-utf8 output ended control mode"
+        );
+
+        drop(session);
+        let _ = Command::new("tmux")
+            .args(["-L", &socket, "kill-server"])
+            .output();
+        let _ = std::fs::remove_dir(&raw_dir);
+    }
+}

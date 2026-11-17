@@ -1,7 +1,7 @@
 use std::time::Instant;
 
+use crate::terminal_ui::{TmuxClient, TmuxLaunchTarget, TmuxRuntimeConfig, TmuxSnapshot};
 use flume::Sender;
-use termy_terminal_ui::{TmuxClient, TmuxLaunchTarget, TmuxRuntimeConfig, TmuxSnapshot};
 
 use super::*;
 
@@ -9,6 +9,10 @@ mod tmux;
 mod tmux_sync;
 
 pub(super) use tmux_sync::{TmuxResizeScheduler, TmuxResizeWakeup};
+
+pub(crate) fn tmux_runtime_requested(config: &AppConfig) -> bool {
+    RuntimeKind::from_app_config(config).uses_tmux()
+}
 
 const TMUX_MOUSE_MODE_SUBSCRIPTION_NAME: &str = "termy_mouse_mode";
 const TMUX_MOUSE_MODE_SUBSCRIPTION_FORMAT: &str = concat!(
@@ -36,7 +40,7 @@ impl RuntimeKind {
 
     pub(super) fn from_app_config(config: &AppConfig) -> Self {
         Self::from_runtime_options(
-            config.tmux_enabled,
+            config.tmux_enabled && !config.multiplexer_enabled,
             cfg!(target_os = "windows"),
             config.tmux_command_prefix_argv().is_empty(),
         )
@@ -98,6 +102,10 @@ pub(super) struct TmuxRuntime {
     pub(super) resize_wakeup_scheduled: bool,
     pub(super) title_refresh_deadline: Option<Instant>,
     pub(super) title_refresh_wakeup_scheduled: bool,
+    /// The snapshot the tabs were last built from, and the cell size they
+    /// were sized with. Event-driven refreshes that fetch the same state
+    /// again leave the tabs alone.
+    pub(super) applied_snapshot: Option<(TmuxSnapshot, Option<Size<Pixels>>)>,
 }
 
 impl TmuxRuntime {
@@ -127,6 +135,7 @@ impl TmuxRuntime {
             resize_wakeup_scheduled: false,
             title_refresh_deadline: None,
             title_refresh_wakeup_scheduled: false,
+            applied_snapshot: None,
         }
     }
 }
@@ -154,21 +163,33 @@ impl TerminalView {
         tab_shell_integration: &TabTitleShellIntegration,
         terminal_runtime: &TerminalRuntimeConfig,
         startup_command: Option<&str>,
-        initial_cols: u16,
-        initial_rows: u16,
+        size: TerminalSize,
+        multiplexer: Option<&termy_core::multiplexer::SessionClient>,
     ) -> Terminal {
-        match Terminal::new_native(
-            TerminalSize {
-                cols: initial_cols,
-                rows: initial_rows,
-                ..TerminalSize::default()
-            },
-            configured_working_dir,
-            Some(native_terminal_wakeup_router),
-            Some(tab_shell_integration),
-            Some(terminal_runtime),
-            startup_command,
-        ) {
+        let start = |multiplexer| {
+            Terminal::new_native(
+                size,
+                configured_working_dir,
+                Some(native_terminal_wakeup_router),
+                Some(tab_shell_integration),
+                Some(terminal_runtime),
+                startup_command,
+                multiplexer,
+            )
+        };
+        // A new window (Cmd+N, a dock reopen) must open even when the host
+        // refuses the pane: it gets a regular terminal (audit B12).
+        let started = start(multiplexer).or_else(|error| {
+            if multiplexer.is_none() {
+                return Err(error);
+            }
+            log::error!("Cannot start a multiplexer terminal: {error:#}");
+            crate::ui::toast::error(format!(
+                "Could not start a multiplexer terminal, so this one ends when Termy quits: {error}"
+            ));
+            start(None)
+        });
+        match started {
             Ok(terminal) => terminal,
             Err(error) => {
                 eprintln!("Termy startup blocked: failed to start native runtime: {error}");
@@ -177,32 +198,14 @@ impl TerminalView {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn runtime_startup_from_app_config(
         config: &AppConfig,
         event_wakeup_tx: &Sender<()>,
-        native_terminal_wakeup_router: &NativeTerminalWakeupRouter,
         configured_working_dir: Option<&str>,
-        tab_shell_integration: &TabTitleShellIntegration,
         terminal_runtime: &TerminalRuntimeConfig,
-        startup_command: Option<&str>,
         initial_cols: u16,
         initial_rows: u16,
-        defer_native_terminal: bool,
-    ) -> (RuntimeState, Option<TmuxSnapshot>, Option<Terminal>) {
-        let start_native = || {
-            let native_terminal = Self::start_native_terminal(
-                native_terminal_wakeup_router,
-                configured_working_dir,
-                tab_shell_integration,
-                terminal_runtime,
-                startup_command,
-                initial_cols,
-                initial_rows,
-            );
-            (RuntimeState::Native, None, Some(native_terminal))
-        };
-
+    ) -> (RuntimeState, Option<TmuxSnapshot>) {
         match RuntimeKind::from_app_config(config) {
             RuntimeKind::Tmux => {
                 let tmux_runtime = Self::tmux_runtime_from_app_config(config);
@@ -226,7 +229,7 @@ impl TerminalView {
                         );
                         log::warn!("{message}");
                         crate::ui::toast::warning(message);
-                        return start_native();
+                        return (RuntimeState::Native, None);
                     }
                 };
                 let initial_snapshot = match tmux_client.refresh_snapshot() {
@@ -244,7 +247,7 @@ impl TerminalView {
                         );
                         log::warn!("{message}");
                         crate::ui::toast::warning(message);
-                        return start_native();
+                        return (RuntimeState::Native, None);
                     }
                 };
                 (
@@ -256,11 +259,11 @@ impl TerminalView {
                         initial_rows,
                     )),
                     Some(initial_snapshot),
-                    None,
                 )
             }
-            RuntimeKind::Native if defer_native_terminal => (RuntimeState::Native, None, None),
-            RuntimeKind::Native => start_native(),
+            // Native shells start after the view can measure the window, font,
+            // padding and chrome. Shell line editors may cache that first size.
+            RuntimeKind::Native => (RuntimeState::Native, None),
         }
     }
 }
@@ -287,6 +290,20 @@ mod tests {
             RuntimeKind::from_runtime_options(true, true, false),
             RuntimeKind::Tmux
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn startup_capability_matches_windows_tmux_configuration() {
+        let mut config = AppConfig {
+            tmux_enabled: true,
+            ..AppConfig::default()
+        };
+        assert!(!tmux_runtime_requested(&config));
+        config.tmux_command_prefix = Some("wsl.exe -e".to_string());
+        assert!(tmux_runtime_requested(&config));
+        config.multiplexer_enabled = true;
+        assert!(!tmux_runtime_requested(&config));
     }
 
     #[test]

@@ -73,6 +73,39 @@ mod tests {
     }
 
     #[test]
+    fn tab_switch_search_finds_keyboard_shortcuts() {
+        let settings = SettingsWindow::build_searchable_settings();
+        let setting = settings
+            .iter()
+            .find(|setting| setting.metadata.key == "keybind")
+            .unwrap();
+        assert_eq!(setting.metadata.title, "Keyboard shortcuts");
+        assert!(
+            SettingsWindow::setting_search_score(setting, "tab switch", &["tab", "switch"])
+                .is_some()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_terminal_search_points_to_general() {
+        let settings = SettingsWindow::build_searchable_settings();
+        let setting = settings
+            .iter()
+            .find(|setting| setting.metadata.key == "default_terminal")
+            .expect("default terminal should be searchable");
+        assert_eq!(setting.metadata.section, SettingsSection::Advanced);
+        assert!(
+            SettingsWindow::setting_search_score(
+                setting,
+                "default terminal",
+                &["default", "terminal"]
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
     fn settings_navigation_order_matches_the_grouped_sidebar() {
         assert_eq!(
             SettingsWindow::settings_sections_in_order(),
@@ -80,7 +113,6 @@ mod tests {
                 SettingsSection::Advanced,
                 SettingsSection::Appearance,
                 SettingsSection::Colors,
-                SettingsSection::ThemeStore,
                 SettingsSection::Plugins,
                 SettingsSection::Terminal,
                 SettingsSection::Ssh,
@@ -168,13 +200,15 @@ static SETTINGS_METADATA: LazyLock<Vec<SettingMetadata>> = LazyLock::new(|| {
         keywords: spec.keywords,
     }));
 
+    #[cfg(target_os = "macos")]
     entries.push(SettingMetadata {
-        key: "theme_store",
-        section: SettingsSection::ThemeStore,
-        title: "Themes",
-        description: "Browse and install community themes from the online store.",
-        keywords: &["theme", "store", "install", "colors"],
+        key: "default_terminal",
+        section: SettingsSection::Advanced,
+        title: "Default terminal",
+        description: "Use Termy when macOS requests the default terminal.",
+        keywords: &["default", "terminal", "macos", "system"],
     });
+
     entries.push(SettingMetadata {
         key: "plugins",
         section: SettingsSection::Plugins,
@@ -211,7 +245,6 @@ impl SettingsWindow {
             SettingsSection::Terminal => "Terminal",
             SettingsSection::Ssh => "SSH",
             SettingsSection::Tabs => "Tabs",
-            SettingsSection::ThemeStore => "Themes",
             SettingsSection::Plugins => "Plugins",
             SettingsSection::Advanced => "General",
             SettingsSection::Colors => "Colors",
@@ -225,11 +258,10 @@ impl SettingsWindow {
             SettingsSection::Terminal => "Shell, input, scrolling, and tmux",
             SettingsSection::Ssh => "Saved hosts, authentication, and remote sessions",
             SettingsSection::Tabs => "Tabs, sidebar, and title bar",
-            SettingsSection::ThemeStore => "Find and install community themes",
             SettingsSection::Plugins => "Install and manage plugins",
             SettingsSection::Advanced => "Startup, windows, updates, and app behavior",
             SettingsSection::Colors => "Override individual terminal colors",
-            SettingsSection::Keybindings => "Assign keys to commands",
+            SettingsSection::Keybindings => "Click to record. Escape cancels; Backspace clears.",
         }
     }
 
@@ -239,7 +271,6 @@ impl SettingsWindow {
             SettingsSection::Terminal => "icons/settings/terminal.svg",
             SettingsSection::Ssh => "icons/settings/ssh.svg",
             SettingsSection::Tabs => "icons/settings/tabs.svg",
-            SettingsSection::ThemeStore => "icons/settings/themes.svg",
             SettingsSection::Plugins => "icons/settings/plugins.svg",
             SettingsSection::Advanced => "icons/settings/advanced.svg",
             SettingsSection::Colors => "icons/settings/colors.svg",
@@ -247,12 +278,11 @@ impl SettingsWindow {
         }
     }
 
-    pub(super) const fn settings_sections_in_order() -> [SettingsSection; 9] {
+    pub(super) const fn settings_sections_in_order() -> [SettingsSection; 8] {
         [
             SettingsSection::Advanced,
             SettingsSection::Appearance,
             SettingsSection::Colors,
-            SettingsSection::ThemeStore,
             SettingsSection::Plugins,
             SettingsSection::Terminal,
             SettingsSection::Ssh,
@@ -274,8 +304,6 @@ impl SettingsWindow {
         self.active_plugin_setting_select = None;
         self.capturing_action = None;
         self.blur_sidebar_search();
-        self.theme_store_search_active = section == SettingsSection::ThemeStore;
-        self.theme_store_search_selecting = false;
         self.scroll_animation_token = self.scroll_animation_token.wrapping_add(1);
         self.content_scroll_handle
             .set_offset(point(px(0.0), px(0.0)));
@@ -483,8 +511,8 @@ impl SettingsWindow {
 
     pub(super) fn start_smooth_scroll_animation(
         &mut self,
-        start_offset: gpui::Point<gpui::Pixels>,
-        target_offset: gpui::Point<gpui::Pixels>,
+        start_offset: gpui_kit::Point<gpui_kit::Pixels>,
+        target_offset: gpui_kit::Point<gpui_kit::Pixels>,
         cx: &mut Context<Self>,
     ) {
         let start_x: f32 = start_offset.x.into();
@@ -506,27 +534,27 @@ impl SettingsWindow {
             let started_at = Instant::now();
 
             loop {
-                smol::Timer::after(Duration::from_millis(SETTINGS_SCROLL_ANIMATION_TICK_MS)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(SETTINGS_SCROLL_ANIMATION_TICK_MS))
+                    .await;
 
-                let continue_animating = cx
-                    .update(|cx| {
-                        this.update(cx, |view, cx| {
-                            if view.scroll_animation_token != token {
-                                return false;
-                            }
+                let continue_animating = cx.update(|cx| {
+                    this.update(cx, |view, cx| {
+                        if view.scroll_animation_token != token {
+                            return false;
+                        }
 
-                            let t = (started_at.elapsed().as_secs_f32() / duration.as_secs_f32())
-                                .clamp(0.0, 1.0);
-                            let eased = t * t * (3.0 - 2.0 * t);
-                            let x = start_x + (target_x - start_x) * eased;
-                            let y = start_y + (target_y - start_y) * eased;
-                            scroll_handle.set_offset(point(px(x), px(y)));
-                            cx.notify();
-                            t < 1.0
-                        })
-                        .unwrap_or(false)
+                        let t = (started_at.elapsed().as_secs_f32() / duration.as_secs_f32())
+                            .clamp(0.0, 1.0);
+                        let eased = t * t * (3.0 - 2.0 * t);
+                        let x = start_x + (target_x - start_x) * eased;
+                        let y = start_y + (target_y - start_y) * eased;
+                        scroll_handle.set_offset(point(px(x), px(y)));
+                        cx.notify();
+                        t < 1.0
                     })
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                });
 
                 if !continue_animating {
                     break;
@@ -554,7 +582,7 @@ impl SettingsWindow {
         self.sidebar_search_active = true;
         self.sidebar_search_selecting = false;
         if !self.focus_handle.is_focused(window) {
-            self.focus_handle.focus(window);
+            self.focus_handle.focus(window, cx);
         }
 
         if let Some(anchor) = self.setting_scroll_anchors.get(setting_key).cloned() {
@@ -655,7 +683,7 @@ impl SettingsWindow {
             .h_full()
             .bg(self.bg_secondary())
             .border_r_1()
-            .border_color(self.border_color())
+            .border_color(self.card_border_color())
             .flex()
             .flex_col()
             .child(
@@ -669,8 +697,8 @@ impl SettingsWindow {
                     .child(
                         div()
                             .px_1()
-                            .text_size(px(18.0))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_size(px(19.0))
+                            .font_weight(gpui_kit::FontWeight::BOLD)
                             .text_color(self.text_primary())
                             .child("Settings"),
                     )
@@ -691,11 +719,7 @@ impl SettingsWindow {
                         ],
                         cx,
                     ))
-                    .child(self.render_sidebar_group(
-                        "Extensions",
-                        &[SettingsSection::ThemeStore, SettingsSection::Plugins],
-                        cx,
-                    ))
+                    .child(self.render_sidebar_group("Extensions", &[SettingsSection::Plugins], cx))
                     .child(self.render_sidebar_group(
                         "Workflow",
                         &[
@@ -708,7 +732,7 @@ impl SettingsWindow {
                     )),
             )
             .child(div().flex_1())
-            .child(self.render_sidebar_footer(cx))
+            .child(self.render_sidebar_footer())
     }
 
     pub(super) fn render_sidebar_group(
@@ -730,7 +754,7 @@ impl SettingsWindow {
                 div()
                     .px_2()
                     .text_size(px(SIDEBAR_GROUP_LABEL_SIZE))
-                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
                     .text_color(self.text_muted())
                     .child(label),
             )
@@ -738,103 +762,10 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    pub(super) fn render_sidebar_footer(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_sidebar_footer(&self) -> impl IntoElement {
         let text_muted = self.text_muted();
-        let text_primary = self.text_primary();
         let border_color = self.border_color();
-        let button_border = self.accent_with_alpha(0.35);
-        let login_bg = self.bg_input();
-        let hover_bg = self.bg_hover();
-        let auth_status: AnyElement = match self.theme_store_auth_session.clone() {
-            Some(session) => {
-                let user = session.user;
-                let display_name = Self::theme_store_auth_display_name(&user);
-                let avatar_fallback = Self::theme_store_auth_avatar_fallback_label(&user);
-                let avatar: AnyElement = match user.avatar_url.clone() {
-                    Some(avatar_url) => div()
-                        .w(px(30.0))
-                        .h(px(30.0))
-                        .rounded_full()
-                        .overflow_hidden()
-                        .bg(self.bg_input())
-                        .child(
-                            img(avatar_url)
-                                .w_full()
-                                .h_full()
-                                .object_fit(ObjectFit::Cover),
-                        )
-                        .into_any_element(),
-                    None => div()
-                        .w(px(30.0))
-                        .h(px(30.0))
-                        .rounded_full()
-                        .bg(self.accent_with_alpha(0.18))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(text_primary)
-                        .child(avatar_fallback)
-                        .into_any_element(),
-                };
-
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(10.0))
-                            .child(avatar)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(text_primary)
-                                            .child(display_name),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(text_muted)
-                                            .child(format!("@{}", user.github_login)),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("theme-store-logout-button")
-                            .px_3()
-                            .py(px(8.0))
-                            .rounded(px(SETTINGS_BUTTON_RADIUS))
-                            .border_1()
-                            .border_color(button_border)
-                            .bg(login_bg)
-                            .cursor_pointer()
-                            .hover(|s| s.bg(hover_bg))
-                            .text_xs()
-                            .text_color(text_primary)
-                            .child(if self.theme_store_auth_loading {
-                                "Signing out..."
-                            } else {
-                                "Logout"
-                            })
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.logout_theme_store_user(cx);
-                            })),
-                    )
-                    .into_any_element()
-            }
-            None => div().into_any_element(),
-        };
-
-        let mut footer = div()
+        div()
             .border_t_1()
             .border_color(border_color)
             .px_4()
@@ -842,19 +773,12 @@ impl SettingsWindow {
             .flex()
             .flex_col()
             .gap(px(10.0))
-            .child(auth_status)
             .child(
                 div()
                     .text_xs()
                     .text_color(text_muted)
                     .child(format!("Termy v{}", crate::APP_VERSION)),
-            );
-
-        if let Some(error) = self.theme_store_auth_error.clone() {
-            footer = footer.child(div().text_xs().text_color(self.accent()).child(error));
-        }
-
-        footer
+            )
     }
 
     pub(super) fn search_input_content(
@@ -869,7 +793,7 @@ impl SettingsWindow {
         if is_active {
             let font = Font {
                 family: self.config.ui_font_family.clone().into(),
-                ..gpui::font("")
+                ..gpui_kit::font("")
             };
             return TextInputElement::new(
                 cx.entity(),
@@ -893,7 +817,7 @@ impl SettingsWindow {
             div()
                 .text_size(px(SETTINGS_INPUT_TEXT_SIZE))
                 .text_color(text_muted)
-                .child("Search settings...")
+                .child("Search")
                 .into_any_element()
         }
     }
@@ -904,17 +828,23 @@ impl SettingsWindow {
         is_active: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let bg_input = self.bg_input();
-        let border_color = self.border_color();
+        // `NSSearchField`: an opaque fill so the focus ring around it stays
+        // a ring instead of tinting the whole field.
+        let bg_input = Self::composite_over(self.native().fill, self.bg_secondary());
+        let border_color = self.card_border_color();
         let accent = self.accent();
+        let focus_ring = self.input_focus_ring();
         div()
             .id("settings-sidebar-search-input")
-            .h(px(36.0))
-            .px_3()
-            .rounded(px(SETTINGS_BUTTON_RADIUS))
+            .h(px(28.0))
+            .px(px(8.0))
+            .rounded(px(SETTINGS_INPUT_RADIUS))
             .bg(bg_input)
             .border_1()
             .border_color(if is_active { accent } else { border_color })
+            .when(is_active, |s| {
+                s.shadow(vec![Self::focus_ring_shadow(focus_ring)])
+            })
             .overflow_hidden()
             .cursor_text()
             .flex()
@@ -946,7 +876,7 @@ impl SettingsWindow {
                     }
                     view.sidebar_search_selecting = event.click_count == 1;
                     view.refresh_search_navigation(window, cx);
-                    view.focus_handle.focus(window);
+                    view.focus_handle.focus(window, cx);
                     cx.notify();
                 }),
             )
@@ -1076,11 +1006,10 @@ impl SettingsWindow {
         let active_bg = self.sidebar_selection_bg();
         let hover_bg = self.bg_hover();
         let text_primary = self.text_primary();
-        let text_secondary = self.text_secondary();
-        let icon_path = Self::section_icon_path(section);
-        let icon_tint = self.icon_color(is_active);
-        let selection_accent = self.accent_with_alpha(0.95);
+        let on_accent = self.native().on_accent;
 
+        // Selected rows fill with the accent and invert their text, as in
+        // System Settings; the colored tile keeps its own color.
         div()
             .id(SharedString::from(label))
             .relative()
@@ -1091,50 +1020,19 @@ impl SettingsWindow {
             .flex()
             .items_center()
             .gap(px(10.0))
-            .bg(if is_active {
-                active_bg
-            } else {
-                Rgba {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 0.0,
-                }
-            })
-            .hover(|s| s.bg(hover_bg))
-            .when(is_active, |s| {
-                s.child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top(px(SIDEBAR_SELECTED_ACCENT_INSET_Y))
-                        .w(px(SIDEBAR_SELECTED_ACCENT_WIDTH))
-                        .h(px((SIDEBAR_ITEM_HEIGHT
-                            - (SIDEBAR_SELECTED_ACCENT_INSET_Y * 2.0))
-                            .max(0.0)))
-                        .rounded_full()
-                        .bg(selection_accent),
-                )
-            })
-            .child(
-                svg()
-                    .path(SharedString::from(icon_path))
-                    .size(px(SIDEBAR_ICON_SIZE))
-                    .text_color(icon_tint),
-            )
+            .when(is_active, |s| s.bg(active_bg))
+            .when(!is_active, |s| s.hover(|s| s.bg(hover_bg)))
+            .child(self.render_section_tile(
+                section,
+                SIDEBAR_ICON_TILE_SIZE,
+                SIDEBAR_ICON_TILE_RADIUS,
+                SIDEBAR_ICON_SIZE,
+                is_active,
+            ))
             .child(
                 div()
-                    .text_sm()
-                    .font_weight(if is_active {
-                        gpui::FontWeight::MEDIUM
-                    } else {
-                        gpui::FontWeight::NORMAL
-                    })
-                    .text_color(if is_active {
-                        text_primary
-                    } else {
-                        text_secondary
-                    })
+                    .text_size(px(13.0))
+                    .text_color(if is_active { on_accent } else { text_primary })
                     .child(label),
             )
             .on_mouse_down(

@@ -4,7 +4,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(in crate::terminal_view) struct TerminalContextMenuState {
-    pub(in crate::terminal_view) anchor_position: gpui::Point<Pixels>,
+    pub(in crate::terminal_view) anchor_position: gpui_kit::Point<Pixels>,
     pub(in crate::terminal_view) buffer_position: Option<SelectionPos>,
     pub(in crate::terminal_view) image: Option<KittyImageSelection>,
     pub(in crate::terminal_view) selected_text: Option<String>,
@@ -14,7 +14,7 @@ pub(in crate::terminal_view) struct TerminalContextMenuState {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(in crate::terminal_view) struct TabContextMenuState {
-    pub(in crate::terminal_view) anchor_position: gpui::Point<Pixels>,
+    pub(in crate::terminal_view) anchor_position: gpui_kit::Point<Pixels>,
     pub(in crate::terminal_view) tab_id: TabId,
     pub(in crate::terminal_view) pinned: bool,
 }
@@ -22,7 +22,7 @@ pub(in crate::terminal_view) struct TabContextMenuState {
 impl TerminalView {
     fn terminal_context_menu_buffer_position(
         &self,
-        position: gpui::Point<Pixels>,
+        position: gpui_kit::Point<Pixels>,
     ) -> Option<SelectionPos> {
         let (_, buffer_position) = self.position_to_pane_selection_pos(position, false)?;
         Some(buffer_position)
@@ -42,31 +42,35 @@ impl TerminalView {
 
     fn terminal_context_menu_capabilities(&self, cx: &mut Context<Self>) -> (Option<String>, bool) {
         let selected_text = self.selected_text();
-        let can_paste = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-            .is_some();
+        let can_paste = self
+            .active_terminal()
+            .is_some_and(Terminal::kitty_clipboard_paste_events_enabled)
+            && crate::native_sdk::available_clipboard_formats().is_ok()
+            || cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .is_some();
         (selected_text, can_paste)
     }
 
     #[cfg(any(test, target_os = "macos"))]
     fn command_action_for_context_menu_action(
-        action: termy_native_sdk::ContextMenuAction,
+        action: crate::native_sdk::ContextMenuAction,
     ) -> Option<CommandAction> {
         match action {
-            termy_native_sdk::ContextMenuAction::Copy => Some(CommandAction::Copy),
-            termy_native_sdk::ContextMenuAction::Paste => Some(CommandAction::Paste),
-            termy_native_sdk::ContextMenuAction::OpenSearch => Some(CommandAction::OpenSearch),
-            termy_native_sdk::ContextMenuAction::CopyImage
-            | termy_native_sdk::ContextMenuAction::CopyBufferPosition => None,
+            crate::native_sdk::ContextMenuAction::Copy => Some(CommandAction::Copy),
+            crate::native_sdk::ContextMenuAction::Paste => Some(CommandAction::Paste),
+            crate::native_sdk::ContextMenuAction::OpenSearch => Some(CommandAction::OpenSearch),
+            crate::native_sdk::ContextMenuAction::CopyImage
+            | crate::native_sdk::ContextMenuAction::CopyBufferPosition => None,
         }
     }
 
     #[cfg(target_os = "macos")]
     fn native_context_menu_anchor(
         window: &Window,
-        position: gpui::Point<Pixels>,
-    ) -> Option<termy_native_sdk::NativeContextMenuAnchor> {
+        position: gpui_kit::Point<Pixels>,
+    ) -> Option<crate::native_sdk::NativeContextMenuAnchor> {
         let raw_handle = HasWindowHandle::window_handle(window).ok()?.as_raw();
         let native_view = match raw_handle {
             RawWindowHandle::AppKit(handle) => handle.ns_view.as_ptr() as usize,
@@ -76,7 +80,7 @@ impl TerminalView {
         let x: f32 = position.x.into();
         let y: f32 = position.y.into();
 
-        Some(termy_native_sdk::NativeContextMenuAnchor {
+        Some(crate::native_sdk::NativeContextMenuAnchor {
             native_view,
             x: x as f64,
             y: y as f64,
@@ -126,7 +130,7 @@ impl TerminalView {
     #[cfg(target_os = "macos")]
     fn execute_terminal_context_menu_action(
         &mut self,
-        action: termy_native_sdk::ContextMenuAction,
+        action: crate::native_sdk::ContextMenuAction,
         cx: &mut Context<Self>,
     ) {
         if let Some(command_action) = Self::command_action_for_context_menu_action(action) {
@@ -140,10 +144,10 @@ impl TerminalView {
         }
 
         match action {
-            termy_native_sdk::ContextMenuAction::CopyImage => {
+            crate::native_sdk::ContextMenuAction::CopyImage => {
                 self.execute_terminal_context_menu_copy_image(cx);
             }
-            termy_native_sdk::ContextMenuAction::CopyBufferPosition => {
+            crate::native_sdk::ContextMenuAction::CopyBufferPosition => {
                 self.execute_terminal_context_menu_copy_buffer_position(cx);
             }
             _ => {}
@@ -163,7 +167,7 @@ impl TerminalView {
         let Some(png) = selection
             .as_ref()
             .and_then(|selection| self.current_kitty_image_placement(selection))
-            .map(|placement| placement.png)
+            .map(|placement| placement.image.png())
         else {
             let _ = self.close_terminal_context_menu(cx);
             return;
@@ -197,7 +201,7 @@ impl TerminalView {
     #[cfg(target_os = "macos")]
     fn execute_tab_context_menu_action(
         &mut self,
-        action: termy_native_sdk::TabContextMenuAction,
+        action: crate::native_sdk::TabContextMenuAction,
         cx: &mut Context<Self>,
     ) {
         let Some(tab_id) = self.tab_context_menu.as_ref().map(|state| state.tab_id) else {
@@ -207,18 +211,18 @@ impl TerminalView {
 
         let _ = self.close_tab_context_menu(cx);
         match action {
-            termy_native_sdk::TabContextMenuAction::Rename => {
+            crate::native_sdk::TabContextMenuAction::Rename => {
                 if let Some(index) = self.tab_index_by_id(tab_id) {
                     self.begin_rename_tab(index, cx);
                 }
             }
-            termy_native_sdk::TabContextMenuAction::Pin => {
+            crate::native_sdk::TabContextMenuAction::Pin => {
                 let _ = self.set_tab_pinned_by_id(tab_id, true, cx);
             }
-            termy_native_sdk::TabContextMenuAction::Unpin => {
+            crate::native_sdk::TabContextMenuAction::Unpin => {
                 let _ = self.set_tab_pinned_by_id(tab_id, false, cx);
             }
-            termy_native_sdk::TabContextMenuAction::Close => {
+            crate::native_sdk::TabContextMenuAction::Close => {
                 if let Some(index) = self.tab_index_by_id(tab_id) {
                     self.close_tab(index, cx);
                 }
@@ -233,20 +237,22 @@ impl TerminalView {
         can_copy: bool,
         can_copy_image: bool,
         can_paste: bool,
-        anchor: Option<termy_native_sdk::NativeContextMenuAnchor>,
+        anchor: Option<crate::native_sdk::NativeContextMenuAnchor>,
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let action = smol::unblock(move || {
-                termy_native_sdk::show_copy_paste_context_menu(
-                    buffer_position_label,
-                    can_copy,
-                    can_copy_image,
-                    can_paste,
-                    anchor,
-                )
-            })
-            .await;
+            let action = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::native_sdk::show_copy_paste_context_menu(
+                        buffer_position_label,
+                        can_copy,
+                        can_copy_image,
+                        can_paste,
+                        anchor,
+                    )
+                })
+                .await;
 
             let _ = cx.update(|cx| {
                 this.update(cx, |view, cx| {
@@ -265,13 +271,14 @@ impl TerminalView {
     fn schedule_native_tab_context_menu(
         &mut self,
         pinned: bool,
-        anchor: Option<termy_native_sdk::NativeContextMenuAnchor>,
+        anchor: Option<crate::native_sdk::NativeContextMenuAnchor>,
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let action =
-                smol::unblock(move || termy_native_sdk::show_tab_context_menu(pinned, anchor))
-                    .await;
+            let action = cx
+                .background_executor()
+                .spawn(async move { crate::native_sdk::show_tab_context_menu(pinned, anchor) })
+                .await;
 
             let _ = cx.update(|cx| {
                 this.update(cx, |view, cx| {
@@ -289,7 +296,7 @@ impl TerminalView {
     #[cfg(not(target_os = "macos"))]
     pub(in super::super) fn open_terminal_context_menu(
         &mut self,
-        position: gpui::Point<Pixels>,
+        position: gpui_kit::Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
         self.open_terminal_context_menu_with_native_anchor(position, None, cx);
@@ -297,7 +304,7 @@ impl TerminalView {
 
     pub(in super::super) fn open_terminal_context_menu_for_window(
         &mut self,
-        position: gpui::Point<Pixels>,
+        position: gpui_kit::Point<Pixels>,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -314,8 +321,8 @@ impl TerminalView {
 
     fn open_terminal_context_menu_with_native_anchor(
         &mut self,
-        position: gpui::Point<Pixels>,
-        native_anchor: Option<termy_native_sdk::NativeContextMenuAnchor>,
+        position: gpui_kit::Point<Pixels>,
+        native_anchor: Option<crate::native_sdk::NativeContextMenuAnchor>,
         cx: &mut Context<Self>,
     ) {
         #[cfg(not(target_os = "macos"))]
@@ -365,7 +372,7 @@ impl TerminalView {
     pub(in super::super) fn open_tab_context_menu_for_window(
         &mut self,
         tab_index: usize,
-        position: gpui::Point<Pixels>,
+        position: gpui_kit::Point<Pixels>,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -380,11 +387,23 @@ impl TerminalView {
         self.open_tab_context_menu_with_native_anchor(tab_index, position, native_anchor, cx);
     }
 
+    /// Opens the tab menu for a click that GPUI did not see (the WinUI strip
+    /// reports its own right-clicks).
+    #[cfg(target_os = "windows")]
+    pub(in super::super) fn open_tab_context_menu(
+        &mut self,
+        tab_index: usize,
+        position: gpui_kit::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_tab_context_menu_with_native_anchor(tab_index, position, None, cx);
+    }
+
     fn open_tab_context_menu_with_native_anchor(
         &mut self,
         tab_index: usize,
-        position: gpui::Point<Pixels>,
-        native_anchor: Option<termy_native_sdk::NativeContextMenuAnchor>,
+        position: gpui_kit::Point<Pixels>,
+        native_anchor: Option<crate::native_sdk::NativeContextMenuAnchor>,
         cx: &mut Context<Self>,
     ) {
         #[cfg(not(target_os = "macos"))]
@@ -431,31 +450,31 @@ mod tests {
     fn context_menu_action_maps_to_command_action() {
         assert_eq!(
             TerminalView::command_action_for_context_menu_action(
-                termy_native_sdk::ContextMenuAction::Copy
+                crate::native_sdk::ContextMenuAction::Copy
             ),
             Some(CommandAction::Copy)
         );
         assert_eq!(
             TerminalView::command_action_for_context_menu_action(
-                termy_native_sdk::ContextMenuAction::Paste
+                crate::native_sdk::ContextMenuAction::Paste
             ),
             Some(CommandAction::Paste)
         );
         assert_eq!(
             TerminalView::command_action_for_context_menu_action(
-                termy_native_sdk::ContextMenuAction::OpenSearch
+                crate::native_sdk::ContextMenuAction::OpenSearch
             ),
             Some(CommandAction::OpenSearch)
         );
         assert_eq!(
             TerminalView::command_action_for_context_menu_action(
-                termy_native_sdk::ContextMenuAction::CopyImage
+                crate::native_sdk::ContextMenuAction::CopyImage
             ),
             None
         );
         assert_eq!(
             TerminalView::command_action_for_context_menu_action(
-                termy_native_sdk::ContextMenuAction::CopyBufferPosition
+                crate::native_sdk::ContextMenuAction::CopyBufferPosition
             ),
             None
         );

@@ -1,0 +1,1295 @@
+use super::*;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn dropping_a_hup_ignoring_child_has_bounded_shutdown() {
+    const MARKER: &[u8] = b"TERMY_NATIVE_HUP_IGNORED_READY";
+
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+    let mut output = Vec::new();
+    let mut ready_reported = false;
+    let terminal = Transport::spawn(
+        SpawnConfig {
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "trap '' HUP; printf TERMY_NATIVE_HUP_IGNORED_READY; exec sleep 30".to_string(),
+            ],
+            working_directory: None,
+            environment: Vec::new(),
+        },
+        test_size(),
+        move |bytes| {
+            output.extend_from_slice(bytes);
+            if !ready_reported && output.windows(MARKER.len()).any(|part| part == MARKER) {
+                ready_reported = true;
+                let _ = ready_tx.send(());
+            }
+            Vec::new()
+        },
+        move || {
+            let _ = exit_tx.send(());
+        },
+    )
+    .expect("HUP-ignoring PTY child should start");
+    let child_pid = terminal.child_pid;
+    let cleanup = KillProcessOnDrop(child_pid);
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("child should install its HUP handler before terminal drop");
+
+    drop(terminal);
+    let exited = exit_rx.recv_timeout(Duration::from_millis(750)).is_ok();
+    if !exited {
+        force_child_shutdown(child_pid);
+        let _ = exit_rx.recv_timeout(Duration::from_secs(2));
+    }
+    // The child has either exited through the implementation under test or
+    // was killed explicitly above, so the cleanup guard must not target a
+    // subsequently reused PID during normal scope teardown.
+    std::mem::forget(cleanup);
+
+    assert!(exited, "dropping a PTY left its HUP-ignoring child alive");
+}
+
+#[test]
+fn child_environment_rejects_invalid_override_names() {
+    for name in ["", "BAD=NAME"] {
+        let error = child_environment(&[(name.to_string(), "value".to_string())], None, true)
+            .expect_err("invalid environment name should fail");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+}
+
+#[test]
+fn child_environment_reports_the_actual_working_directory() {
+    let directory = Path::new("/tmp/termy-native working directory");
+    let environment = child_environment(
+        &[("PWD".to_string(), "/stale/value".to_string())],
+        Some(directory),
+        true,
+    )
+    .expect("working directory should be representable in the child environment");
+    assert!(
+        environment
+            .iter()
+            .any(|entry| { entry.as_bytes() == b"PWD=/tmp/termy-native working directory" })
+    );
+}
+
+#[test]
+fn missing_absolute_executable_fails_synchronously() {
+    let directory = TestDirectory::new("missing-executable");
+    let error = assert_spawn_error(
+        SpawnConfig {
+            program: directory
+                .path()
+                .join("does-not-exist")
+                .to_string_lossy()
+                .into_owned(),
+            args: Vec::new(),
+            working_directory: None,
+            environment: Vec::new(),
+        },
+        ErrorKind::NotFound,
+    );
+    assert!(error.to_string().contains("execute terminal program"));
+}
+
+#[test]
+fn non_executable_file_fails_synchronously() {
+    let directory = TestDirectory::new("non-executable");
+    let program = directory.path().join("program");
+    write_test_file(&program, b"#!/bin/sh\nexit 0\n", 0o644);
+
+    let error = assert_spawn_error(
+        SpawnConfig {
+            program: program.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            working_directory: None,
+            environment: Vec::new(),
+        },
+        ErrorKind::PermissionDenied,
+    );
+    assert!(error.to_string().contains("execute terminal program"));
+}
+
+#[test]
+fn missing_working_directory_fails_synchronously() {
+    let directory = TestDirectory::new("missing-working-directory");
+    let error = assert_spawn_error(
+        SpawnConfig {
+            program: "/bin/sh".to_string(),
+            args: Vec::new(),
+            working_directory: Some(directory.path().join("does-not-exist")),
+            environment: Vec::new(),
+        },
+        ErrorKind::NotFound,
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("change terminal working directory")
+    );
+}
+
+#[test]
+fn relative_path_entry_uses_child_working_directory() {
+    const SENTINEL: &[u8] = b"TERMY_NATIVE_CHILD_CWD_PATH";
+
+    let directory = TestDirectory::new("relative-path");
+    let child_directory = directory.path().join("child");
+    let bin_directory = child_directory.join("bin");
+    std::fs::create_dir_all(&bin_directory).expect("child bin directory should be created");
+    let program = bin_directory.join("termy-native-relative-path-probe");
+    write_test_file(
+        &program,
+        b"#!/bin/sh\nprintf TERMY_NATIVE_CHILD_CWD_PATH\n",
+        0o755,
+    );
+    let config = SpawnConfig {
+        program: "termy-native-relative-path-probe".to_string(),
+        args: Vec::new(),
+        working_directory: Some(child_directory),
+        environment: vec![("PATH".to_string(), "bin".to_string())],
+    };
+
+    let resolved = resolve_program(&config).expect("relative PATH entry should resolve");
+    assert!(resolved.is_absolute());
+    assert_eq!(
+        resolved,
+        program
+            .canonicalize()
+            .expect("test executable should canonicalize")
+    );
+
+    let (sentinel_tx, sentinel_rx) = mpsc::sync_channel(1);
+    let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+    let mut output = Vec::new();
+    let mut sentinel_reported = false;
+    let terminal = Transport::spawn(
+        config,
+        test_size(),
+        move |bytes| {
+            output.extend_from_slice(bytes);
+            if !sentinel_reported && output.windows(SENTINEL.len()).any(|part| part == SENTINEL) {
+                sentinel_reported = true;
+                let _ = sentinel_tx.send(());
+            }
+            Vec::new()
+        },
+        move || {
+            let _ = exit_tx.send(());
+        },
+    )
+    .expect("child-cwd relative PATH executable should start");
+
+    sentinel_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("resolved child executable should produce its sentinel");
+    exit_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("resolved child executable should exit");
+    drop(terminal);
+}
+
+#[test]
+fn zero_timeout_exit_drain_reads_buffered_data_without_waiting_for_eof() {
+    const SENTINEL: &[u8] = b"TERMY_NATIVE_TAIL_SENTINEL";
+
+    let (reader_stream, mut writer_stream) = UnixStream::pair().expect("socket pair should open");
+    writer_stream
+        .write_all(SENTINEL)
+        .expect("sentinel should be buffered");
+    // SAFETY: ownership of the socket fd is transferred into `reader`.
+    let mut reader = unsafe { File::from_raw_fd(reader_stream.into_raw_fd()) };
+    let mut buffer = [0u8; 32 * 1024];
+    let mut output = Vec::new();
+    drain_ready_pty_output(&mut reader, &mut buffer, &mut |bytes| {
+        output.extend_from_slice(bytes);
+        Vec::new()
+    });
+
+    assert_eq!(output, SENTINEL);
+    // The peer deliberately remains open through the drain, proving the
+    // zero-timeout loop did not wait for EOF or descendant-style closure.
+    writer_stream
+        .write_all(b"still-open")
+        .expect("drain should not close the peer");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn exit_drain_preserves_buffered_tail_beyond_legacy_eight_mib_cap() {
+    const BUFFER_BYTES: usize = 32 * 1024;
+    const LEGACY_EXIT_DRAIN_READS: usize = 256;
+    const TAIL_BYTES: usize = (LEGACY_EXIT_DRAIN_READS + 1) * BUFFER_BYTES;
+
+    let directory = TestDirectory::new("large-exit-tail");
+    let tail_path = directory.path().join("tail");
+    let mut tail_writer = File::create(&tail_path).expect("tail file should be created");
+    let chunk = [b'T'; BUFFER_BYTES];
+    for _ in 0..=LEGACY_EXIT_DRAIN_READS {
+        tail_writer
+            .write_all(&chunk)
+            .expect("complete tail should be queued");
+    }
+    drop(tail_writer);
+
+    let mut reader = File::open(&tail_path).expect("queued tail should be readable");
+    let mut buffer = [0u8; BUFFER_BYTES];
+    let mut delivered = 0;
+    drain_ready_pty_output(&mut reader, &mut buffer, &mut |bytes| {
+        delivered += bytes.len();
+        Vec::new()
+    });
+
+    assert_eq!(
+        delivered, TAIL_BYTES,
+        "all output already readable at direct-child exit must precede the exit callback"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn direct_child_large_tail_is_complete_before_exit_callback() {
+    const HELPER_ENV: &str = "TERMY_NATIVE_PTY_LARGE_EXIT_TAIL_HELPER";
+    const BEGIN: &[u8] = b"<TERMY_NATIVE_LARGE_EXIT_TAIL_BEGIN>";
+    const END: &[u8] = b"<TERMY_NATIVE_LARGE_EXIT_TAIL_END>";
+    const CHUNK_BYTES: usize = 32 * 1024;
+    const LEGACY_EXIT_DRAIN_READS: usize = 256;
+    const TAIL_BYTES: usize = (LEGACY_EXIT_DRAIN_READS + 1) * CHUNK_BYTES;
+
+    if std::env::var_os(HELPER_ENV).as_deref() == Some(OsStr::new("1")) {
+        let mut stdout = io::stdout().lock();
+        stdout
+            .write_all(BEGIN)
+            .expect("helper should write the leading marker");
+        let chunk = [b'T'; CHUNK_BYTES];
+        for _ in 0..=LEGACY_EXIT_DRAIN_READS {
+            stdout
+                .write_all(&chunk)
+                .expect("helper should write its complete exit tail");
+        }
+        stdout
+            .write_all(END)
+            .expect("helper should write the trailing marker");
+        stdout.flush().expect("helper should flush its exit tail");
+        // Exit immediately after the tail so the watcher and reader race in
+        // the same way as a real short-lived terminal command.
+        unsafe { _exit(0) }
+    }
+
+    let executable = std::env::current_exe().expect("test executable should exist");
+    let output = Arc::new(Mutex::new(Vec::with_capacity(
+        BEGIN.len() + TAIL_BYTES + END.len(),
+    )));
+    let callback_output = output.clone();
+    let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+    let terminal = Transport::spawn(
+        SpawnConfig {
+            program: executable.to_string_lossy().into_owned(),
+            args: vec![
+                "terminal_engine::transport::unix::tests::process::direct_child_large_tail_is_complete_before_exit_callback"
+                    .to_string(),
+                "--exact".to_string(),
+                "--nocapture".to_string(),
+            ],
+            working_directory: None,
+            environment: vec![(HELPER_ENV.to_string(), "1".to_string())],
+        },
+        test_size(),
+        move |bytes| {
+            callback_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(bytes);
+            Vec::new()
+        },
+        move || {
+            let _ = exit_tx.send(());
+        },
+    )
+    .expect("large-tail PTY helper should start");
+
+    exit_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("large-tail helper should exit after all output is delivered");
+    let output = output
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let begin = output
+        .windows(BEGIN.len())
+        .position(|window| window == BEGIN)
+        .expect("leading marker should be delivered")
+        + BEGIN.len();
+    let end = output[begin..]
+        .windows(END.len())
+        .position(|window| window == END)
+        .map(|position| begin + position)
+        .expect("trailing marker should precede the exit callback");
+    assert_eq!(
+        end - begin,
+        TAIL_BYTES,
+        "the complete tail beyond the legacy eight MiB cap should be delivered"
+    );
+    assert!(
+        output[begin..end].iter().all(|byte| *byte == b'T'),
+        "the large tail should not be reordered or corrupted"
+    );
+    drop(output);
+    drop(terminal);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn exit_drain_is_time_bounded_for_a_live_descendant_style_source() {
+    let (reader_stream, mut writer_stream) = UnixStream::pair().expect("socket pair should open");
+    writer_stream
+        .set_nonblocking(true)
+        .expect("producer should be nonblocking");
+    let keep_writing = Arc::new(AtomicBool::new(true));
+    let producer_control = keep_writing.clone();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let producer = thread::spawn(move || {
+        let chunk = [b'D'; 32 * 1024];
+        let mut ready_reported = false;
+        while producer_control.load(Ordering::Acquire) {
+            match writer_stream.write(&chunk) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if !ready_reported {
+                        ready_reported = true;
+                        let _ = ready_tx.send(());
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::yield_now();
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("producer should queue descendant-style output");
+
+    // SAFETY: ownership of the socket fd is transferred into `reader`.
+    let mut reader = unsafe { File::from_raw_fd(reader_stream.into_raw_fd()) };
+    let mut buffer = [0u8; 32 * 1024];
+    let mut delivered = 0;
+    let started = Instant::now();
+
+    drain_ready_pty_output(&mut reader, &mut buffer, &mut |bytes| {
+        delivered += bytes.len();
+        Vec::new()
+    });
+
+    keep_writing.store(false, Ordering::Release);
+    drop(reader);
+    producer.join().expect("producer should stop cleanly");
+    assert!(delivered > 0, "the ready source should be drained");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "continuous descendant output must not indefinitely delay direct-child exit"
+    );
+}
+
+#[test]
+fn direct_child_exit_delivers_final_sentinel_before_exit_callback() {
+    const SENTINEL: &[u8] = b"TERMY_NATIVE_FINAL_SENTINEL";
+
+    let sentinel_seen = Arc::new(AtomicBool::new(false));
+    let output_sentinel_seen = sentinel_seen.clone();
+    let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+    let mut output = Vec::new();
+    let terminal = Transport::spawn(
+        SpawnConfig {
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf 'TERMY_NATIVE_FINAL_SENTINEL\\n'; exit 0".to_string(),
+            ],
+            working_directory: None,
+            environment: Vec::new(),
+        },
+        test_size(),
+        move |bytes| {
+            output.extend_from_slice(bytes);
+            if output.windows(SENTINEL.len()).any(|part| part == SENTINEL) {
+                output_sentinel_seen.store(true, Ordering::Release);
+            }
+            Vec::new()
+        },
+        move || {
+            let _ = exit_tx.send(sentinel_seen.load(Ordering::Acquire));
+        },
+    )
+    .expect("PTY should start");
+
+    assert!(
+        exit_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("exit callback should run after delivering the final sentinel"),
+        "exit callback ran before the final PTY sentinel was delivered"
+    );
+    drop(terminal);
+}
+
+#[test]
+fn direct_child_exit_is_reported_while_descendant_holds_slave_open() {
+    const MARKER: &[u8] = b"TERMY_NATIVE_DESCENDANT_READY:";
+
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let mut output = Vec::new();
+    let mut acknowledged = false;
+    let exit_count = Arc::new(AtomicUsize::new(0));
+    let callback_count = exit_count.clone();
+    let (exit_tx, exit_rx) = mpsc::channel();
+    let exit_sender_guard = exit_tx.clone();
+
+    let terminal = Transport::spawn(
+        SpawnConfig {
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                concat!(
+                    "trap '' HUP\n",
+                    "sleep 30 &\n",
+                    "printf 'TERMY_NATIVE_DESCENDANT_READY:%s\\n' \"$!\"\n",
+                    "read confirmation\n",
+                    "exit 0\n",
+                )
+                .to_string(),
+            ],
+            working_directory: None,
+            environment: Vec::new(),
+        },
+        test_size(),
+        move |bytes| {
+            output.extend_from_slice(bytes);
+            if acknowledged {
+                return Vec::new();
+            }
+
+            let Some(marker) = output.windows(MARKER.len()).position(|part| part == MARKER) else {
+                return Vec::new();
+            };
+            let pid_start = marker + MARKER.len();
+            let Some(line_length) = output[pid_start..].iter().position(|byte| *byte == b'\n')
+            else {
+                return Vec::new();
+            };
+            let pid = std::str::from_utf8(&output[pid_start..pid_start + line_length])
+                .map_err(|error| error.to_string())
+                .and_then(|text| {
+                    text.trim()
+                        .parse::<c_int>()
+                        .map_err(|error| error.to_string())
+                });
+            let _ = ready_tx.send(pid);
+            acknowledged = true;
+            b"\n".to_vec()
+        },
+        move || {
+            callback_count.fetch_add(1, Ordering::AcqRel);
+            let _ = exit_tx.send(());
+        },
+    )
+    .expect("PTY should start");
+
+    let descendant_pid = ready_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("background descendant should report its PID")
+        .expect("background descendant PID should be valid");
+    let descendant = KillProcessOnDrop(descendant_pid);
+    // Signal 0 only checks that the background descendant is still alive.
+    // SAFETY: `descendant_pid` was just reported by the direct child.
+    assert_eq!(unsafe { kill(descendant_pid, 0) }, 0);
+
+    exit_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("direct-child exit should not wait for the descendant's PTY descriptor");
+    assert!(matches!(
+        exit_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert_eq!(exit_count.load(Ordering::Acquire), 1);
+
+    drop(exit_sender_guard);
+    drop(terminal);
+    drop(descendant);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn resize_preempts_saturated_write_and_preserves_input_order() {
+    const HELPER_ENV: &str = "TERMY_NATIVE_PTY_BACKPRESSURE_TEST_HELPER";
+    const READY: &[u8] = b"TERMY_NATIVE_BACKPRESSURE_READY";
+    const WINCH: &[u8] = b"TERMY_NATIVE_BACKPRESSURE_WINCH";
+    const ORDERED: &[u8] = b"TERMY_NATIVE_BACKPRESSURE_ORDERED";
+    const WRITE_COUNT: usize = 300;
+    const CHUNK_BYTES: usize = 16 * 1024;
+
+    fn identifiable_write(index: usize) -> Vec<u8> {
+        let mut bytes = vec![(index % 251) as u8; CHUNK_BYTES];
+        bytes[..size_of::<u32>()].copy_from_slice(&(index as u32).to_le_bytes());
+        bytes
+    }
+
+    if std::env::var_os(HELPER_ENV).as_deref() == Some(OsStr::new("1")) {
+        let mut input = io::stdin().lock();
+        let mut chunk = vec![0; CHUNK_BYTES];
+        for index in 0..WRITE_COUNT {
+            input
+                .read_exact(&mut chunk)
+                .unwrap_or_else(|error| panic!("helper did not receive write {index}: {error}"));
+            assert!(
+                chunk == identifiable_write(index),
+                "write {index} was reordered or corrupted"
+            );
+        }
+        io::stdout()
+            .write_all(ORDERED)
+            .expect("helper should report ordered input");
+        io::stdout()
+            .flush()
+            .expect("helper should flush its ordered-input marker");
+        return;
+    }
+
+    let executable = std::env::current_exe().expect("test executable should exist");
+    let script = concat!(
+        "stty raw -echo\n",
+        "resized=\n",
+        "trap 'resized=1; printf TERMY_NATIVE_BACKPRESSURE_WINCH' WINCH\n",
+        "printf TERMY_NATIVE_BACKPRESSURE_READY\n",
+        "while [ -z \"$resized\" ]; do :; done\n",
+        "exec \"$1\" \"$2\" --exact --nocapture\n",
+    );
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (winch_tx, winch_rx) = mpsc::sync_channel(1);
+    let (ordered_tx, ordered_rx) = mpsc::sync_channel(1);
+    let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+    let mut output = Vec::new();
+    let mut ready_reported = false;
+    let mut winch_reported = false;
+    let mut ordered_reported = false;
+    let terminal = Transport::spawn(
+        SpawnConfig {
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                script.to_string(),
+                "termy-native-backpressure-probe".to_string(),
+                executable.to_string_lossy().into_owned(),
+                "terminal_engine::transport::unix::tests::process::resize_preempts_saturated_write_and_preserves_input_order"
+                    .to_string(),
+            ],
+            working_directory: None,
+            environment: vec![(HELPER_ENV.to_string(), "1".to_string())],
+        },
+        test_size(),
+        move |bytes| {
+            output.extend_from_slice(bytes);
+            if !ready_reported && output.windows(READY.len()).any(|part| part == READY) {
+                ready_reported = true;
+                let _ = ready_tx.send(());
+            }
+            if !winch_reported && output.windows(WINCH.len()).any(|part| part == WINCH) {
+                winch_reported = true;
+                let _ = winch_tx.send(());
+            }
+            if !ordered_reported && output.windows(ORDERED.len()).any(|part| part == ORDERED) {
+                ordered_reported = true;
+                let _ = ordered_tx.send(());
+            }
+            Vec::new()
+        },
+        move || {
+            let _ = exit_tx.send(());
+        },
+    )
+    .expect("backpressure PTY should start");
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("child should stop reading after configuring its PTY");
+    for index in 0..WRITE_COUNT {
+        terminal
+            .write_owned(identifiable_write(index))
+            .unwrap_or_else(|error| panic!("write {index} should queue: {error}"));
+    }
+    terminal
+        .resize(PtySize {
+            cols: 100,
+            ..test_size()
+        })
+        .expect("resize should be published outside the write backlog");
+
+    winch_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("resize should preempt the saturated write");
+    ordered_rx
+        .recv_timeout(Duration::from_secs(8))
+        .expect("queued input should retain byte order after backpressure clears");
+    exit_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("ordering helper should exit after reading all input");
+    drop(terminal);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn canonical_unicode_erase_uses_iutf8() {
+    const READY: &[u8] = b"TERMY_NATIVE_IUTF8_READY";
+    const RESULT: &[u8] = b"TERMY_NATIVE_IUTF8_RESULT:";
+
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let (exit_tx, exit_rx) = mpsc::channel();
+    let mut output = Vec::new();
+    let mut input_sent = false;
+    let mut result_sent = false;
+    let terminal = Transport::spawn(
+        SpawnConfig {
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                concat!(
+                    "stty -echo erase '^?'\n",
+                    "printf TERMY_NATIVE_IUTF8_READY\n",
+                    "IFS= read -r line\n",
+                    "printf 'TERMY_NATIVE_IUTF8_RESULT:%s\\n' \"$line\"\n",
+                    "read confirmation\n",
+                )
+                .to_string(),
+            ],
+            working_directory: None,
+            environment: Vec::new(),
+        },
+        test_size(),
+        move |bytes| {
+            output.extend_from_slice(bytes);
+            let mut reply = Vec::new();
+            if !input_sent && output.windows(READY.len()).any(|part| part == READY) {
+                input_sent = true;
+                // Canonical erase should remove the complete two-byte `é`,
+                // leaving only `X` for the shell's read.
+                reply.extend_from_slice(&[0xc3, 0xa9, 0x7f, b'X', b'\n']);
+            }
+
+            if !result_sent
+                && let Some(marker) = output.windows(RESULT.len()).position(|part| part == RESULT)
+            {
+                let value_start = marker + RESULT.len();
+                if let Some(line_length) =
+                    output[value_start..].iter().position(|byte| *byte == b'\n')
+                {
+                    let mut value = output[value_start..value_start + line_length].to_vec();
+                    if value.last() == Some(&b'\r') {
+                        value.pop();
+                    }
+                    let _ = result_tx.send(value);
+                    result_sent = true;
+                    reply.push(b'\n');
+                }
+            }
+            reply
+        },
+        move || {
+            let _ = exit_tx.send(());
+        },
+    )
+    .expect("PTY should start");
+
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("child should report the canonical input"),
+        b"X"
+    );
+    exit_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("child should exit after the result acknowledgment");
+    drop(terminal);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SignalObservation {
+    Ready,
+    Survived,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn child_resets_inherited_ignored_signals() {
+    const HELPER_ENV: &str = "TERMY_NATIVE_SIGNAL_RESET_TEST_HELPER";
+    let (signal_number, signal_name) = match std::env::var(HELPER_ENV).as_deref() {
+        Ok("TERM") => (SIGTERM, "TERM"),
+        Ok("PIPE") => (SIGPIPE, "PIPE"),
+        // Not in the old fixed reset list: every disposition is reset now.
+        Ok("USR1") => (libc::SIGUSR1, "USR1"),
+        _ => {
+            for signal_name in ["TERM", "PIPE", "USR1"] {
+                let status = Command::new(std::env::current_exe().expect("test executable should exist"))
+                    .arg("terminal_engine::transport::unix::tests::process::child_resets_inherited_ignored_signals")
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .env(HELPER_ENV, signal_name)
+                    .status()
+                    .expect("isolated signal test should start");
+                assert!(
+                    status.success(),
+                    "isolated SIG{signal_name} test failed: {status}"
+                );
+            }
+            return;
+        }
+    };
+
+    const READY: &[u8] = b"TERMY_NATIVE_SIGNAL_READY";
+    const SURVIVED: &[u8] = b"TERMY_NATIVE_SIGNAL_SURVIVED";
+    let (observation_tx, observation_rx) = mpsc::channel();
+    let (exit_tx, exit_rx) = mpsc::channel();
+    let mut output = Vec::new();
+    let mut ready_acknowledged = false;
+    let mut survived_acknowledged = false;
+    let config = SpawnConfig {
+        program: "/bin/sh".to_string(),
+        args: vec![
+            "-c".to_string(),
+            format!(
+                concat!(
+                    "printf TERMY_NATIVE_SIGNAL_READY\n",
+                    "read ready\n",
+                    "kill -{} $$\n",
+                    "printf TERMY_NATIVE_SIGNAL_SURVIVED\n",
+                    "read survived\n",
+                ),
+                signal_name,
+            ),
+        ],
+        working_directory: None,
+        environment: Vec::new(),
+    };
+
+    // This process is an isolated test helper, so temporarily changing its
+    // process-wide disposition cannot interfere with the main test runner.
+    // SAFETY: SIG_IGN is the POSIX sentinel value, and the exact prior
+    // disposition is restored immediately after forkpty returns.
+    let previous = unsafe { signal(signal_number, SIGNAL_IGNORE) };
+    assert_ne!(
+        previous, SIGNAL_ERROR,
+        "ignoring SIG{signal_name} should succeed"
+    );
+    let terminal = Transport::spawn(
+        config,
+        test_size(),
+        move |bytes| {
+            output.extend_from_slice(bytes);
+            if !ready_acknowledged && output.windows(READY.len()).any(|part| part == READY) {
+                ready_acknowledged = true;
+                let _ = observation_tx.send(SignalObservation::Ready);
+                return b"\n".to_vec();
+            }
+            if !survived_acknowledged && output.windows(SURVIVED.len()).any(|part| part == SURVIVED)
+            {
+                survived_acknowledged = true;
+                let _ = observation_tx.send(SignalObservation::Survived);
+                return b"\n".to_vec();
+            }
+            Vec::new()
+        },
+        move || {
+            let _ = exit_tx.send(());
+        },
+    );
+    // SAFETY: `previous` is the handler returned by the successful signal call above.
+    let restore_result = unsafe { signal(signal_number, previous) };
+    assert_ne!(
+        restore_result, SIGNAL_ERROR,
+        "restoring SIG{signal_name} should succeed"
+    );
+    let terminal = terminal.expect("PTY should start");
+
+    assert_eq!(
+        observation_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("child should reach the pre-signal handshake"),
+        SignalObservation::Ready
+    );
+    exit_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the signal should terminate the child promptly");
+    assert_ne!(
+        observation_rx.try_recv(),
+        Ok(SignalObservation::Survived),
+        "the child inherited SIG_IGN instead of resetting SIG{signal_name}"
+    );
+    drop(terminal);
+}
+
+#[test]
+fn child_environment_without_inheritance_contains_only_overrides() {
+    let environment = child_environment(&[("ONLY".to_string(), "1".to_string())], None, false)
+        .expect("environment should build");
+    let entries = environment
+        .iter()
+        .map(|entry| entry.to_bytes().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, vec![b"ONLY=1".to_vec()]);
+}
+
+#[test]
+fn spawn_with_exit_reports_exit_codes_and_signals() {
+    let spawn = |script: &str| {
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let terminal = Transport::spawn_with_exit(
+            SpawnConfig {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), script.to_string()],
+                working_directory: None,
+                environment: Vec::new(),
+            },
+            PtySize {
+                cols: 80,
+                rows: 24,
+                cell_width: 0.0,
+                cell_height: 0.0,
+            },
+            true,
+            |_| Vec::new(),
+            move |exit| {
+                let _ = exit_tx.send(exit);
+            },
+        )
+        .expect("shell should start");
+        (terminal, exit_rx)
+    };
+
+    let (_terminal, exit_rx) = spawn("exit 7");
+    let exit = exit_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("child should exit");
+    assert_eq!(
+        exit,
+        ChildExit {
+            code: Some(7),
+            signal: None
+        }
+    );
+
+    let (terminal, exit_rx) = spawn("sleep 30");
+    terminal.signal(15).expect("signal should be delivered");
+    let exit = exit_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("child should exit after SIGTERM");
+    assert_eq!(
+        exit,
+        ChildExit {
+            code: None,
+            signal: Some(15)
+        }
+    );
+}
+
+#[test]
+fn foreground_process_name_reports_the_running_program() {
+    let terminal = Transport::spawn(
+        SpawnConfig {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "exec sleep 30".to_string()],
+            working_directory: None,
+            environment: Vec::new(),
+        },
+        PtySize {
+            cols: 80,
+            rows: 24,
+            cell_width: 0.0,
+            cell_height: 0.0,
+        },
+        |_| Vec::new(),
+        || {},
+    )
+    .expect("shell should start");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if terminal.foreground_process_name().as_deref() == Some("sleep") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "foreground process should become sleep"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn child_does_not_inherit_descriptors_without_close_on_exec() {
+    // Libraries in the GUI process can open descriptors without O_CLOEXEC;
+    // none of them may reach the shell or its descendants.
+    let leaked = File::open("/dev/null").expect("open /dev/null");
+    // SAFETY: clearing FD_CLOEXEC on an owned, valid descriptor.
+    assert_eq!(unsafe { fcntl(leaked.as_raw_fd(), F_SETFD, 0) }, 0);
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+    let terminal = Transport::spawn(
+        SpawnConfig {
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!(
+                    "[ -e /dev/fd/{0} ] && printf LEAKED || printf CLEAN",
+                    leaked.as_raw_fd()
+                ),
+            ],
+            working_directory: None,
+            environment: Vec::new(),
+        },
+        test_size(),
+        {
+            let output = output.clone();
+            move |bytes| {
+                output.lock().unwrap().extend_from_slice(bytes);
+                Vec::new()
+            }
+        },
+        move || {
+            let _ = exit_tx.send(());
+        },
+    )
+    .expect("PTY child should start");
+    exit_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("child should exit");
+    drop(terminal);
+    let output = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
+    assert!(output.contains("CLEAN"), "{output:?}");
+}
+
+#[test]
+fn child_environment_drops_the_parent_terminals_identity() {
+    for name in [
+        "TMUX",
+        "COLUMNS",
+        "VSCODE_INJECTION",
+        "KITTY_WINDOW_ID",
+        "COLORTERM",
+        "TERM_PROGRAM_VERSION",
+        "LC_TERMINAL",
+        "WEZTERM_EXECUTABLE",
+        "TERMY_MUX_PANE",
+    ] {
+        assert!(
+            crate::terminal_engine::transport::belongs_to_parent_terminal(OsStr::new(name)),
+            "{name}"
+        );
+    }
+    for name in [
+        "HOME",
+        "PATH",
+        "TERM",
+        "TERM_PROGRAM",
+        "TMUX_TMPDIR",
+        "LC_ALL",
+        "LANG",
+    ] {
+        assert!(
+            !crate::terminal_engine::transport::belongs_to_parent_terminal(OsStr::new(name)),
+            "{name}"
+        );
+    }
+    // Explicit overrides still win.
+    let environment = child_environment(&[("TMUX".into(), "kept".into())], None, true).unwrap();
+    assert!(
+        environment
+            .iter()
+            .any(|entry| entry.as_bytes() == b"TMUX=kept")
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn dropping_after_the_child_exited_does_not_raise_sigpipe() {
+    // C and Swift hosts keep SIGPIPE at its default, which kills the process.
+    // Run in an isolated helper so the main runner keeps ignoring it.
+    const HELPER_ENV: &str = "TERMY_NATIVE_SIGPIPE_TEST_HELPER";
+    const SIGNAL_DEFAULT: usize = 0;
+    if std::env::var_os(HELPER_ENV).is_none() {
+        let status = Command::new(std::env::current_exe().expect("test executable should exist"))
+            .arg("terminal_engine::transport::unix::tests::process::dropping_after_the_child_exited_does_not_raise_sigpipe")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(HELPER_ENV, "1")
+            .status()
+            .expect("isolated SIGPIPE test should start");
+        assert!(status.success(), "isolated SIGPIPE test failed: {status}");
+        return;
+    }
+
+    // SAFETY: this process is an isolated helper; SIG_DFL is the POSIX sentinel.
+    let previous = unsafe { signal(SIGPIPE, SIGNAL_DEFAULT) };
+    assert_ne!(previous, SIGNAL_ERROR, "resetting SIGPIPE should succeed");
+    let (exit_tx, exit_rx) = mpsc::channel();
+    let terminal = Transport::spawn(
+        SpawnConfig {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            working_directory: None,
+            environment: Vec::new(),
+        },
+        test_size(),
+        |_| Vec::new(),
+        move || {
+            let _ = exit_tx.send(());
+        },
+    )
+    .expect("PTY should start");
+    exit_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("child should exit");
+    // Let the writer thread see the close and drop its end of the wake socket.
+    thread::sleep(Duration::from_millis(200));
+    drop(terminal);
+    thread::sleep(Duration::from_millis(100));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_reply_during_the_drop_grace_keeps_the_hup_handler_running() {
+    const READY: &[u8] = b"TERMY_NATIVE_HUP_QUERY_READY";
+    const QUERY: &[u8] = b"\x1b[c";
+    let directory = TestDirectory::new("hup-query");
+    let marker = directory.path().join("handled");
+    let release = directory.path().join("release");
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (query_tx, query_rx) = mpsc::sync_channel(1);
+    let mut output = Vec::new();
+    let mut ready_reported = false;
+    let mut query_reported = false;
+    // The handler spins on builtins until the test releases it, so it stays
+    // inside the drop grace without a fixed sleep. The grace is lengthened so
+    // a loaded runner can't stretch the handshake past it.
+    let mut terminal = Transport::spawn(
+        SpawnConfig {
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!(
+                    "trap 'printf \"\\033[c\"; while [ ! -e \"{}\" ]; do :; done; : > \"{}\"; exit 0' HUP; printf TERMY_NATIVE_HUP_QUERY_READY; while :; do sleep 0.02; done",
+                    release.display(),
+                    marker.display()
+                ),
+            ],
+            working_directory: None,
+            environment: Vec::new(),
+        },
+        test_size(),
+        move |bytes| {
+            output.extend_from_slice(bytes);
+            if !ready_reported && output.windows(READY.len()).any(|part| part == READY) {
+                ready_reported = true;
+                let _ = ready_tx.send(());
+            }
+            if !query_reported && output.windows(QUERY.len()).any(|part| part == QUERY) {
+                query_reported = true;
+                let _ = query_tx.send(());
+            }
+            // Every chunk "answers" a query, like the engine replying to DA1.
+            b"\x1b[?62c".to_vec()
+        },
+        || {},
+    )
+    .expect("PTY should start");
+    terminal.set_drop_grace(Duration::from_secs(5));
+    let cleanup = KillProcessOnDrop(terminal.child_pid);
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("child should install its HUP handler");
+    drop(terminal);
+    query_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the HUP handler should print its query");
+    // Give the reader time to queue the reply against the closed writer.
+    thread::sleep(Duration::from_millis(20));
+    std::fs::write(&release, b"").expect("release file should be written");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(cleanup);
+    assert!(
+        marker.exists(),
+        "the HUP handler was killed before it finished"
+    );
+}
+
+#[test]
+fn a_failed_wait_reports_an_unknown_exit_instead_of_success() {
+    // Hosts that ignore SIGCHLD or reap with waitpid(-1) make our wait fail
+    // with ECHILD; pid 1 is never our child, which gives the same error.
+    assert_eq!(wait_for_child(1), None);
+    assert_eq!(
+        wait_for_child(1).map_or_default(child_exit_from_wait_status),
+        ChildExit::default()
+    );
+}
+
+// macOS only: the exact descriptor arrangement depends on how many fds the
+// platform's openpty uses, which was only verified there.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_child_setup_failure_is_reported_instead_of_looking_like_a_spawn() {
+    // The child moves a status endpoint that landed on stdin/stdout above
+    // stderr. With the descriptor table full that fails, and the failure must
+    // reach the parent. Run isolated: this rearranges the process's fds.
+    const HELPER_ENV: &str = "TERMY_NATIVE_CHILD_EMFILE_TEST_HELPER";
+    if std::env::var_os(HELPER_ENV).is_none() {
+        let output = Command::new(std::env::current_exe().expect("test executable should exist"))
+            .arg("terminal_engine::transport::unix::tests::process::a_child_setup_failure_is_reported_instead_of_looking_like_a_spawn")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(HELPER_ENV, "1")
+            .output()
+            .expect("isolated descriptor test should start");
+        assert!(
+            output.status.success(),
+            "isolated descriptor test failed: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    // SAFETY: raw descriptor and rlimit calls on this isolated helper only.
+    unsafe {
+        let mut limit = std::mem::zeroed::<libc::rlimit>();
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+        limit.rlim_cur = 64;
+        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+        let mut filler = Vec::new();
+        loop {
+            let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+            if fd < 0 {
+                break;
+            }
+            filler.push(fd);
+        }
+        // Free stdin and stdout for the status pair, and two slots for the
+        // PTY pair; the forked child then has no slot above stderr left.
+        let _ = close(0);
+        let _ = close(1);
+        for fd in filler.iter().rev().take(2) {
+            let _ = close(*fd);
+        }
+    }
+    let error = Transport::spawn(
+        SpawnConfig {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            working_directory: None,
+            environment: Vec::new(),
+        },
+        test_size(),
+        |_| Vec::new(),
+        || {},
+    )
+    .err()
+    .expect("a child that cannot set up its terminal must fail the spawn");
+    assert!(
+        error
+            .to_string()
+            .contains("attach terminal as controlling tty"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_reply_to_a_closed_writer_leaves_the_child_running() {
+    const READY: &[u8] = b"TERMY_NATIVE_CLOSED_REPLY_READY";
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let mut output = Vec::new();
+    let mut ready_reported = false;
+    let terminal = Transport::spawn(
+        SpawnConfig {
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf TERMY_NATIVE_CLOSED_REPLY_READY; exec sleep 30".to_string(),
+            ],
+            working_directory: None,
+            environment: Vec::new(),
+        },
+        test_size(),
+        move |bytes| {
+            output.extend_from_slice(bytes);
+            if !ready_reported && output.windows(READY.len()).any(|part| part == READY) {
+                ready_reported = true;
+                let _ = ready_tx.send(());
+            }
+            Vec::new()
+        },
+        || {},
+    )
+    .expect("PTY should start");
+    let cleanup = KillProcessOnDrop(terminal.child_pid);
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("child should start");
+    // A writer thread that stopped, as after a failed write.
+    terminal.writer.close();
+    let error = terminal
+        .write_protocol_reply_owned(b"\x1b[?62c".to_vec())
+        .expect_err("a closed writer rejects the reply");
+    assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        terminal.alive.is_alive(),
+        "a rejected reply killed the child without a SIGHUP grace"
+    );
+    drop(terminal);
+    drop(cleanup);
+}
+
+#[test]
+fn absolute_path_entries_resolve_without_a_working_directory() {
+    let config = SpawnConfig {
+        program: "sh".to_string(),
+        args: Vec::new(),
+        working_directory: None,
+        environment: vec![("PATH".to_string(), "/usr/bin:/bin".to_string())],
+    };
+    // As when the parent's working directory was deleted.
+    let deleted = || Err(io::Error::from_raw_os_error(2));
+    let resolved = resolve_program_from(&config, deleted).expect("absolute PATH should resolve");
+    assert!(resolved.is_absolute());
+    // Relative entries are skipped, as `execvp` skips them.
+    let config = SpawnConfig {
+        environment: vec![("PATH".to_string(), "bin:/usr/bin:/bin".to_string())],
+        ..config
+    };
+    assert_eq!(resolve_program_from(&config, deleted).ok(), Some(resolved));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_watcher_sees_an_exit_before_the_pid_is_released() {
+    let child = Command::new("/bin/sh")
+        .args(["-c", "exit 3"])
+        .spawn()
+        .expect("child should start");
+    let pid = child.id() as c_int;
+    assert!(wait_for_child_exit(pid));
+    // Still a zombie: the PID can't be reused before the reap below.
+    // SAFETY: signal 0 only checks that `pid`, this test's child, exists.
+    assert_eq!(unsafe { kill(pid, 0) }, 0);
+    let status = wait_for_child(pid).expect("the exit is still reapable");
+    assert_eq!(child_exit_from_wait_status(status).code, Some(3));
+    // Reaped here, so `child` must not be waited on again.
+    std::mem::forget(child);
+}

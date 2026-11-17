@@ -1,6 +1,24 @@
 use super::*;
+use crate::ui::native::{NativePalette, tile_gradient, with_alpha};
+use gpui_kit::rgba;
 
 impl SettingsWindow {
+    /// AppKit semantic colors for this window, picked from the theme ground
+    /// so light themes get the light appearance.
+    pub(super) fn native(&self) -> NativePalette {
+        NativePalette::for_background(self.colors.background)
+            .with_increased_contrast(self.config.chrome_contrast)
+    }
+
+    /// The opaque surface under the material, as `windowBackgroundColor`.
+    fn native_surface(&self) -> Rgba {
+        if self.native().dark {
+            rgba(0x1e1e1eff)
+        } else {
+            rgba(0xecececff)
+        }
+    }
+
     pub(super) fn background_opacity_factor(&self) -> f32 {
         self.effective_background_opacity()
     }
@@ -22,17 +40,6 @@ impl SettingsWindow {
             .clamp(0.0, 1.0)
     }
 
-    fn scaled_chrome_surface_alpha(&self, base_alpha: f32) -> f32 {
-        self.scaled_background_alpha(self.chrome_contrast_profile().surface_alpha(base_alpha))
-    }
-
-    fn scaled_chrome_neutral_alpha(&self, base_alpha: f32) -> f32 {
-        self.scaled_background_alpha(
-            self.chrome_contrast_profile()
-                .panel_neutral_alpha(base_alpha),
-        )
-    }
-
     fn scaled_chrome_accent_alpha(&self, base_alpha: f32) -> f32 {
         self.scaled_background_alpha(
             self.chrome_contrast_profile()
@@ -51,119 +58,177 @@ impl SettingsWindow {
         }
     }
 
+    /// The content pane, `windowBackgroundColor` under the window's opacity.
     pub(super) fn bg_primary(&self) -> Rgba {
-        let mut c = self.colors.background;
-        c.a = self.scaled_background_alpha(c.a);
+        let mut c = self.native_surface();
+        c.a = self.scaled_background_alpha(1.0);
         c
     }
 
+    /// The sidebar, a step darker than the content as in System Settings.
     pub(super) fn bg_secondary(&self) -> Rgba {
-        let mut c = self.colors.background;
-        c.a = self.adaptive_chrome_panel_alpha(0.7);
+        let native = self.native();
+        let overlay = if native.dark {
+            rgba(0x00000033)
+        } else {
+            rgba(0x0000000a)
+        };
+        let mut c = Self::composite_over(overlay, self.native_surface());
+        c.a = self.adaptive_chrome_panel_alpha(0.92);
         c
     }
 
     pub(super) fn bg_card(&self) -> Rgba {
-        let mut c = self.colors.background;
-        c.a = self.adaptive_chrome_panel_alpha(0.5);
-        c
+        self.bg_primary()
     }
 
-    pub(super) fn icon_color(&self, active: bool) -> Rgba {
-        if active {
-            self.accent()
+    /// A grouped form section, `quaternarySystemFill` over the window.
+    pub(super) fn bg_elevated(&self) -> Rgba {
+        self.native().group
+    }
+
+    /// The hairline around a grouped section.
+    pub(super) fn card_border_color(&self) -> Rgba {
+        self.native().separator
+    }
+
+    /// Hairline between rows inside a grouped section.
+    pub(super) fn row_separator_color(&self) -> Rgba {
+        self.native().separator
+    }
+
+    /// The selected sidebar row, filled with the accent as in System Settings.
+    pub(super) fn sidebar_selection_bg(&self) -> Rgba {
+        self.native().blue
+    }
+
+    /// `textBackgroundColor` for fields sitting inside a grouped section.
+    /// Opaque, so a focus ring drawn around a field never tints through it.
+    pub(super) fn bg_input(&self) -> Rgba {
+        let native = self.native();
+        if native.dark {
+            let group = Self::composite_over(native.group, self.native_surface());
+            Self::composite_over(rgba(0xffffff0d), group)
         } else {
-            self.text_secondary()
+            rgba(0xffffffff)
         }
     }
 
-    pub(super) fn bg_elevated(&self) -> Rgba {
-        let mut c = self.colors.foreground;
-        c.a = self.scaled_chrome_surface_alpha(0.045);
-        c
-    }
-
-    pub(super) fn divider_color(&self) -> Rgba {
-        let mut c = self.colors.foreground;
-        c.a = self.scaled_chrome_neutral_alpha(0.10);
-        c
-    }
-
-    /// Soft outline for grouped setting cards — lighter than `border_color` so
-    /// cards read as a gentle inset surface rather than a boxed-in panel.
-    pub(super) fn card_border_color(&self) -> Rgba {
-        let mut c = self.colors.foreground;
-        c.a = self.scaled_chrome_neutral_alpha(0.14);
-        c
-    }
-
-    /// Hairline between rows inside a card. Subtler than the card outline so the
-    /// inset separators recede the way native macOS grouped lists do.
-    pub(super) fn row_separator_color(&self) -> Rgba {
-        let mut c = self.colors.foreground;
-        c.a = self.scaled_chrome_neutral_alpha(0.08);
-        c
-    }
-
-    /// Accent-tinted fill behind the selected sidebar item.
-    pub(super) fn sidebar_selection_bg(&self) -> Rgba {
-        self.accent_with_alpha(0.16)
-    }
-
-    pub(super) fn bg_input(&self) -> Rgba {
-        let mut c = self.colors.background;
-        c.a = self.adaptive_chrome_panel_alpha(0.36);
-        c
-    }
-
     pub(super) fn bg_hover(&self) -> Rgba {
-        let mut c = self.colors.foreground;
-        c.a = self.scaled_chrome_surface_alpha(0.1);
-        c
+        self.native().fill
     }
 
     pub(super) fn text_primary(&self) -> Rgba {
-        self.colors.foreground
+        self.native().label
     }
 
+    /// Body text one step below the label, for unselected sidebar rows.
     pub(super) fn text_secondary(&self) -> Rgba {
-        let mut c = self.colors.foreground;
-        c.a = 0.82;
-        c
+        let native = self.native();
+        with_alpha(native.label, native.label.a * 0.86)
     }
 
     pub(super) fn text_muted(&self) -> Rgba {
-        let mut c = self.colors.foreground;
-        c.a = 0.68;
-        c
+        self.native().secondary
     }
 
     pub(super) fn border_color(&self) -> Rgba {
-        let mut c = self.colors.foreground;
-        c.a = self.scaled_chrome_neutral_alpha(0.24);
-        c
+        self.native().stroke
     }
 
     pub(super) fn accent(&self) -> Rgba {
-        self.colors.cursor
+        self.native().blue
     }
 
     pub(super) fn accent_with_alpha(&self, alpha: f32) -> Rgba {
-        let mut c = self.colors.cursor;
-        c.a = self.scaled_chrome_accent_alpha(alpha);
-        c
+        with_alpha(self.native().blue, self.scaled_chrome_accent_alpha(alpha))
+    }
+
+    /// The focus ring macOS draws around a focused text field or search box.
+    pub(super) fn input_focus_ring(&self) -> Rgba {
+        with_alpha(self.native().blue, 0.5)
+    }
+
+    /// Zero-blur spread shadow that reads as a focus ring around a control.
+    pub(super) fn focus_ring_shadow(color: Rgba) -> gpui_kit::BoxShadow {
+        gpui_kit::BoxShadow {
+            inset: false,
+            color: color.into(),
+            offset: point(px(0.0), px(0.0)),
+            blur_radius: px(0.0),
+            spread_radius: px(SETTINGS_INPUT_FOCUS_RING_WIDTH),
+        }
+    }
+
+    /// Colour that identifies a section across the sidebar and its header.
+    /// Pulled from the active theme's ANSI palette so every theme keeps the
+    /// tiles readable; the two neutral sections use the foreground instead.
+    pub(super) fn section_tint(&self, section: SettingsSection) -> Rgba {
+        let native = self.native();
+        match section {
+            SettingsSection::Advanced | SettingsSection::Keybindings => native.gray,
+            SettingsSection::Appearance => native.blue,
+            SettingsSection::Colors => native.red,
+            SettingsSection::Plugins => native.orange,
+            SettingsSection::Terminal => rgba(0x3a3a3cff),
+            SettingsSection::Ssh => native.green,
+            SettingsSection::Tabs => rgba(0x5ac8faff),
+        }
+    }
+
+    /// Tiles are solid system colors with a white glyph, like the rows in
+    /// System Settings.
+    pub(super) fn section_tile_bg(&self, section: SettingsSection, _emphasized: bool) -> Rgba {
+        self.section_tint(section)
+    }
+
+    pub(super) fn section_tile_icon(&self, _section: SettingsSection) -> Rgba {
+        self.native().on_accent
+    }
+
+    /// Rounded, tinted square holding a section glyph.
+    pub(super) fn render_section_tile(
+        &self,
+        section: SettingsSection,
+        tile_size: f32,
+        tile_radius: f32,
+        icon_size: f32,
+        emphasized: bool,
+    ) -> gpui_kit::Div {
+        div()
+            .flex_none()
+            .w(px(tile_size))
+            .h(px(tile_size))
+            .rounded(px(tile_radius))
+            .bg(tile_gradient(self.section_tile_bg(section, emphasized)))
+            .shadow(vec![gpui_kit::BoxShadow {
+                inset: false,
+                color: gpui_kit::black().opacity(0.18),
+                offset: point(px(0.0), px(0.5)),
+                blur_radius: px(1.0),
+                spread_radius: px(0.0),
+            }])
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                svg()
+                    .path(SharedString::from(Self::section_icon_path(section)))
+                    .size(px(icon_size))
+                    .text_color(self.section_tile_icon(section)),
+            )
     }
 
     /// Projects this window's live chrome colors onto the shared design-system
     /// tokens.
     ///
     /// Every value comes from the helpers above rather than from
-    /// `termy_ui::Tokens::from_palette`, because those helpers already fold in
+    /// `crate::design_system::Tokens::from_palette`, because those helpers already fold in
     /// background opacity, the opacity preview, and the chrome-contrast profile.
     /// Deriving tokens from the raw palette instead would paint opaque surfaces
     /// and quietly drop the window's translucency.
-    pub(super) fn ui_tokens(&self) -> termy_ui::Tokens {
-        termy_ui::Tokens {
+    pub(super) fn ui_tokens(&self) -> crate::design_system::Tokens {
+        crate::design_system::Tokens {
             bg_window: self.bg_primary(),
             bg_panel: self.bg_secondary(),
             // Cards in this window ride the elevated surface, not `bg_card()`,
@@ -195,21 +260,16 @@ impl SettingsWindow {
     /// nothing changed so a repaint does not churn the global.
     pub(super) fn sync_ui_tokens(&self, cx: &mut Context<Self>) {
         let tokens = self.ui_tokens();
-        termy_ui::sync_glassy_theme(&tokens, cx);
-        if cx.try_global::<termy_ui::Tokens>() != Some(&tokens) {
-            termy_ui::set_tokens(tokens, cx);
+        if cx.try_global::<crate::design_system::Tokens>() != Some(&tokens) {
+            crate::design_system::set_tokens(tokens, cx);
         }
     }
 
     pub(super) fn settings_scrollbar_style(&self) -> ScrollbarPaintStyle {
-        let mut track = self.colors.foreground;
-        track.a = self.scaled_chrome_neutral_alpha(SETTINGS_SCROLLBAR_TRACK_ALPHA);
-
-        let mut thumb = self.colors.foreground;
-        thumb.a = self.scaled_chrome_neutral_alpha(SETTINGS_SCROLLBAR_THUMB_ALPHA);
-
-        let mut active_thumb = self.colors.foreground;
-        active_thumb.a = self.scaled_chrome_neutral_alpha(SETTINGS_SCROLLBAR_THUMB_ACTIVE_ALPHA);
+        let label = self.native().label;
+        let track = with_alpha(label, SETTINGS_SCROLLBAR_TRACK_ALPHA * 0.5);
+        let thumb = with_alpha(label, SETTINGS_SCROLLBAR_THUMB_ALPHA);
+        let active_thumb = with_alpha(label, SETTINGS_SCROLLBAR_THUMB_ACTIVE_ALPHA);
 
         ScrollbarPaintStyle {
             width: SETTINGS_SCROLLBAR_WIDTH,
@@ -228,7 +288,7 @@ impl SettingsWindow {
 
     pub(super) fn settings_scrollbar_range(&self, window: &Window) -> ScrollbarRange {
         let viewport_height: f32 = window.viewport_size().height.into();
-        let max_offset: f32 = self.content_scroll_handle.max_offset().height.into();
+        let max_offset: f32 = self.content_scroll_handle.max_offset().y.into();
         let offset_y: f32 = self.content_scroll_handle.offset().y.into();
         let offset = (-offset_y).max(0.0);
         ScrollbarRange {

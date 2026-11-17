@@ -1,16 +1,19 @@
 use crate::text_editing;
-use gpui::{
+use gpui_kit::{
     Bounds, ElementInputHandler, Entity, EntityInputHandler, Font, Hsla, IntoElement, PaintQuad,
     Pixels, ShapedLine, Styled, TextRun, UTF16Selection, UnderlineStyle, canvas, fill, point, px,
     size,
 };
 use std::ops::Range;
 
+mod inline;
 mod multiline;
+
+pub(crate) use inline::InlineInputState;
 
 pub use multiline::MultilineTextInputElement;
 
-const INLINE_INPUT_LINE_HEIGHT_MULTIPLIER: f32 = 1.35;
+pub(crate) const INLINE_INPUT_LINE_HEIGHT_MULTIPLIER: f32 = 1.35;
 
 /// Shared text input state for single-line and multiline text fields.
 #[derive(Clone, Debug)]
@@ -26,7 +29,6 @@ pub struct TextInputState {
     last_line_layouts: Vec<Option<ShapedLine>>,
 }
 
-#[allow(dead_code)]
 impl TextInputState {
     pub fn new(text: String) -> Self {
         let mut state = Self {
@@ -56,8 +58,13 @@ impl TextInputState {
         self.move_to_end();
     }
 
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.set_text(String::new());
+    }
+
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        (!self.selected_range.is_empty())
+            .then(|| self.text[self.selected_range.clone()].to_string())
     }
 
     pub fn move_to_end(&mut self) {
@@ -415,7 +422,7 @@ impl TextInputState {
             .map(|range| self.range_to_utf16(range))
     }
 
-    pub fn character_index_for_point(&self, point: gpui::Point<Pixels>) -> usize {
+    pub fn character_index_for_point(&self, point: gpui_kit::Point<Pixels>) -> usize {
         if self.text.is_empty() {
             return 0;
         }
@@ -536,7 +543,7 @@ pub struct TextInputPrepaintState {
 
 pub struct TextInputElement<V: TextInputProvider> {
     view: Entity<V>,
-    focus_handle: gpui::FocusHandle,
+    focus_handle: gpui_kit::FocusHandle,
     font: Font,
     font_size: Pixels,
     text_color: Hsla,
@@ -547,7 +554,7 @@ pub struct TextInputElement<V: TextInputProvider> {
 impl<V: TextInputProvider> TextInputElement<V> {
     pub fn new(
         view: Entity<V>,
-        focus_handle: gpui::FocusHandle,
+        focus_handle: gpui_kit::FocusHandle,
         font: Font,
         font_size: Pixels,
         text_color: Hsla,
@@ -566,8 +573,10 @@ impl<V: TextInputProvider> TextInputElement<V> {
     }
 }
 
-impl<V: TextInputProvider + gpui::Render + EntityInputHandler> IntoElement for TextInputElement<V> {
-    type Element = gpui::Canvas<TextInputPrepaintState>;
+impl<V: TextInputProvider + gpui_kit::Render + EntityInputHandler> IntoElement
+    for TextInputElement<V>
+{
+    type Element = gpui_kit::Canvas<TextInputPrepaintState>;
 
     fn into_element(self) -> Self::Element {
         let focus_handle = self.focus_handle;
@@ -757,6 +766,8 @@ impl<V: TextInputProvider + gpui::Render + EntityInputHandler> IntoElement for T
                             prepaint.line_bounds.top(),
                         ),
                         prepaint.line_bounds.size.height,
+                        gpui_kit::TextAlign::Left,
+                        None,
                         window,
                         cx,
                     )
@@ -790,13 +801,13 @@ impl<V: TextInputProvider + gpui::Render + EntityInputHandler> IntoElement for T
 #[macro_export]
 macro_rules! impl_text_input_handler {
     ($ty:ty) => {
-        impl gpui::EntityInputHandler for $ty {
+        impl gpui_kit::EntityInputHandler for $ty {
             fn text_for_range(
                 &mut self,
                 range: std::ops::Range<usize>,
                 adjusted_range: &mut Option<std::ops::Range<usize>>,
-                _window: &mut gpui::Window,
-                _cx: &mut gpui::Context<Self>,
+                _window: &mut gpui_kit::Window,
+                _cx: &mut gpui_kit::Context<Self>,
             ) -> Option<String> {
                 let state = $crate::text_input::TextInputProvider::text_input_state(self)?;
                 Some(state.text_for_range(range, adjusted_range))
@@ -805,23 +816,27 @@ macro_rules! impl_text_input_handler {
             fn selected_text_range(
                 &mut self,
                 _ignore_disabled_input: bool,
-                _window: &mut gpui::Window,
-                _cx: &mut gpui::Context<Self>,
-            ) -> Option<gpui::UTF16Selection> {
+                _window: &mut gpui_kit::Window,
+                _cx: &mut gpui_kit::Context<Self>,
+            ) -> Option<gpui_kit::UTF16Selection> {
                 let state = $crate::text_input::TextInputProvider::text_input_state(self)?;
                 Some(state.selected_text_range())
             }
 
             fn marked_text_range(
                 &self,
-                _window: &mut gpui::Window,
-                _cx: &mut gpui::Context<Self>,
+                _window: &mut gpui_kit::Window,
+                _cx: &mut gpui_kit::Context<Self>,
             ) -> Option<std::ops::Range<usize>> {
                 let state = $crate::text_input::TextInputProvider::text_input_state(self)?;
                 state.marked_text_range_utf16()
             }
 
-            fn unmark_text(&mut self, _window: &mut gpui::Window, _cx: &mut gpui::Context<Self>) {
+            fn unmark_text(
+                &mut self,
+                _window: &mut gpui_kit::Window,
+                _cx: &mut gpui_kit::Context<Self>,
+            ) {
                 if let Some(state) =
                     $crate::text_input::TextInputProvider::text_input_state_mut(self)
                 {
@@ -833,8 +848,8 @@ macro_rules! impl_text_input_handler {
                 &mut self,
                 range: Option<std::ops::Range<usize>>,
                 text: &str,
-                _window: &mut gpui::Window,
-                cx: &mut gpui::Context<Self>,
+                _window: &mut gpui_kit::Window,
+                cx: &mut gpui_kit::Context<Self>,
             ) {
                 if let Some(state) =
                     $crate::text_input::TextInputProvider::text_input_state_mut(self)
@@ -849,8 +864,8 @@ macro_rules! impl_text_input_handler {
                 range: Option<std::ops::Range<usize>>,
                 new_text: &str,
                 new_selected_range: Option<std::ops::Range<usize>>,
-                _window: &mut gpui::Window,
-                cx: &mut gpui::Context<Self>,
+                _window: &mut gpui_kit::Window,
+                cx: &mut gpui_kit::Context<Self>,
             ) {
                 if let Some(state) =
                     $crate::text_input::TextInputProvider::text_input_state_mut(self)
@@ -863,19 +878,19 @@ macro_rules! impl_text_input_handler {
             fn bounds_for_range(
                 &mut self,
                 range_utf16: std::ops::Range<usize>,
-                element_bounds: gpui::Bounds<gpui::Pixels>,
-                _window: &mut gpui::Window,
-                _cx: &mut gpui::Context<Self>,
-            ) -> Option<gpui::Bounds<gpui::Pixels>> {
+                element_bounds: gpui_kit::Bounds<gpui_kit::Pixels>,
+                _window: &mut gpui_kit::Window,
+                _cx: &mut gpui_kit::Context<Self>,
+            ) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
                 let state = $crate::text_input::TextInputProvider::text_input_state(self)?;
                 Some(state.bounds_for_range(range_utf16, element_bounds))
             }
 
             fn character_index_for_point(
                 &mut self,
-                point: gpui::Point<gpui::Pixels>,
-                _window: &mut gpui::Window,
-                _cx: &mut gpui::Context<Self>,
+                point: gpui_kit::Point<gpui_kit::Pixels>,
+                _window: &mut gpui_kit::Window,
+                _cx: &mut gpui_kit::Context<Self>,
             ) -> Option<usize> {
                 let state = $crate::text_input::TextInputProvider::text_input_state(self)?;
                 Some(state.character_index_for_point(point))
@@ -883,8 +898,8 @@ macro_rules! impl_text_input_handler {
 
             fn accepts_text_input(
                 &self,
-                _window: &mut gpui::Window,
-                _cx: &mut gpui::Context<Self>,
+                _window: &mut gpui_kit::Window,
+                _cx: &mut gpui_kit::Context<Self>,
             ) -> bool {
                 $crate::text_input::TextInputProvider::text_input_state(self).is_some()
             }

@@ -1,5 +1,5 @@
 <p align="center">
-  <img alt="Termy — The terminal, at full speed" src="./assets/termy-readme-hero.png" width="900" />
+  <img alt="Termy — The terminal, at full speed" src="./assets/termy-readme-hero-v2.png" width="900" />
 </p>
 
 <p align="center">
@@ -27,14 +27,15 @@ Termy is a fast, native terminal for macOS, Linux, and Windows. It combines GPU-
 
 Download the latest build from **[termy.sh/download](https://termy.sh/download)** or browse every artifact on **[GitHub Releases](https://github.com/lassejlv/termy/releases)**.
 
-> [!IMPORTANT]
-> macOS builds are not signed yet. After moving Termy to `/Applications`, run:
->
-> ```bash
-> sudo xattr -d com.apple.quarantine /Applications/Termy.app
-> ```
->
-> See [macOS troubleshooting](https://termy.sh/docs/getting-started/troubleshooting) if Gatekeeper still prevents Termy from opening.
+macOS DMGs from v0.2.75 onward are signed and notarized. Open the DMG and drag
+Termy to `/Applications`. See [macOS troubleshooting](https://termy.sh/docs/getting-started/troubleshooting)
+if the app still does not open.
+
+On Windows, run `Termy-<version>-windows-x64-Setup.exe` (or the `arm64` one on
+ARM64 PCs). It installs for the current user without an administrator prompt;
+pass `/ALLUSERS` or pick **Install for all users** to install under Program
+Files. See the [installation guide](https://termy.sh/docs/getting-started/installation#windows)
+for SmartScreen and winget notes.
 
 ### Build from source
 
@@ -61,7 +62,7 @@ Start with [Customize Termy](https://termy.sh/docs/customize) or use the complet
 
 ## Architecture
 
-Termy is more than a window around a PTY. Its terminal emulation is powered by [Alacritty's terminal engine](https://github.com/alacritty/alacritty), wrapped in Termy's reusable runtime. The repository also contains a GPUI desktop application, CLI, native FFI, website, and release tooling.
+Termy is more than a window around a PTY. Its terminal emulation uses Termy's own streaming parser, screen storage, and native PTY runtime. The repository also contains a GPUI desktop application, CLI, native FFI, website, and release tooling.
 
 ```text
 desktop / embedding hosts
@@ -95,7 +96,6 @@ Termy is supported by companies and people who care about fast, native developer
 
 ## Roadmap and contributing
 
-- [Product and v1.0 roadmap](./ROADMAP.md)
 - [Engineering quality roadmap](./docs/engineering/roadmap.md)
 - [Contributor setup and validation](./CONTRIBUTING.md)
 

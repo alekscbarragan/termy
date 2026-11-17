@@ -10,7 +10,7 @@ pub(super) enum EditableField {
     ThemeMode,
     ThemeLight,
     ThemeDark,
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     AppIcon,
     BackgroundOpacity,
     FontFamily,
@@ -24,6 +24,7 @@ pub(super) enum EditableField {
     Shell,
     Term,
     Colorterm,
+    TermProgram,
     TmuxBinary,
     TmuxCommandPrefix,
     ScrollbackHistory,
@@ -34,6 +35,7 @@ pub(super) enum EditableField {
     ScrollbarStyle,
     PaneFocusEffect,
     PaneFocusStrength,
+    ClipboardRead,
     TabFallbackTitle,
     TabTitlePriority,
     TabTitleMode,
@@ -43,12 +45,14 @@ pub(super) enum EditableField {
     TabCloseVisibility,
     TabWidthMode,
     TabBarPosition,
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    TabStyle,
     SidebarWidth,
     WorkingDirectory,
     WorkingDirFallback,
     WindowWidth,
     WindowHeight,
-    Color(termy_config_core::ColorSettingId),
+    Color(termy_core::config_core::ColorSettingId),
 }
 
 #[derive(Clone, Debug)]
@@ -134,70 +138,70 @@ impl SettingsWindow {
 
     pub(super) fn parse_tab_title_source_token(
         token: &str,
-    ) -> Option<termy_config_core::TabTitleSource> {
+    ) -> Option<termy_core::config_core::TabTitleSource> {
         match token.trim().to_ascii_lowercase().as_str() {
-            "manual" => Some(termy_config_core::TabTitleSource::Manual),
-            "explicit" => Some(termy_config_core::TabTitleSource::Explicit),
-            "shell" | "app" | "terminal" => Some(termy_config_core::TabTitleSource::Shell),
-            "fallback" | "default" => Some(termy_config_core::TabTitleSource::Fallback),
+            "manual" => Some(termy_core::config_core::TabTitleSource::Manual),
+            "explicit" => Some(termy_core::config_core::TabTitleSource::Explicit),
+            "shell" | "app" | "terminal" => Some(termy_core::config_core::TabTitleSource::Shell),
+            "fallback" | "default" => Some(termy_core::config_core::TabTitleSource::Fallback),
             _ => None,
         }
     }
 
     pub(super) fn custom_color_for_id(
         &self,
-        id: termy_config_core::ColorSettingId,
-    ) -> Option<termy_config_core::Rgb8> {
+        id: termy_core::config_core::ColorSettingId,
+    ) -> Option<termy_core::config_core::Rgb8> {
         let colors = &self.config.colors;
         match id {
-            termy_config_core::ColorSettingId::Foreground => colors.foreground,
-            termy_config_core::ColorSettingId::Background => colors.background,
-            termy_config_core::ColorSettingId::Cursor => colors.cursor,
-            termy_config_core::ColorSettingId::Black => colors.ansi[0],
-            termy_config_core::ColorSettingId::Red => colors.ansi[1],
-            termy_config_core::ColorSettingId::Green => colors.ansi[2],
-            termy_config_core::ColorSettingId::Yellow => colors.ansi[3],
-            termy_config_core::ColorSettingId::Blue => colors.ansi[4],
-            termy_config_core::ColorSettingId::Magenta => colors.ansi[5],
-            termy_config_core::ColorSettingId::Cyan => colors.ansi[6],
-            termy_config_core::ColorSettingId::White => colors.ansi[7],
-            termy_config_core::ColorSettingId::BrightBlack => colors.ansi[8],
-            termy_config_core::ColorSettingId::BrightRed => colors.ansi[9],
-            termy_config_core::ColorSettingId::BrightGreen => colors.ansi[10],
-            termy_config_core::ColorSettingId::BrightYellow => colors.ansi[11],
-            termy_config_core::ColorSettingId::BrightBlue => colors.ansi[12],
-            termy_config_core::ColorSettingId::BrightMagenta => colors.ansi[13],
-            termy_config_core::ColorSettingId::BrightCyan => colors.ansi[14],
-            termy_config_core::ColorSettingId::BrightWhite => colors.ansi[15],
+            termy_core::config_core::ColorSettingId::Foreground => colors.foreground,
+            termy_core::config_core::ColorSettingId::Background => colors.background,
+            termy_core::config_core::ColorSettingId::Cursor => colors.cursor,
+            termy_core::config_core::ColorSettingId::Black => colors.ansi[0],
+            termy_core::config_core::ColorSettingId::Red => colors.ansi[1],
+            termy_core::config_core::ColorSettingId::Green => colors.ansi[2],
+            termy_core::config_core::ColorSettingId::Yellow => colors.ansi[3],
+            termy_core::config_core::ColorSettingId::Blue => colors.ansi[4],
+            termy_core::config_core::ColorSettingId::Magenta => colors.ansi[5],
+            termy_core::config_core::ColorSettingId::Cyan => colors.ansi[6],
+            termy_core::config_core::ColorSettingId::White => colors.ansi[7],
+            termy_core::config_core::ColorSettingId::BrightBlack => colors.ansi[8],
+            termy_core::config_core::ColorSettingId::BrightRed => colors.ansi[9],
+            termy_core::config_core::ColorSettingId::BrightGreen => colors.ansi[10],
+            termy_core::config_core::ColorSettingId::BrightYellow => colors.ansi[11],
+            termy_core::config_core::ColorSettingId::BrightBlue => colors.ansi[12],
+            termy_core::config_core::ColorSettingId::BrightMagenta => colors.ansi[13],
+            termy_core::config_core::ColorSettingId::BrightCyan => colors.ansi[14],
+            termy_core::config_core::ColorSettingId::BrightWhite => colors.ansi[15],
         }
     }
 
     pub(super) fn set_custom_color_for_id(
         &mut self,
-        id: termy_config_core::ColorSettingId,
-        value: Option<termy_config_core::Rgb8>,
+        id: termy_core::config_core::ColorSettingId,
+        value: Option<termy_core::config_core::Rgb8>,
     ) {
         let colors = &mut self.config.colors;
         match id {
-            termy_config_core::ColorSettingId::Foreground => colors.foreground = value,
-            termy_config_core::ColorSettingId::Background => colors.background = value,
-            termy_config_core::ColorSettingId::Cursor => colors.cursor = value,
-            termy_config_core::ColorSettingId::Black => colors.ansi[0] = value,
-            termy_config_core::ColorSettingId::Red => colors.ansi[1] = value,
-            termy_config_core::ColorSettingId::Green => colors.ansi[2] = value,
-            termy_config_core::ColorSettingId::Yellow => colors.ansi[3] = value,
-            termy_config_core::ColorSettingId::Blue => colors.ansi[4] = value,
-            termy_config_core::ColorSettingId::Magenta => colors.ansi[5] = value,
-            termy_config_core::ColorSettingId::Cyan => colors.ansi[6] = value,
-            termy_config_core::ColorSettingId::White => colors.ansi[7] = value,
-            termy_config_core::ColorSettingId::BrightBlack => colors.ansi[8] = value,
-            termy_config_core::ColorSettingId::BrightRed => colors.ansi[9] = value,
-            termy_config_core::ColorSettingId::BrightGreen => colors.ansi[10] = value,
-            termy_config_core::ColorSettingId::BrightYellow => colors.ansi[11] = value,
-            termy_config_core::ColorSettingId::BrightBlue => colors.ansi[12] = value,
-            termy_config_core::ColorSettingId::BrightMagenta => colors.ansi[13] = value,
-            termy_config_core::ColorSettingId::BrightCyan => colors.ansi[14] = value,
-            termy_config_core::ColorSettingId::BrightWhite => colors.ansi[15] = value,
+            termy_core::config_core::ColorSettingId::Foreground => colors.foreground = value,
+            termy_core::config_core::ColorSettingId::Background => colors.background = value,
+            termy_core::config_core::ColorSettingId::Cursor => colors.cursor = value,
+            termy_core::config_core::ColorSettingId::Black => colors.ansi[0] = value,
+            termy_core::config_core::ColorSettingId::Red => colors.ansi[1] = value,
+            termy_core::config_core::ColorSettingId::Green => colors.ansi[2] = value,
+            termy_core::config_core::ColorSettingId::Yellow => colors.ansi[3] = value,
+            termy_core::config_core::ColorSettingId::Blue => colors.ansi[4] = value,
+            termy_core::config_core::ColorSettingId::Magenta => colors.ansi[5] = value,
+            termy_core::config_core::ColorSettingId::Cyan => colors.ansi[6] = value,
+            termy_core::config_core::ColorSettingId::White => colors.ansi[7] = value,
+            termy_core::config_core::ColorSettingId::BrightBlack => colors.ansi[8] = value,
+            termy_core::config_core::ColorSettingId::BrightRed => colors.ansi[9] = value,
+            termy_core::config_core::ColorSettingId::BrightGreen => colors.ansi[10] = value,
+            termy_core::config_core::ColorSettingId::BrightYellow => colors.ansi[11] = value,
+            termy_core::config_core::ColorSettingId::BrightBlue => colors.ansi[12] = value,
+            termy_core::config_core::ColorSettingId::BrightMagenta => colors.ansi[13] = value,
+            termy_core::config_core::ColorSettingId::BrightCyan => colors.ansi[14] = value,
+            termy_core::config_core::ColorSettingId::BrightWhite => colors.ansi[15] = value,
         }
     }
 
@@ -212,8 +216,7 @@ impl SettingsWindow {
             SettingsSection::Terminal => Some(CoreSettingsSection::Terminal),
             SettingsSection::Tabs => Some(CoreSettingsSection::Tabs),
             SettingsSection::Advanced => Some(CoreSettingsSection::Advanced),
-            SettingsSection::ThemeStore
-            | SettingsSection::Plugins
+            SettingsSection::Plugins
             | SettingsSection::Ssh
             | SettingsSection::Colors
             | SettingsSection::Keybindings => None,
@@ -233,7 +236,7 @@ impl SettingsWindow {
     }
 
     pub(super) fn root_setting_visible_in_current_settings(setting: RootSettingId) -> bool {
-        if !termy_config_core::root_setting_is_user_facing(setting) {
+        if !termy_core::config_core::root_setting_is_user_facing(setting) {
             return false;
         }
 
@@ -277,7 +280,7 @@ impl SettingsWindow {
             SettingsSection::Colors => color_setting_specs()
                 .iter()
                 .any(|spec| self.custom_color_for_id(spec.id).is_some()),
-            SettingsSection::ThemeStore | SettingsSection::Plugins | SettingsSection::Ssh => false,
+            SettingsSection::Plugins | SettingsSection::Ssh => false,
             SettingsSection::Keybindings => !self.config.keybind_lines.is_empty(),
             _ => Self::section_root_settings(section)
                 .any(|setting| !self.is_root_setting_at_default(setting)),
@@ -313,7 +316,6 @@ impl SettingsWindow {
                 let _ = self.reload_config_if_changed(cx);
                 self.active_input = None;
                 self.capturing_action = None;
-                crate::ui::toast::success("Reset to default");
                 cx.notify();
             }
             Err(error) => crate::ui::toast::error(error),
@@ -332,13 +334,26 @@ impl SettingsWindow {
             SettingsSection::Advanced => "General",
             SettingsSection::Colors => "Colors",
             SettingsSection::Keybindings => "Keyboard shortcuts",
-            SettingsSection::ThemeStore | SettingsSection::Plugins | SettingsSection::Ssh => return,
+            SettingsSection::Plugins | SettingsSection::Ssh => return,
         };
-        self.pending_confirmation = Some(PendingSettingsConfirmation::ResetSection {
-            section,
-            section_name,
-        });
-        cx.notify();
+        let title = "Reset Section";
+        let message = format!(
+            "Are you sure you want to reset all {section_name} settings to their default values?"
+        );
+
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let confirmed = crate::native_sdk::confirm(title, &message);
+            if !confirmed {
+                return;
+            }
+
+            let _ = cx.update(|cx| {
+                this.update(cx, |view, cx| {
+                    view.reset_section_to_defaults(section, cx);
+                })
+            });
+        })
+        .detach();
     }
 
     pub(super) fn confirm_reset_setting_to_default(
@@ -346,8 +361,22 @@ impl SettingsWindow {
         setting_key: &'static str,
         cx: &mut Context<Self>,
     ) {
-        self.pending_confirmation = Some(PendingSettingsConfirmation::ResetSetting { setting_key });
-        cx.notify();
+        let title = "Reset Setting";
+        let message = "Are you sure you want to reset this setting to its default value?";
+
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let confirmed = crate::native_sdk::confirm(title, message);
+            if !confirmed {
+                return;
+            }
+
+            let _ = cx.update(|cx| {
+                this.update(cx, |view, cx| {
+                    view.reset_setting_to_default(setting_key, cx);
+                })
+            });
+        })
+        .detach();
     }
 
     pub(super) fn reset_section_to_defaults(
@@ -369,7 +398,7 @@ impl SettingsWindow {
             SettingsSection::Colors => color_setting_specs()
                 .iter()
                 .try_for_each(|spec| config::set_color_setting(spec.id, None)),
-            SettingsSection::ThemeStore | SettingsSection::Plugins | SettingsSection::Ssh => Ok(()),
+            SettingsSection::Plugins | SettingsSection::Ssh => Ok(()),
             SettingsSection::Keybindings => Ok(()),
         };
 
@@ -378,7 +407,6 @@ impl SettingsWindow {
                 let _ = self.reload_config_if_changed(cx);
                 self.active_input = None;
                 self.capturing_action = None;
-                crate::ui::toast::success("Section reset to defaults");
                 cx.notify();
             }
             Err(error) => crate::ui::toast::error(error),
@@ -403,6 +431,7 @@ impl SettingsWindow {
             | EditableField::Shell
             | EditableField::Term
             | EditableField::Colorterm
+            | EditableField::TermProgram
             | EditableField::TmuxBinary
             | EditableField::TmuxCommandPrefix
             | EditableField::ScrollbackHistory
@@ -412,7 +441,8 @@ impl SettingsWindow {
             | EditableField::ScrollbarVisibility
             | EditableField::ScrollbarStyle
             | EditableField::PaneFocusEffect
-            | EditableField::PaneFocusStrength => Self::terminal_field_spec(field),
+            | EditableField::PaneFocusStrength
+            | EditableField::ClipboardRead => Self::terminal_field_spec(field),
             EditableField::TabFallbackTitle
             | EditableField::TabTitlePriority
             | EditableField::TabTitleMode
@@ -422,6 +452,7 @@ impl SettingsWindow {
             | EditableField::TabCloseVisibility
             | EditableField::TabWidthMode
             | EditableField::TabBarPosition
+            | EditableField::TabStyle
             | EditableField::SidebarWidth => Self::tabs_field_spec(field),
             EditableField::WorkingDirectory
             | EditableField::WorkingDirFallback
@@ -496,8 +527,8 @@ impl SettingsWindow {
                 dropdown_click_only: false,
                 numeric_step: Some(NumericStepSpec {
                     delta: 0.05,
-                    min: termy_config_core::MIN_LINE_HEIGHT,
-                    max: termy_config_core::MAX_LINE_HEIGHT,
+                    min: termy_core::config_core::MIN_LINE_HEIGHT,
+                    max: termy_core::config_core::MAX_LINE_HEIGHT,
                 }),
             },
             EditableField::PaddingX => FieldSpec {
@@ -530,6 +561,7 @@ impl SettingsWindow {
             EditableField::Shell => Self::text_field_spec(Some(RootSettingId::Shell)),
             EditableField::Term => Self::text_field_spec(Some(RootSettingId::Term)),
             EditableField::Colorterm => Self::text_field_spec(Some(RootSettingId::Colorterm)),
+            EditableField::TermProgram => Self::enum_field_spec(RootSettingId::TermProgram),
             EditableField::TmuxBinary => Self::text_field_spec(Some(RootSettingId::TmuxBinary)),
             EditableField::TmuxCommandPrefix => {
                 Self::text_field_spec(Some(RootSettingId::TmuxCommandPrefix))
@@ -564,6 +596,7 @@ impl SettingsWindow {
             }
             EditableField::ScrollbarStyle => Self::enum_field_spec(RootSettingId::ScrollbarStyle),
             EditableField::PaneFocusEffect => Self::enum_field_spec(RootSettingId::PaneFocusEffect),
+            EditableField::ClipboardRead => Self::enum_field_spec(RootSettingId::ClipboardRead),
             EditableField::PaneFocusStrength => Self::numeric_field_spec(
                 RootSettingId::PaneFocusStrength,
                 NumericStepSpec {
@@ -599,12 +632,13 @@ impl SettingsWindow {
             }
             EditableField::TabWidthMode => Self::enum_field_spec(RootSettingId::TabWidthMode),
             EditableField::TabBarPosition => Self::enum_field_spec(RootSettingId::TabBarPosition),
+            EditableField::TabStyle => Self::enum_field_spec(RootSettingId::TabStyle),
             EditableField::SidebarWidth => Self::numeric_field_spec(
                 RootSettingId::SidebarWidth,
                 NumericStepSpec {
                     delta: 10.0,
-                    min: termy_config_core::MIN_SIDEBAR_WIDTH,
-                    max: termy_config_core::MAX_SIDEBAR_WIDTH,
+                    min: termy_core::config_core::MIN_SIDEBAR_WIDTH,
+                    max: termy_core::config_core::MAX_SIDEBAR_WIDTH,
                 },
             ),
             _ => unreachable!("invalid tabs field"),
@@ -825,7 +859,6 @@ impl SettingsWindow {
             return;
         }
         self.active_input = None;
-        crate::ui::toast::success("Saved");
         cx.notify();
     }
 
@@ -861,15 +894,15 @@ impl SettingsWindow {
         match field {
             EditableField::Theme => self.config.theme.clone(),
             EditableField::ThemeMode => match self.config.theme_mode {
-                termy_config_core::AppearanceMode::Manual => "manual",
-                termy_config_core::AppearanceMode::System => "system",
+                termy_core::config_core::AppearanceMode::Manual => "manual",
+                termy_core::config_core::AppearanceMode::System => "system",
             }
             .to_string(),
             EditableField::ThemeLight => self.config.theme_light.clone(),
             EditableField::ThemeDark => self.config.theme_dark.clone(),
             EditableField::AppIcon => match self.config.app_icon {
-                termy_config_core::AppIcon::TermyDefault => "default",
-                termy_config_core::AppIcon::TermyOld => "old",
+                termy_core::config_core::AppIcon::TermyDefault => "default",
+                termy_core::config_core::AppIcon::TermyOld => "old",
             }
             .to_string(),
             EditableField::BackgroundOpacity => format!(
@@ -883,15 +916,17 @@ impl SettingsWindow {
             EditableField::PaddingX => format!("{}", self.config.padding_x.round() as i32),
             EditableField::PaddingY => format!("{}", self.config.padding_y.round() as i32),
             EditableField::WindowsShell => match self.config.windows_shell {
-                termy_config_core::WindowsShell::Cmd => "cmd",
-                termy_config_core::WindowsShell::PowerShell => "powershell",
-                termy_config_core::WindowsShell::PowerShellCore => "pwsh",
-                termy_config_core::WindowsShell::GitBash => "git_bash",
+                termy_core::config_core::WindowsShell::Auto => "auto",
+                termy_core::config_core::WindowsShell::Cmd => "cmd",
+                termy_core::config_core::WindowsShell::PowerShell => "powershell",
+                termy_core::config_core::WindowsShell::PowerShellCore => "pwsh",
+                termy_core::config_core::WindowsShell::GitBash => "git_bash",
             }
             .to_string(),
             EditableField::Shell => self.config.shell.clone().unwrap_or_default(),
             EditableField::Term => self.config.term.clone(),
             EditableField::Colorterm => self.config.colorterm.clone().unwrap_or_default(),
+            EditableField::TermProgram => self.config.term_program.as_str().to_string(),
             EditableField::TmuxBinary => self.config.tmux_binary.clone(),
             EditableField::TmuxCommandPrefix => {
                 self.config.tmux_command_prefix.clone().unwrap_or_default()
@@ -900,33 +935,33 @@ impl SettingsWindow {
             EditableField::InactiveTabScrollback => self
                 .config
                 .inactive_tab_scrollback
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
+                .map_or_default(|value| value.to_string()),
             EditableField::ScrollMultiplier => {
                 format!("{:.3}", self.config.mouse_scroll_multiplier)
             }
             EditableField::CursorStyle => match self.config.cursor_style {
-                termy_config_core::CursorStyle::Line => "line",
-                termy_config_core::CursorStyle::Block => "block",
+                termy_core::config_core::CursorStyle::Line => "line",
+                termy_core::config_core::CursorStyle::Block => "block",
             }
             .to_string(),
             EditableField::ScrollbarVisibility => match self.config.terminal_scrollbar_visibility {
-                termy_config_core::TerminalScrollbarVisibility::Off => "off",
-                termy_config_core::TerminalScrollbarVisibility::Always => "always",
-                termy_config_core::TerminalScrollbarVisibility::OnScroll => "on_scroll",
+                termy_core::config_core::TerminalScrollbarVisibility::Off => "off",
+                termy_core::config_core::TerminalScrollbarVisibility::Always => "always",
+                termy_core::config_core::TerminalScrollbarVisibility::OnScroll => "on_scroll",
             }
             .to_string(),
             EditableField::ScrollbarStyle => match self.config.terminal_scrollbar_style {
-                termy_config_core::TerminalScrollbarStyle::Neutral => "neutral",
-                termy_config_core::TerminalScrollbarStyle::MutedTheme => "muted_theme",
-                termy_config_core::TerminalScrollbarStyle::Theme => "theme",
+                termy_core::config_core::TerminalScrollbarStyle::Neutral => "neutral",
+                termy_core::config_core::TerminalScrollbarStyle::MutedTheme => "muted_theme",
+                termy_core::config_core::TerminalScrollbarStyle::Theme => "theme",
             }
             .to_string(),
+            EditableField::ClipboardRead => self.config.clipboard_read.as_str().to_string(),
             EditableField::PaneFocusEffect => match self.config.pane_focus_effect {
-                termy_config_core::PaneFocusEffect::Off => "off",
-                termy_config_core::PaneFocusEffect::SoftSpotlight => "soft_spotlight",
-                termy_config_core::PaneFocusEffect::Cinematic => "cinematic",
-                termy_config_core::PaneFocusEffect::Minimal => "minimal",
+                termy_core::config_core::PaneFocusEffect::Off => "off",
+                termy_core::config_core::PaneFocusEffect::SoftSpotlight => "soft_spotlight",
+                termy_core::config_core::PaneFocusEffect::Cinematic => "cinematic",
+                termy_core::config_core::PaneFocusEffect::Minimal => "minimal",
             }
             .to_string(),
             EditableField::PaneFocusStrength => {
@@ -939,39 +974,44 @@ impl SettingsWindow {
                 .priority
                 .iter()
                 .map(|source| match source {
-                    termy_config_core::TabTitleSource::Manual => "manual",
-                    termy_config_core::TabTitleSource::Explicit => "explicit",
-                    termy_config_core::TabTitleSource::Shell => "shell",
-                    termy_config_core::TabTitleSource::Fallback => "fallback",
+                    termy_core::config_core::TabTitleSource::Manual => "manual",
+                    termy_core::config_core::TabTitleSource::Explicit => "explicit",
+                    termy_core::config_core::TabTitleSource::Shell => "shell",
+                    termy_core::config_core::TabTitleSource::Fallback => "fallback",
                 })
                 .collect::<Vec<_>>()
                 .join(", "),
             EditableField::TabTitleMode => match self.config.tab_title.mode {
-                termy_config_core::TabTitleMode::Smart => "smart",
-                termy_config_core::TabTitleMode::Shell => "shell",
-                termy_config_core::TabTitleMode::Explicit => "explicit",
-                termy_config_core::TabTitleMode::Static => "static",
+                termy_core::config_core::TabTitleMode::Smart => "smart",
+                termy_core::config_core::TabTitleMode::Shell => "shell",
+                termy_core::config_core::TabTitleMode::Explicit => "explicit",
+                termy_core::config_core::TabTitleMode::Static => "static",
             }
             .to_string(),
             EditableField::TabTitleExplicitPrefix => self.config.tab_title.explicit_prefix.clone(),
             EditableField::TabTitlePromptFormat => self.config.tab_title.prompt_format.clone(),
             EditableField::TabTitleCommandFormat => self.config.tab_title.command_format.clone(),
             EditableField::TabCloseVisibility => match self.config.tab_close_visibility {
-                termy_config_core::TabCloseVisibility::ActiveHover => "active_hover",
-                termy_config_core::TabCloseVisibility::Hover => "hover",
-                termy_config_core::TabCloseVisibility::Always => "always",
+                termy_core::config_core::TabCloseVisibility::ActiveHover => "active_hover",
+                termy_core::config_core::TabCloseVisibility::Hover => "hover",
+                termy_core::config_core::TabCloseVisibility::Always => "always",
             }
             .to_string(),
             EditableField::TabWidthMode => match self.config.tab_width_mode {
-                termy_config_core::TabWidthMode::Stable => "stable",
-                termy_config_core::TabWidthMode::ActiveGrow => "active_grow",
-                termy_config_core::TabWidthMode::ActiveGrowSticky => "active_grow_sticky",
-                termy_config_core::TabWidthMode::Uniform => "uniform",
+                termy_core::config_core::TabWidthMode::Stable => "stable",
+                termy_core::config_core::TabWidthMode::ActiveGrow => "active_grow",
+                termy_core::config_core::TabWidthMode::ActiveGrowSticky => "active_grow_sticky",
+                termy_core::config_core::TabWidthMode::Uniform => "uniform",
             }
             .to_string(),
             EditableField::TabBarPosition => match self.config.tab_bar_position {
-                termy_config_core::TabBarPosition::Top => "top",
-                termy_config_core::TabBarPosition::Right => "right",
+                termy_core::config_core::TabBarPosition::Top => "top",
+                termy_core::config_core::TabBarPosition::Right => "right",
+            }
+            .to_string(),
+            EditableField::TabStyle => match self.config.tab_style {
+                termy_core::config_core::TabStyle::Native => "native",
+                termy_core::config_core::TabStyle::Custom => "custom",
             }
             .to_string(),
             EditableField::SidebarWidth => {
@@ -979,16 +1019,15 @@ impl SettingsWindow {
             }
             EditableField::WorkingDirectory => self.config.working_dir.clone().unwrap_or_default(),
             EditableField::WorkingDirFallback => match self.config.working_dir_fallback {
-                termy_config_core::WorkingDirFallback::Home => "home",
-                termy_config_core::WorkingDirFallback::Process => "process",
+                termy_core::config_core::WorkingDirFallback::Home => "home",
+                termy_core::config_core::WorkingDirFallback::Process => "process",
             }
             .to_string(),
             EditableField::WindowWidth => format!("{}", self.config.window_width.round() as i32),
             EditableField::WindowHeight => format!("{}", self.config.window_height.round() as i32),
             EditableField::Color(id) => self
                 .custom_color_for_id(id)
-                .map(|rgb| format!("#{:02x}{:02x}{:02x}", rgb.r, rgb.g, rgb.b))
-                .unwrap_or_default(),
+                .map_or_default(|rgb| format!("#{:02x}{:02x}{:02x}", rgb.r, rgb.g, rgb.b)),
         }
     }
 
@@ -1011,7 +1050,7 @@ impl SettingsWindow {
             field,
             self.editable_field_value(field),
         ));
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -1045,7 +1084,7 @@ impl SettingsWindow {
                     (self.config.font_size + (delta as f32 * step.delta)).clamp(step.min, step.max);
                 self.config.font_size = next;
                 config::set_root_setting(
-                    termy_config_core::RootSettingId::FontSize,
+                    termy_core::config_core::RootSettingId::FontSize,
                     &next.to_string(),
                 )
             }
@@ -1053,7 +1092,7 @@ impl SettingsWindow {
                 let next = (self.config.line_height + (delta as f32 * step.delta))
                     .clamp(step.min, step.max);
                 let result = config::set_root_setting(
-                    termy_config_core::RootSettingId::LineHeight,
+                    termy_core::config_core::RootSettingId::LineHeight,
                     &format_line_height(next),
                 );
                 if result.is_ok() {
@@ -1066,7 +1105,7 @@ impl SettingsWindow {
                     (self.config.padding_x + (delta as f32 * step.delta)).clamp(step.min, step.max);
                 self.config.padding_x = next;
                 config::set_root_setting(
-                    termy_config_core::RootSettingId::PaddingX,
+                    termy_core::config_core::RootSettingId::PaddingX,
                     &next.to_string(),
                 )
             }
@@ -1075,7 +1114,7 @@ impl SettingsWindow {
                     (self.config.padding_y + (delta as f32 * step.delta)).clamp(step.min, step.max);
                 self.config.padding_y = next;
                 config::set_root_setting(
-                    termy_config_core::RootSettingId::PaddingY,
+                    termy_core::config_core::RootSettingId::PaddingY,
                     &next.to_string(),
                 )
             }
@@ -1085,7 +1124,7 @@ impl SettingsWindow {
                     .clamp(step.min, step.max) as usize;
                 self.config.scrollback_history = next;
                 config::set_root_setting(
-                    termy_config_core::RootSettingId::ScrollbackHistory,
+                    termy_core::config_core::RootSettingId::ScrollbackHistory,
                     &next.to_string(),
                 )
             }
@@ -1096,7 +1135,7 @@ impl SettingsWindow {
                     .clamp(step.min, step.max) as usize;
                 self.config.inactive_tab_scrollback = Some(next);
                 config::set_root_setting(
-                    termy_config_core::RootSettingId::InactiveTabScrollback,
+                    termy_core::config_core::RootSettingId::InactiveTabScrollback,
                     &next.to_string(),
                 )
             }
@@ -1105,7 +1144,7 @@ impl SettingsWindow {
                     .clamp(step.min, step.max);
                 self.config.mouse_scroll_multiplier = next;
                 config::set_root_setting(
-                    termy_config_core::RootSettingId::MouseScrollMultiplier,
+                    termy_core::config_core::RootSettingId::MouseScrollMultiplier,
                     &format!("{next:.3}"),
                 )
             }
@@ -1114,7 +1153,7 @@ impl SettingsWindow {
                     .clamp(step.min, step.max);
                 self.config.pane_focus_strength = next;
                 config::set_root_setting(
-                    termy_config_core::RootSettingId::PaneFocusStrength,
+                    termy_core::config_core::RootSettingId::PaneFocusStrength,
                     &format!("{next:.3}"),
                 )
             }
@@ -1123,7 +1162,7 @@ impl SettingsWindow {
                     .clamp(step.min, step.max);
                 self.config.sidebar_width = next;
                 config::set_root_setting(
-                    termy_config_core::RootSettingId::SidebarWidth,
+                    termy_core::config_core::RootSettingId::SidebarWidth,
                     &next.to_string(),
                 )
             }
@@ -1132,7 +1171,7 @@ impl SettingsWindow {
                     .clamp(step.min, step.max);
                 self.config.window_width = next;
                 config::set_root_setting(
-                    termy_config_core::RootSettingId::WindowWidth,
+                    termy_core::config_core::RootSettingId::WindowWidth,
                     &next.to_string(),
                 )
             }
@@ -1141,7 +1180,7 @@ impl SettingsWindow {
                     .clamp(step.min, step.max);
                 self.config.window_height = next;
                 config::set_root_setting(
-                    termy_config_core::RootSettingId::WindowHeight,
+                    termy_core::config_core::RootSettingId::WindowHeight,
                     &next.to_string(),
                 )
             }
@@ -1150,34 +1189,31 @@ impl SettingsWindow {
 
         if let Err(error) = result {
             crate::ui::toast::error(error);
-        } else {
-            crate::ui::toast::success("Saved");
         }
         self.active_input = None;
         cx.notify();
     }
 
+    /// Every theme the app can apply, then shell-decide and whatever the
+    /// config names that is not one of them.
+    /// The configured themes first, then Termy's themes and the shell-decided
+    /// theme, then the rest. The dropdown shows only the first few without a
+    /// query, so these must not sink below the ~800 built-in themes.
     pub(super) fn ordered_theme_ids_for_settings(&self) -> Vec<String> {
-        let mut theme_ids: Vec<String> = self
-            .theme_store_installed_versions
-            .keys()
-            .cloned()
-            .collect();
-        theme_ids.push("shell-decide".to_string());
-
-        for current in [
-            &self.config.theme,
-            &self.config.theme_light,
-            &self.config.theme_dark,
-        ] {
-            if !theme_ids.iter().any(|theme| theme == current) {
-                theme_ids.push(current.clone());
-            }
-        }
-
-        theme_ids.sort_unstable();
-        theme_ids.dedup();
-        theme_ids
+        let mut seen = std::collections::HashSet::new();
+        let leading = [
+            self.config.theme.as_str(),
+            self.config.theme_light.as_str(),
+            self.config.theme_dark.as_str(),
+        ]
+        .into_iter()
+        .chain(termy_core::themes::TERMY_THEME_IDS)
+        .chain([config::SHELL_DECIDE_THEME_ID])
+        .map(str::to_string);
+        leading
+            .chain(crate::theme_library::available_theme_ids())
+            .filter(|theme| !theme.is_empty() && seen.insert(theme.clone()))
+            .collect()
     }
 
     pub(super) fn ordered_font_families_for_settings(&self) -> Vec<String> {
@@ -1232,8 +1268,6 @@ impl SettingsWindow {
         if let Err(error) = self.apply_editable_field(input.field, input.state.text()) {
             crate::ui::toast::error(error);
             self.active_input = Some(input);
-        } else {
-            crate::ui::toast::success("Saved");
         }
         cx.notify();
     }
@@ -1266,6 +1300,7 @@ mod tests {
             EditableField::Shell,
             EditableField::Term,
             EditableField::Colorterm,
+            EditableField::TermProgram,
             EditableField::TmuxBinary,
             EditableField::TmuxCommandPrefix,
             EditableField::ScrollbackHistory,
@@ -1276,6 +1311,7 @@ mod tests {
             EditableField::ScrollbarStyle,
             EditableField::PaneFocusEffect,
             EditableField::PaneFocusStrength,
+            EditableField::ClipboardRead,
             EditableField::TabFallbackTitle,
             EditableField::TabTitlePriority,
             EditableField::TabTitleMode,
@@ -1285,12 +1321,13 @@ mod tests {
             EditableField::TabCloseVisibility,
             EditableField::TabWidthMode,
             EditableField::TabBarPosition,
+            EditableField::TabStyle,
             EditableField::SidebarWidth,
             EditableField::WorkingDirectory,
             EditableField::WorkingDirFallback,
             EditableField::WindowWidth,
             EditableField::WindowHeight,
-            EditableField::Color(termy_config_core::ColorSettingId::Foreground),
+            EditableField::Color(termy_core::config_core::ColorSettingId::Foreground),
         ];
 
         for field in fields {
@@ -1312,11 +1349,14 @@ mod tests {
             EditableField::ScrollbarVisibility,
             EditableField::ScrollbarStyle,
             EditableField::PaneFocusEffect,
+            EditableField::ClipboardRead,
+            EditableField::TermProgram,
             EditableField::AppIcon,
             EditableField::TabTitleMode,
             EditableField::TabCloseVisibility,
             EditableField::TabWidthMode,
             EditableField::TabBarPosition,
+            EditableField::TabStyle,
             EditableField::WorkingDirFallback,
         ];
 
@@ -1330,7 +1370,7 @@ mod tests {
     #[test]
     fn app_icon_dropdown_displays_user_facing_labels_only() {
         let option = SettingsWindow::dropdown_option_for_enum_choice(
-            termy_config_core::RootSettingId::AppIcon,
+            termy_core::config_core::RootSettingId::AppIcon,
             "default",
             "Termy Default",
         );
@@ -1366,15 +1406,15 @@ mod tests {
             .numeric_step
             .expect("missing line-height step");
         assert!((step.delta - 0.05).abs() < f32::EPSILON);
-        assert!((step.min - termy_config_core::MIN_LINE_HEIGHT).abs() < f32::EPSILON);
-        assert!((step.max - termy_config_core::MAX_LINE_HEIGHT).abs() < f32::EPSILON);
+        assert!((step.min - termy_core::config_core::MIN_LINE_HEIGHT).abs() < f32::EPSILON);
+        assert!((step.max - termy_core::config_core::MAX_LINE_HEIGHT).abs() < f32::EPSILON);
     }
 
     #[test]
     fn color_hex_parser_accepts_valid_and_rejects_invalid_values() {
-        assert!(termy_config_core::Rgb8::from_hex("#12ab34").is_some());
-        assert!(termy_config_core::Rgb8::from_hex("#12AB34").is_some());
-        assert!(termy_config_core::Rgb8::from_hex("12ab34").is_some());
-        assert!(termy_config_core::Rgb8::from_hex("#zzzzzz").is_none());
+        assert!(termy_core::config_core::Rgb8::from_hex("#12ab34").is_some());
+        assert!(termy_core::config_core::Rgb8::from_hex("#12AB34").is_some());
+        assert!(termy_core::config_core::Rgb8::from_hex("12ab34").is_some());
+        assert!(termy_core::config_core::Rgb8::from_hex("#zzzzzz").is_none());
     }
 }

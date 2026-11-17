@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use gpui::{AssetSource, Result, SharedString};
+use gpui_kit::{AssetSource, Result, SharedString};
 
 pub struct EmbeddedAssets;
 
@@ -55,6 +55,7 @@ const SETTINGS_ICONS: &[(&str, &[u8])] = &[
     settings_icon!("keybindings"),
     settings_icon!("advanced"),
     settings_icon!("search"),
+    settings_icon!("more"),
     settings_icon!("chevron-down"),
     settings_icon!("chevron-up"),
     settings_icon!("reset"),
@@ -62,6 +63,7 @@ const SETTINGS_ICONS: &[(&str, &[u8])] = &[
 
 const COMMAND_PALETTE_ICONS: &[(&str, &[u8])] = &[
     palette_icon!("new-tab"),
+    palette_icon!("new-window"),
     palette_icon!("close-tab"),
     palette_icon!("tab-left"),
     palette_icon!("tab-right"),
@@ -115,9 +117,9 @@ impl AssetSource for EmbeddedAssets {
                 }
             }
         }
-        // App icons win; the shared UI asset source supplies Glassy assets and
-        // Termy's broader settings icon set.
-        termy_ui::Assets.load(trimmed)
+        // App icons win; the design system supplies whatever it ships that the
+        // app does not already embed.
+        Ok(crate::design_system::icon_bytes(trimmed).map(Cow::Borrowed))
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
@@ -129,11 +131,6 @@ impl AssetSource for EmbeddedAssets {
                 if prefix.is_empty() || key.starts_with(prefix) {
                     out.push(SharedString::from(*key));
                 }
-            }
-        }
-        for asset in termy_ui::Assets.list(prefix)? {
-            if !out.contains(&asset) {
-                out.push(asset);
             }
         }
         Ok(out)
@@ -155,11 +152,11 @@ mod tests {
     }
 
     #[test]
-    fn glassy_font_is_embedded() {
+    fn search_more_icon_is_embedded() {
         assert!(
             EmbeddedAssets
-                .load("fonts/InterVariable.ttf")
-                .expect("load Glassy font")
+                .load("icons/settings/more.svg")
+                .expect("load embedded search more icon")
                 .is_some()
         );
     }

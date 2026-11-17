@@ -4,8 +4,16 @@ use super::render_palette::{TabStripPalette, resolve_branding_text_color};
 use super::render_shared::TabStripRenderState;
 use super::render_tab_item::TabItemRenderInput;
 use super::state::{TabStripOrientation, TabStripOverflowState};
+use super::style::{
+    WINDOWS_TAB_ADD_BUTTON_WIDTH, WINDOWS_TAB_ADD_GLYPH, WINDOWS_TAB_ADD_GLYPH_SIZE,
+    WINDOWS_TAB_CORNER_RADIUS, WINDOWS_TAB_MENU_BUTTON_WIDTH, WINDOWS_TAB_MENU_GLYPH,
+    WINDOWS_TAB_MENU_GLYPH_SIZE, WINDOWS_TAB_RAIL_BUTTON_RADIUS, windows_tab_icon_font_family,
+    windows_tab_separator_visible, windows_tab_title_font_family,
+};
+use super::transitions::ClosingTabOverlaySlot;
 
 impl TerminalView {
+    #[cfg(not(target_os = "windows"))]
     fn render_inset_lane(id: &'static str, width: f32, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id(id)
@@ -23,7 +31,7 @@ impl TerminalView {
         font_family: &SharedString,
         termy_branding_slot_start_x: f32,
         termy_branding_slot_width: f32,
-        termy_branding_text_color: gpui::Rgba,
+        termy_branding_text_color: gpui_kit::Rgba,
     ) -> Option<AnyElement> {
         (termy_branding_slot_width > f32::EPSILON).then(|| {
             div()
@@ -53,7 +61,7 @@ impl TerminalView {
         window: &Window,
         colors: &TerminalColors,
         font_family: &SharedString,
-        tabbar_bg: gpui::Rgba,
+        tabbar_bg: gpui_kit::Rgba,
         _show_sidebar_chrome: bool,
         _cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
@@ -92,11 +100,11 @@ impl TerminalView {
         font_family: &SharedString,
         termy_branding_slot_start_x: f32,
         termy_branding_slot_width: f32,
-        termy_branding_text_color: gpui::Rgba,
+        termy_branding_text_color: gpui_kit::Rgba,
         workspace_actions: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
+        let lane = div()
             .id("tabbar-left-inset")
             .relative()
             .flex_none()
@@ -104,15 +112,23 @@ impl TerminalView {
             .h_full()
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 this.on_action_rail_mouse_move(event, window, cx);
-            }))
-            .children(Self::render_termy_branding(
-                font_family,
-                termy_branding_slot_start_x,
-                termy_branding_slot_width,
-                termy_branding_text_color,
-            ))
-            .children(workspace_actions)
-            .into_any_element()
+            }));
+        // Without workspace actions the inset holds only padding and the
+        // branding, so on Windows it moves the window like the caption.
+        #[cfg(target_os = "windows")]
+        let lane = if workspace_actions.is_none() {
+            lane.window_control_area(gpui_kit::WindowControlArea::Drag)
+        } else {
+            lane
+        };
+        lane.children(Self::render_termy_branding(
+            font_family,
+            termy_branding_slot_start_x,
+            termy_branding_slot_width,
+            termy_branding_text_color,
+        ))
+        .children(workspace_actions)
+        .into_any_element()
     }
 
     fn render_gutter_lane(gutter_width: f32, cx: &mut Context<Self>) -> AnyElement {
@@ -128,19 +144,45 @@ impl TerminalView {
             .into_any_element()
     }
 
+    /// The WinUI strip spans from the first tab to the caption buttons; it
+    /// lays out its own tabs, so Termy's tab widths do not apply.
+    pub(super) fn winui_tab_lane_width(geometry: &super::layout::TabStripGeometry) -> f32 {
+        (geometry.window_width - geometry.row_start_x - Self::winui_right_inset_width(geometry))
+            .max(0.0)
+    }
+
+    /// With the WinUI strip the right inset holds only the caption buttons.
+    fn winui_right_inset_width(geometry: &super::layout::TabStripGeometry) -> f32 {
+        geometry
+            .right_inset_width
+            .min(Self::titlebar_right_padding_for_platform())
+    }
+
+    /// Placeholder for the tab lane the WinUI strip covers. It must stay
+    /// client area: the island receives its input through this window, and
+    /// moves the window from its own empty space.
+    fn render_winui_tab_lane(width: f32) -> AnyElement {
+        div()
+            .id("tabbar-winui-lane")
+            .flex_none()
+            .w(px(width))
+            .h_full()
+            .into_any_element()
+    }
+
     fn should_render_left_inset_divider(overflow: TabStripOverflowState) -> bool {
         overflow.left
     }
 
-    fn horizontal_tab_render_width(display_width: f32, anim_progress: Option<f32>) -> f32 {
-        let stable_width = if display_width.is_finite() {
-            display_width.max(TAB_MIN_WIDTH)
-        } else {
-            TAB_MIN_WIDTH
-        };
+    fn horizontal_tab_render_width(
+        display_width: f32,
+        anim_progress: Option<f32>,
+        min_width: f32,
+    ) -> f32 {
+        let stable_width = Self::stable_tab_render_width(display_width, min_width);
 
         anim_progress.map_or(stable_width, |progress| {
-            (stable_width * progress.clamp(0.0, 1.0)).max(TAB_MIN_WIDTH)
+            (stable_width * progress.clamp(0.0, 1.0)).max(TAB_OPEN_ANIM_MIN_WIDTH)
         })
     }
 
@@ -157,16 +199,37 @@ impl TerminalView {
     ) -> AnyElement {
         let now = Instant::now();
         let new_tab_anim = self.new_tab_animation_progress(now);
+        let tab_count = self.session.tabs.len();
+        let metrics = self.horizontal_tab_metrics();
+        let windows_style = palette.style.is_windows_11();
+        let overlay_slots = self.tab_strip.transitions.overlay_slots(tab_count, now);
+        let mut tab_widths = Vec::with_capacity(tab_count);
+        for (index, tab) in self.session.tabs.iter().enumerate() {
+            let display_width = tab.display_width;
+            let anim_progress = new_tab_anim
+                .filter(|(anim_index, _)| *anim_index == index)
+                .map(|(_, progress)| progress);
+            tab_widths.push(Self::horizontal_tab_render_width(
+                display_width,
+                anim_progress,
+                metrics.min_width,
+            ));
+        }
+        let overlay_extra_width: f32 = overlay_slots
+            .iter()
+            .map(|slot| slot.width + metrics.item_gap)
+            .sum();
+        let content_width = state.content_width + overlay_extra_width;
         let mut tabs_scroll_content = div()
             .id("tabs-scroll-content")
             .flex_none()
-            .w(px(state.content_width))
-            .min_w(px(state.content_width))
+            .w(px(content_width))
+            .min_w(px(content_width))
             .h(px(TABBAR_HEIGHT))
             .flex()
             .relative()
             .items_center()
-            .gap(px(TAB_ITEM_GAP))
+            .gap(px(metrics.item_gap))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 this.on_tabs_content_mouse_move(TabStripOrientation::Horizontal, event, window, cx);
             }));
@@ -175,24 +238,34 @@ impl TerminalView {
             div()
                 .id("tabs-left-padding-spacer")
                 .flex_none()
-                .w(px(TAB_HORIZONTAL_PADDING))
+                .w(px(metrics.leading_padding))
                 .h(px(TABBAR_HEIGHT)),
         );
 
-        for index in 0..self.session.tabs.len() {
-            let (display_width, tab_title, pinned, progress_state) = {
+        for (index, &tab_width) in tab_widths.iter().enumerate() {
+            for slot in overlay_slots.iter().filter(|slot| slot.index == index) {
+                tabs_scroll_content = tabs_scroll_content.child(self.render_closing_tab_overlay(
+                    slot,
+                    window,
+                    palette,
+                    font_family,
+                    font_family_key,
+                ));
+            }
+            let (tab_title, pinned, progress_state, program_status) = {
                 let tab = &self.session.tabs[index];
                 (
-                    tab.display_width,
                     tab.title.clone(),
                     tab.pinned,
                     tab.aggregate_progress_state(),
+                    self.progress_indicator_enabled
+                        .then(|| tab.program_status_state())
+                        .flatten(),
                 )
             };
             let anim_progress = new_tab_anim
                 .filter(|(anim_index, _)| *anim_index == index)
                 .map(|(_, p)| p);
-            let tab_width = Self::horizontal_tab_render_width(display_width, anim_progress);
             let is_active = index == self.session.active_tab;
             let is_drag_source = self
                 .tab_strip
@@ -220,7 +293,7 @@ impl TerminalView {
             let close_slot_width = if !is_renaming
                 && (show_tab_close || show_tab_pin || switch_hint_label.is_some())
             {
-                TAB_CLOSE_SLOT_WIDTH
+                metrics.close_slot_width
             } else {
                 0.0
             };
@@ -242,14 +315,22 @@ impl TerminalView {
             let text_reserve_slot_width = if is_renaming {
                 0.0
             } else if reserves_close_slot {
-                TAB_CLOSE_SLOT_WIDTH
+                metrics.close_slot_width
             } else {
                 close_slot_width
             };
             let available_text_px = Self::tab_title_text_area_width(
                 tab_width,
                 text_reserve_slot_width + icon_slot_width,
+                metrics.text_padding_x,
             );
+            let show_trailing_separator = windows_style
+                && windows_tab_separator_visible(
+                    index,
+                    tab_count,
+                    self.session.active_tab,
+                    self.tab_strip.hovered_tab,
+                );
             let label = Self::format_tab_label_for_render_measured(
                 &tab_title,
                 available_text_px,
@@ -263,7 +344,7 @@ impl TerminalView {
                     orientation: TabStripOrientation::Horizontal,
                     index,
                     tab_primary_extent: tab_width,
-                    tab_cross_extent: TAB_ITEM_HEIGHT,
+                    tab_cross_extent: metrics.item_height,
                     label,
                     switch_hint_label,
                     is_active,
@@ -273,12 +354,14 @@ impl TerminalView {
                     show_tab_close,
                     show_tab_pin,
                     close_slot_width,
-                    text_padding_x: TAB_TEXT_PADDING_X,
+                    text_padding_x: metrics.text_padding_x,
                     label_centered: false,
                     drop_marker_side: self.tab_drop_marker_side(index),
                     open_anim_progress: anim_progress,
                     hover_progress: self.tab_strip.hover_progress(index, now),
                     progress_state,
+                    program_status,
+                    show_trailing_separator,
                 },
                 font_family,
                 colors,
@@ -289,7 +372,211 @@ impl TerminalView {
             tabs_scroll_content = tabs_scroll_content.child(tab_item);
         }
 
+        for slot in overlay_slots.iter().filter(|slot| slot.index >= tab_count) {
+            tabs_scroll_content = tabs_scroll_content.child(self.render_closing_tab_overlay(
+                slot,
+                window,
+                palette,
+                font_family,
+                font_family_key,
+            ));
+        }
+
         tabs_scroll_content.into_any_element()
+    }
+
+    /// Non-interactive chip for a just-closed tab. It collapses in place so
+    /// the surviving tabs glide into the freed space instead of jumping.
+    fn render_closing_tab_overlay(
+        &mut self,
+        slot: &ClosingTabOverlaySlot,
+        window: &Window,
+        palette: &TabStripPalette,
+        font_family: &SharedString,
+        font_family_key: &str,
+    ) -> AnyElement {
+        let mut chip_bg = if slot.was_active {
+            palette.active_tab_bg
+        } else {
+            palette.hovered_tab_bg
+        };
+        chip_bg.a *= slot.alpha;
+        let mut text_color = if slot.was_active {
+            palette.active_tab_text
+        } else {
+            palette.inactive_tab_text
+        };
+        text_color.a *= slot.alpha;
+        let metrics = palette.style.metrics();
+        let windows_style = palette.style.is_windows_11();
+        // Once the chip is too narrow to show text the pill keeps collapsing
+        // on its own.
+        let label = (slot.width >= TAB_OPEN_ANIM_MIN_WIDTH).then(|| {
+            let available_text_px = Self::tab_title_text_area_width(
+                slot.width,
+                TAB_LEADING_SLOT_WIDTH,
+                metrics.text_padding_x,
+            );
+            Self::format_tab_label_for_render_measured(
+                &slot.title,
+                available_text_px,
+                |candidate| {
+                    self.measure_tab_title_width(window, font_family, font_family_key, candidate)
+                },
+            )
+        });
+
+        let wrapper = div()
+            .flex_none()
+            .w(px(slot.width.max(0.0)))
+            .h(px(TABBAR_HEIGHT))
+            .flex();
+        let wrapper = if windows_style {
+            wrapper.items_end()
+        } else {
+            wrapper.items_center()
+        };
+        let chip = div()
+            .w_full()
+            .h(px(metrics.item_height))
+            .flex()
+            .items_center()
+            .overflow_hidden();
+        let chip = if windows_style {
+            chip.rounded_t(px(WINDOWS_TAB_CORNER_RADIUS))
+        } else {
+            chip.rounded(px(TAB_ITEM_RADIUS_HORIZONTAL))
+        };
+        wrapper
+            .child(
+                chip.bg(chip_bg)
+                    .px(px(metrics.text_padding_x))
+                    .children(label.map(|text| {
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_x_hidden()
+                            .whitespace_nowrap()
+                            .font_family(font_family.clone())
+                            .text_color(text_color)
+                            .text_size(px(TAB_HORIZONTAL_TITLE_FONT_SIZE))
+                            .text_ellipsis()
+                            .child(text)
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// Windows 11 style rail: "+" adds a tab right away and, when the
+    /// new-tab menu has choices, a chevron next to it opens that menu (like
+    /// Windows Terminal).
+    fn render_windows_action_rail(
+        &mut self,
+        state: &TabStripRenderState,
+        palette: &TabStripPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let geometry = state.geometry;
+        let mut icon_color = palette.inactive_tab_text;
+        icon_color.a = icon_color.a.max(0.70);
+        let mut hover_icon_color = palette.active_tab_text;
+        hover_icon_color.a = 1.0;
+        let hover_bg = palette.hovered_tab_bg;
+        let pressed_bg = palette.pressed_tab_bg;
+        let buttons_width = (geometry.button_end_x - geometry.button_start_x).max(0.0);
+        let button_height = (geometry.button_end_y - geometry.button_start_y).max(0.0);
+        let menu_button = buttons_width > WINDOWS_TAB_ADD_BUTTON_WIDTH + f32::EPSILON;
+        let add_width = buttons_width.min(WINDOWS_TAB_ADD_BUTTON_WIDTH);
+        let menu_width = (buttons_width - add_width).min(WINDOWS_TAB_MENU_BUTTON_WIDTH);
+        // The dropdown opens left-aligned under the chevron, kept inside the
+        // window.
+        let menu_x = geometry.button_start_x + add_width;
+        let menu_anchor = (
+            menu_x
+                .min(geometry.window_width - NEW_TAB_MENU_WIDTH - 4.0)
+                .max(4.0),
+            TABBAR_HEIGHT + 2.0,
+        );
+        let plus_anchor = (
+            (geometry.button_start_x)
+                .min(geometry.window_width - NEW_TAB_MENU_WIDTH - 4.0)
+                .max(4.0),
+            TABBAR_HEIGHT + 2.0,
+        );
+        let rail_button = |id: &'static str, width: f32, glyph: &'static str, glyph_size: f32| {
+            div()
+                .id(id)
+                .flex_none()
+                .w(px(width))
+                .h(px(button_height))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(WINDOWS_TAB_RAIL_BUTTON_RADIUS))
+                .font_family(windows_tab_icon_font_family())
+                .text_size(px(glyph_size))
+                .text_color(icon_color)
+                .hover(move |style| style.bg(hover_bg).text_color(hover_icon_color))
+                .active(move |style| style.bg(pressed_bg).text_color(hover_icon_color))
+                .cursor_pointer()
+                .child(glyph)
+        };
+
+        div()
+            .id("tabbar-action-rail")
+            .relative()
+            .flex_none()
+            .w(px(geometry.action_rail_width))
+            .h_full()
+            .on_scroll_wheel(cx.listener(Self::handle_tab_strip_action_rail_scroll_wheel))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                this.on_action_rail_mouse_move(event, window, cx);
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(geometry.button_start_x - geometry.action_rail_start_x))
+                    .top(px(geometry.button_start_y - TOP_STRIP_CONTENT_OFFSET_Y))
+                    .flex()
+                    .child(
+                        rail_button(
+                            "tabbar-new-tab-button",
+                            add_width,
+                            WINDOWS_TAB_ADD_GLYPH,
+                            WINDOWS_TAB_ADD_GLYPH_SIZE,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                                window.prevent_default();
+                                if menu_button {
+                                    this.close_new_tab_menu(cx);
+                                    this.add_tab(cx);
+                                } else {
+                                    this.handle_new_tab_button(plus_anchor, cx);
+                                }
+                                cx.stop_propagation();
+                            }),
+                        ),
+                    )
+                    .children((menu_button && menu_width > 0.0).then(|| {
+                        rail_button(
+                            "tabbar-new-tab-menu-button",
+                            menu_width,
+                            WINDOWS_TAB_MENU_GLYPH,
+                            WINDOWS_TAB_MENU_GLYPH_SIZE,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                                window.prevent_default();
+                                this.handle_new_tab_menu_button(menu_anchor, cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                    })),
+            )
+            .into_any_element()
     }
 
     fn render_action_rail(
@@ -298,6 +585,9 @@ impl TerminalView {
         palette: &TabStripPalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if palette.style.is_windows_11() {
+            return self.render_windows_action_rail(state, palette, cx);
+        }
         let mut button_bg = palette.hovered_tab_bg;
         button_bg.a = 0.0;
         let mut button_hover_bg = palette.hovered_tab_bg;
@@ -333,7 +623,7 @@ impl TerminalView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(TAB_ITEM_RADIUS))
+                    .rounded(px(TAB_ITEM_RADIUS_HORIZONTAL))
                     .bg(button_bg)
                     .text_color(icon_color)
                     .hover(move |style| style.bg(button_hover_bg))
@@ -347,8 +637,8 @@ impl TerminalView {
                         }),
                     )
                     .child(
-                        gpui::svg()
-                            .path(gpui::SharedString::from("icons/tab_strip/plus.svg"))
+                        gpui_kit::svg()
+                            .path(gpui_kit::SharedString::from("icons/tab_strip/plus.svg"))
                             .size(px(13.0))
                             .text_color(icon_color),
                     ),
@@ -361,13 +651,22 @@ impl TerminalView {
         window: &Window,
         colors: &TerminalColors,
         font_family: &SharedString,
-        tabbar_bg: gpui::Rgba,
+        tabbar_bg: gpui_kit::Rgba,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let font_family_key = font_family.as_ref();
+        let style = self.horizontal_tab_style();
+        // Windows 11 tabs use the system UI face; the rest of the row (branding,
+        // workspace actions) keeps the configured UI font.
+        let tab_font_family: SharedString = if style.is_windows_11() {
+            windows_tab_title_font_family().into()
+        } else {
+            font_family.clone()
+        };
+        let tab_font_family_key = tab_font_family.as_ref();
         let measured_title_widths =
-            self.measure_tab_title_widths(window, font_family, font_family_key);
+            self.measure_tab_title_widths(window, &tab_font_family, tab_font_family_key);
         self.sync_tab_title_text_widths(&measured_title_widths);
+        let font_family_key = font_family.as_ref();
 
         let base_left_inset_width = self.tab_strip_base_left_inset();
         let workspace_sidebar_visible = self.workspace_sidebar_visible();
@@ -388,7 +687,7 @@ impl TerminalView {
             window,
             base_left_inset_width + termy_branding_reserved_width + termy_branding_tab_gap,
         );
-        let palette = self.resolve_tab_strip_palette(colors, tabbar_bg);
+        let palette = self.resolve_horizontal_tab_strip_palette(colors, tabbar_bg, style);
         let termy_branding_slot_start_x =
             base_left_inset_width.min(state.geometry.left_inset_width);
         let termy_branding_slot_width = (state.geometry.left_inset_width
@@ -397,26 +696,35 @@ impl TerminalView {
             .min(termy_branding_reserved_width.max(0.0));
         let termy_branding_text_color =
             super::render_palette::resolve_branding_text_color(&palette);
-        let tabs_scroll_content = self.build_tabs_scroll_content(
-            window,
-            &state,
-            &palette,
-            font_family,
-            font_family_key,
-            colors,
-            cx,
-        );
+        #[cfg(target_os = "windows")]
+        let winui_strip = style.is_windows_11()
+            && self.sync_winui_tab_strip(window, &state, colors, tabbar_bg, cx);
+        #[cfg(not(target_os = "windows"))]
+        let winui_strip = false;
+        let tabs_scroll_content = (!winui_strip).then(|| {
+            self.build_tabs_scroll_content(
+                window,
+                &state,
+                &palette,
+                &tab_font_family,
+                tab_font_family_key,
+                colors,
+                cx,
+            )
+        });
         let show_left_inset_divider = Self::should_render_left_inset_divider(state.overflow_state);
         let workspace_actions = self
             .workspace_sidebar_actions_visible()
             .then(|| self.render_workspace_sidebar_titlebar_actions(&palette, cx));
 
-        div()
-            .w_full()
-            .h(px(TABBAR_HEIGHT))
-            .flex()
-            .border_b_1()
-            .border_color(palette.tab_stroke_color)
+        let strip = div().w_full().h(px(TABBAR_HEIGHT)).flex();
+        // Windows 11 tabs run straight into the content: no baseline stroke.
+        let strip = if style.is_windows_11() {
+            strip
+        } else {
+            strip.border_b_1().border_color(palette.tab_stroke_color)
+        };
+        strip
             .children((state.geometry.left_inset_width > 0.0).then(|| {
                 Self::render_left_inset_lane(
                     state.geometry.left_inset_width,
@@ -428,7 +736,12 @@ impl TerminalView {
                     cx,
                 )
             }))
-            .child(
+            .children(
+                winui_strip.then(|| {
+                    Self::render_winui_tab_lane(Self::winui_tab_lane_width(&state.geometry))
+                }),
+            )
+            .children(tabs_scroll_content.map(|tabs_scroll_content| {
                 div()
                     .id("tabs-scroll-viewport-lane")
                     .flex_none()
@@ -463,18 +776,38 @@ impl TerminalView {
                             .bottom_0()
                             .w(px(TAB_STROKE_THICKNESS))
                             .bg(palette.tab_stroke_color)
-                    })),
-            )
+                    }))
+            }))
             .children(
-                (state.geometry.gutter_width > 0.0)
+                (!winui_strip && state.geometry.gutter_width > 0.0)
                     .then(|| Self::render_gutter_lane(state.geometry.gutter_width, cx)),
             )
             .children(
-                (state.geometry.action_rail_width > 0.0)
+                (!winui_strip && state.geometry.action_rail_width > 0.0)
                     .then(|| self.render_action_rail(&state, &palette, cx)),
             )
             .children((state.geometry.right_inset_width > 0.0).then(|| {
-                Self::render_inset_lane("tabbar-right-inset", state.geometry.right_inset_width, cx)
+                #[cfg(target_os = "windows")]
+                {
+                    Self::render_windows_right_inset_lane(
+                        window,
+                        colors.foreground,
+                        if winui_strip {
+                            Self::winui_right_inset_width(&state.geometry)
+                        } else {
+                            state.geometry.right_inset_width
+                        },
+                        cx,
+                    )
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    Self::render_inset_lane(
+                        "tabbar-right-inset",
+                        state.geometry.right_inset_width,
+                        cx,
+                    )
+                }
             }))
             .into_any_element()
     }
@@ -519,15 +852,15 @@ mod tests {
     #[test]
     fn horizontal_tab_render_width_never_drops_below_minimum() {
         assert_eq!(
-            TerminalView::horizontal_tab_render_width(TAB_MAX_WIDTH, Some(0.0)),
-            TAB_MIN_WIDTH
+            TerminalView::horizontal_tab_render_width(TAB_MAX_WIDTH, Some(0.0), TAB_MIN_WIDTH),
+            TAB_OPEN_ANIM_MIN_WIDTH
         );
         assert_eq!(
-            TerminalView::horizontal_tab_render_width(TAB_MAX_WIDTH, Some(0.1)),
-            TAB_MIN_WIDTH
+            TerminalView::horizontal_tab_render_width(TAB_MAX_WIDTH, Some(0.1), TAB_MIN_WIDTH),
+            TAB_OPEN_ANIM_MIN_WIDTH
         );
         assert_eq!(
-            TerminalView::horizontal_tab_render_width(12.0, None),
+            TerminalView::horizontal_tab_render_width(12.0, None, TAB_MIN_WIDTH),
             TAB_MIN_WIDTH
         );
     }
@@ -535,8 +868,17 @@ mod tests {
     #[test]
     fn horizontal_tab_render_width_keeps_full_width_without_animation() {
         assert_eq!(
-            TerminalView::horizontal_tab_render_width(TAB_MAX_WIDTH, None),
+            TerminalView::horizontal_tab_render_width(TAB_MAX_WIDTH, None, TAB_MIN_WIDTH),
             TAB_MAX_WIDTH
+        );
+    }
+
+    #[test]
+    fn horizontal_tab_render_width_uses_style_minimum() {
+        let windows_min = HorizontalTabMetrics::WINDOWS_11.min_width;
+        assert_eq!(
+            TerminalView::horizontal_tab_render_width(12.0, None, windows_min),
+            windows_min
         );
     }
 }

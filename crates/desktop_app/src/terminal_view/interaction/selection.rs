@@ -1,6 +1,4 @@
 use super::*;
-#[cfg(test)]
-use alacritty_terminal::grid::Dimensions;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::terminal_view) struct HoveredLink {
@@ -55,25 +53,29 @@ pub(in crate::terminal_view) fn kitty_graphics_placement_bounds(
     cell_width: f32,
     cell_height: f32,
 ) -> KittyGraphicsPlacementBounds {
-    // Prefer explicit cell layout from core (including materialised natural
-    // size). Fall back to the occupied span, then raw source pixels.
-    let width = placement
-        .display_cols
-        .or_else(|| (placement.occupied_cols > 0).then_some(placement.occupied_cols))
-        .map_or(placement.source_width as f32, |cols| {
-            cols as f32 * cell_width
-        });
-    let height = placement
-        .display_rows
-        .or_else(|| (placement.occupied_rows > 0).then_some(placement.occupied_rows))
-        .map_or(placement.source_height as f32, |rows| {
-            rows as f32 * cell_height
-        });
+    let (width, height) = if placement.virtual_cell.is_some() {
+        (cell_width, cell_height)
+    } else {
+        termy_core::graphics_display_layout(
+            placement.source_width,
+            placement.source_height,
+            placement.display_cols,
+            placement.display_rows,
+            (cell_width, cell_height),
+            (placement.x_offset, placement.y_offset),
+            false,
+        )
+        .placement_size
+    };
     KittyGraphicsPlacementBounds {
-        left: placement.col as f32 * cell_width + placement.x_offset as f32,
-        top: placement.viewport_row as f32 * cell_height + placement.y_offset as f32,
+        left: (placement.col as f32 + placement.col_offset as f32) * cell_width
+            + placement.x_offset as f32,
+        top: (placement.viewport_row as f32 + placement.clip_top_rows as f32) * cell_height
+            + placement.y_offset as f32,
         width,
-        height,
+        height: (height
+            - (placement.clip_top_rows as f32 + placement.clip_bottom_rows as f32) * cell_height)
+            .max(0.0),
     }
 }
 
@@ -92,15 +94,22 @@ pub(in crate::terminal_view) fn kitty_graphics_placement_intersects_selection(
         return false;
     }
 
-    let image_start_line = i64::from(placement.viewport_row)
+    let origin_line = i64::from(placement.viewport_row)
         .saturating_sub(i64::try_from(display_offset).unwrap_or(i64::MAX));
-    let image_end_line = image_start_line
+    let image_start_line = origin_line.saturating_add(i64::from(placement.clip_top_rows));
+    let image_end_line = origin_line
         .saturating_add(i64::from(placement.occupied_rows))
+        .saturating_sub(i64::from(placement.clip_bottom_rows))
         .saturating_sub(1);
-    let image_left = placement.col;
-    let image_right = image_left
-        .saturating_add(placement.occupied_cols as usize)
+    let origin_col = (placement.col as i64).saturating_add(i64::from(placement.col_offset));
+    let right_col = origin_col
+        .saturating_add(i64::from(placement.occupied_cols))
         .saturating_sub(1);
+    if right_col < 0 || image_start_line > image_end_line {
+        return false;
+    }
+    let image_left = origin_col.max(0) as usize;
+    let image_right = right_col as usize;
     let start_line = i64::from(start.line);
     let end_line = i64::from(end.line);
 
@@ -149,6 +158,20 @@ fn topmost_kitty_graphics_placement_at_point(
         })
 }
 
+/// Rows output scrolled the pane's content up between two observations of
+/// the same pane. History growth counts them at any scroll position. Once
+/// history is full it stops growing, but the engine still raises the display
+/// offset to keep a scrolled viewport still; user scrolls resync the baseline,
+/// so offset changes left here come from output (or clearing history).
+fn content_rows_scrolled(previous: &ContentScrollBaseline, current: &ContentScrollBaseline) -> i32 {
+    let delta = |previous: usize, current: usize| {
+        i32::try_from(current as i64 - previous as i64).unwrap_or(0)
+    };
+    let grown = delta(previous.history_size, current.history_size);
+    let offset = delta(previous.display_offset, current.display_offset);
+    if grown > 0 { grown.max(offset) } else { offset }
+}
+
 fn cell_has_visible_foreground_text(line: &[Option<char>], col: usize) -> bool {
     match line.get(col).copied().flatten() {
         Some(c) => !c.is_whitespace(),
@@ -158,73 +181,39 @@ fn cell_has_visible_foreground_text(line: &[Option<char>], col: usize) -> bool {
 }
 
 #[cfg(test)]
-fn is_hidden_or_spacer(flags: Flags) -> bool {
-    flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN)
-}
-
-/// Trailing spacer occupies the right half of a wide character on the same
-/// line.  Only this variant should trigger the "go back one column" fallback
-/// when a selection endpoint or double-click lands on it.
-#[cfg(test)]
-fn is_trailing_wide_char_spacer(flags: Flags) -> bool {
-    flags.contains(Flags::WIDE_CHAR_SPACER) && !flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
-}
-
-#[cfg(test)]
-fn terminal_line_bounds(
-    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
-) -> Option<(i32, i32)> {
-    let screen_lines = i32::try_from(grid.screen_lines()).ok()?;
-    let total_lines = i32::try_from(grid.total_lines()).ok()?;
-    if screen_lines <= 0 || total_lines <= 0 {
+fn grid_line_text(terminal: &Terminal, line_idx: i32, cols: usize) -> Option<Vec<Option<char>>> {
+    let (range, lines) = terminal_line_texts(terminal, line_idx, line_idx)?;
+    if line_idx < range.first_line || line_idx > range.last_line {
         return None;
     }
-
-    let min_line = -(total_lines - screen_lines);
-    let max_line = screen_lines - 1;
-    Some((min_line, max_line))
-}
-
-#[cfg(test)]
-fn grid_line_text(
-    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
-    line_idx: i32,
-    cols: usize,
-) -> Option<Vec<Option<char>>> {
-    use alacritty_terminal::index::{Column, Line};
-
-    let (min_line, max_line) = terminal_line_bounds(grid)?;
-    if line_idx < min_line || line_idx > max_line {
-        return None;
-    }
-
-    let max_cols = cols.min(grid.columns());
+    let (_, texts) = lines.into_iter().next()?;
     let mut line = vec![Some(' '); cols];
-    let line_ref = &grid[Line(line_idx)];
-    for col in 0..max_cols {
-        let cell = &line_ref[Column(col)];
-        if is_trailing_wide_char_spacer(cell.flags) {
-            // Right half of a wide char — mark as None so it is filtered
-            // during copy and triggers the col-1 fallback for selection.
-            line[col] = None;
-            continue;
-        }
-        if is_hidden_or_spacer(cell.flags) {
-            // Leading spacer (wide char wrapped to next line) or hidden
-            // cell — keep as space so it does not trigger col-1 fallback.
-            continue;
-        }
-
-        let c = cell.c;
-        if c != '\0' {
-            line[col] = Some(if c.is_control() { ' ' } else { c });
-        }
+    for (dest, text) in line.iter_mut().zip(texts) {
+        *dest = text.and_then(|text| text.chars().next());
     }
     Some(line)
 }
 
 type TerminalLineText = Vec<Option<String>>;
 type TerminalLineTextRows = Vec<(i32, TerminalLineText)>;
+
+fn full_terminal_selection_range(terminal: &Terminal) -> Option<(SelectionPos, SelectionPos)> {
+    // An empty visit reads consistent bounds without traversing the scrollback cells.
+    let range = terminal.for_each_line_cell_range(1, 0, |_, _, _, _| {})?;
+    if range.columns == 0 || range.first_line > range.last_line {
+        return None;
+    }
+    Some((
+        SelectionPos {
+            col: 0,
+            line: range.first_line,
+        },
+        SelectionPos {
+            col: range.columns - 1,
+            line: range.last_line,
+        },
+    ))
+}
 
 fn terminal_line_texts(
     terminal: &Terminal,
@@ -525,7 +514,7 @@ impl TerminalView {
 
     pub(in super::super) fn position_to_pane_cell(
         &self,
-        position: gpui::Point<Pixels>,
+        position: gpui_kit::Point<Pixels>,
         clamp: bool,
     ) -> Option<(String, CellPos)> {
         let tab = self.session.tabs.get(self.session.active_tab)?;
@@ -550,13 +539,17 @@ impl TerminalView {
 
     fn kitty_image_at_position_with_negative_z(
         &self,
-        position: gpui::Point<Pixels>,
+        position: gpui_kit::Point<Pixels>,
         allow_negative_z_over_foreground: bool,
     ) -> Option<KittyImageSelection> {
         let (pane_id, cell) = self.position_to_pane_cell(position, false)?;
         let tab = self.session.tabs.get(self.session.active_tab)?;
         let pane = tab.panes.iter().find(|pane| pane.id == pane_id)?;
         let terminal = pane.terminal();
+        let placements = terminal.kitty_graphics_placements();
+        if placements.is_empty() {
+            return None;
+        }
         let size = terminal.size();
         let cell_width = size.cell_width;
         let cell_height = size.cell_height;
@@ -575,7 +568,6 @@ impl TerminalView {
 
         let foreground_wins = !allow_negative_z_over_foreground
             && self.pane_cell_has_foreground_semantics(pane_id.as_str(), cell);
-        let placements = terminal.kitty_graphics_placements();
         let placement = topmost_kitty_graphics_placement_at_point(
             &placements,
             local_x,
@@ -592,7 +584,7 @@ impl TerminalView {
     /// this path so a negative-z image can still offer Copy Image where text overlaps it.
     pub(in super::super) fn kitty_image_at_position(
         &self,
-        position: gpui::Point<Pixels>,
+        position: gpui_kit::Point<Pixels>,
     ) -> Option<KittyImageSelection> {
         self.kitty_image_at_position_with_negative_z(position, true)
     }
@@ -602,7 +594,7 @@ impl TerminalView {
     /// selectable.
     pub(in super::super) fn kitty_image_at_position_for_left_click(
         &self,
-        position: gpui::Point<Pixels>,
+        position: gpui_kit::Point<Pixels>,
     ) -> Option<KittyImageSelection> {
         self.kitty_image_at_position_with_negative_z(position, false)
     }
@@ -610,7 +602,7 @@ impl TerminalView {
     pub(in super::super) fn position_to_cell_in_pane(
         &self,
         pane_id: &str,
-        position: gpui::Point<Pixels>,
+        position: gpui_kit::Point<Pixels>,
         clamp: bool,
     ) -> Option<CellPos> {
         let tab = self.session.tabs.get(self.session.active_tab)?;
@@ -721,7 +713,7 @@ impl TerminalView {
 
     pub(in super::super) fn position_to_cell(
         &self,
-        position: gpui::Point<Pixels>,
+        position: gpui_kit::Point<Pixels>,
         clamp: bool,
     ) -> Option<CellPos> {
         let (pane_id, cell) = self.position_to_pane_cell(position, clamp)?;
@@ -730,7 +722,7 @@ impl TerminalView {
 
     pub(in super::super) fn position_to_selection_pos(
         &self,
-        position: gpui::Point<Pixels>,
+        position: gpui_kit::Point<Pixels>,
         clamp: bool,
     ) -> Option<SelectionPos> {
         let cell = self.position_to_cell(position, clamp)?;
@@ -739,7 +731,7 @@ impl TerminalView {
 
     pub(in super::super) fn position_to_pane_selection_pos(
         &self,
-        position: gpui::Point<Pixels>,
+        position: gpui_kit::Point<Pixels>,
         clamp: bool,
     ) -> Option<(String, SelectionPos)> {
         let (pane_id, cell) = self.position_to_pane_cell(position, clamp)?;
@@ -747,32 +739,54 @@ impl TerminalView {
         Some((pane_id, selection_pos))
     }
 
-    /// Sync content_scroll_baseline to the current display_offset after a user-initiated
-    /// scroll action, so that the next content-driven change is detected correctly.
-    pub(in super::super) fn sync_content_scroll_baseline(&mut self) {
-        self.content_scroll_baseline = self
-            .active_terminal()
-            .map_or(self.content_scroll_baseline, |t| t.scroll_state().0);
+    fn current_content_scroll_baseline(&self) -> ContentScrollBaseline {
+        let Some(tab) = self.session.tabs.get(self.session.active_tab) else {
+            return ContentScrollBaseline::default();
+        };
+        let Some(pane) = tab
+            .active_pane_index()
+            .and_then(|index| tab.panes.get(index))
+        else {
+            return ContentScrollBaseline::default();
+        };
+        let (display_offset, history_size) = pane.terminal().scroll_state();
+        ContentScrollBaseline {
+            pane: Some((tab.id, pane.id.clone())),
+            display_offset,
+            history_size,
+        }
     }
 
-    /// Adjust selection positions to compensate for display_offset changes caused by
-    /// new terminal content arriving while the user is scrolled into history.
-    /// Prevents the selection from visually drifting when Alacritty auto-adjusts the
-    /// scroll offset to keep the viewport stable.
-    pub(in super::super) fn adjust_selection_for_display_offset_change(
-        &mut self,
-        old_offset: usize,
-        new_offset: usize,
-    ) {
-        let delta = new_offset as i32 - old_offset as i32;
-        if delta == 0 {
+    /// Sync content_scroll_baseline to the current scroll state after a user-initiated
+    /// scroll action, so that the next content-driven change is detected correctly.
+    pub(in super::super) fn sync_content_scroll_baseline(&mut self) {
+        self.content_scroll_baseline = self.current_content_scroll_baseline();
+    }
+
+    /// Move the selection with content that output scrolled since the last
+    /// observation, so it keeps covering the same text at any scroll position.
+    pub(in super::super) fn follow_content_scroll_with_selection(&mut self) {
+        let current = self.current_content_scroll_baseline();
+        let previous = std::mem::replace(&mut self.content_scroll_baseline, current);
+        // Another pane's scroll state says nothing about this selection.
+        if previous.pane != self.content_scroll_baseline.pane {
+            return;
+        }
+        let rows = content_rows_scrolled(&previous, &self.content_scroll_baseline);
+        self.adjust_selection_for_content_scroll(rows);
+    }
+
+    /// Shift selection positions up by `rows` lines of content that output
+    /// scrolled, keeping them on the text they covered.
+    fn adjust_selection_for_content_scroll(&mut self, rows: i32) {
+        if rows == 0 {
             return;
         }
         if let Some(anchor) = &mut self.selection_anchor {
-            anchor.line -= delta;
+            anchor.line -= rows;
         }
         if let Some(head) = &mut self.selection_head {
-            head.line -= delta;
+            head.line -= rows;
         }
     }
 
@@ -780,6 +794,22 @@ impl TerminalView {
         let (start, end) = self.selection_range()?;
         let terminal = self.active_terminal()?;
         selected_text_from_terminal(terminal, start, end)
+    }
+
+    pub(in super::super) fn select_all_terminal_contents(&mut self) -> bool {
+        let Some((anchor, head)) = self
+            .active_terminal()
+            .and_then(full_terminal_selection_range)
+        else {
+            return false;
+        };
+        self.clear_selection();
+        self.pending_cursor_move_click = None;
+        self.pending_cursor_move_preview = None;
+        self.selection_anchor = Some(anchor);
+        self.selection_head = Some(head);
+        self.selection_moved = true;
+        true
     }
 
     fn terminal_selection_char_class(c: char) -> TerminalSelectionCharClass {
@@ -926,47 +956,197 @@ impl TerminalView {
         }
         #[cfg(target_os = "macos")]
         {
+            let Some(target) = unix_link_open_target(url) else {
+                return false;
+            };
             Command::new("open")
-                .arg(url)
+                .arg(&target)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-                .is_ok_and(|_| true)
+                .is_ok()
         }
         #[cfg(target_os = "linux")]
         {
-            return Command::new("xdg-open")
-                .arg(url)
+            let Some(target) = unix_link_open_target(url) else {
+                return false;
+            };
+            Command::new("xdg-open")
+                .arg(&target)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-                .map(|_| true)
-                .unwrap_or(false);
+                .is_ok()
         }
         #[cfg(target_os = "windows")]
         {
-            webbrowser::open(url).is_ok()
+            // ShellExecuteW starts the registered handler directly; no shell
+            // parses the target, so cmd metacharacters need no filtering.
+            let Some(target) = windows_link_open_target(url) else {
+                return false;
+            };
+            crate::config::shell_execute_open(std::ffi::OsStr::new(&target)).is_ok()
         }
     }
 
-    pub(in super::super) fn is_link_modifier(modifiers: gpui::Modifiers) -> bool {
+    pub(in super::super) fn is_link_modifier(modifiers: gpui_kit::Modifiers) -> bool {
         modifiers.secondary() && !modifiers.alt && !modifiers.function
     }
 }
 
 fn is_safe_url_for_system_opener(url: &str) -> bool {
-    if url.bytes().any(|byte| byte.is_ascii_control()) {
-        return false;
+    !url.bytes().any(|byte| byte.is_ascii_control())
+}
+
+/// What the macOS/Linux system opener (`open` / `xdg-open`) should receive for a
+/// link: web and mail URLs as they are, and `file:` URLs only when they resolve
+/// to a path that already exists on disk. Every other scheme is refused.
+///
+/// OSC 8 hyperlink targets are attacker-controlled (any program writing to the
+/// terminal picks the URI, and its displayed text can be spoofed), and they
+/// otherwise bypass the scheme validation that the heuristic link detector
+/// applies. Handing an unvalidated URI to `open`/`xdg-open` would let a single
+/// click launch arbitrary registered scheme handlers (`smb:` auto-mounting and
+/// leaking credentials, `vscode:`/custom app schemes, …). This mirrors the
+/// `windows_link_open_target` allowlist so every platform vets the scheme.
+///
+/// Every accepted target begins with an alphabetic scheme (`http`/`https`/
+/// `mailto`/`file`), so a validated URL can never start with `-` and be misread
+/// as an `open`/`xdg-open` option.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn unix_link_open_target(url: &str) -> Option<String> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")
+    {
+        return Some(url.to_string());
     }
 
-    #[cfg(target_os = "windows")]
-    if url.bytes().any(|byte| b"&|<>^".contains(&byte)) {
-        return false;
+    if lower.starts_with("file:") {
+        let path = unix_file_url_to_path(&url["file:".len()..])?;
+        // Only forward `file:` links that point at an existing local file, the
+        // same bar the heuristic detector applies; the original URL is handed to
+        // the opener once the path is confirmed.
+        if std::path::Path::new(&path).exists() {
+            return Some(url.to_string());
+        }
+        return None;
     }
 
-    true
+    None
+}
+
+/// The local filesystem path a `file:` URL refers to, given the text after the
+/// `file:` scheme. Accepts `file:///path`, `file://localhost/path`, and
+/// `file:/path`; refuses a remote authority (`file://host/path`), which is a
+/// network location rather than a local file. Returns an absolute path.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn unix_file_url_to_path(rest: &str) -> Option<String> {
+    let after_authority = if let Some(rest) = rest.strip_prefix("//") {
+        // `//authority/path` — the path starts at the first slash.
+        let slash = rest.find('/')?;
+        let authority = &rest[..slash];
+        if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
+            return None;
+        }
+        &rest[slash..]
+    } else {
+        // `file:/path` with no authority component.
+        rest
+    };
+
+    let path_part = after_authority
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(after_authority);
+    let decoded = percent_decode(path_part)?;
+    decoded.starts_with('/').then_some(decoded)
+}
+
+/// What the Windows shell should open for a link: web and mail URLs as they
+/// are, `file:` URLs and absolute paths (`C:\...`, `\\server\share\...`) as
+/// paths. Other schemes would reach arbitrary protocol handlers, and `\\?\` or
+/// `\\.\` device paths are not documents, so both are refused.
+#[cfg(any(target_os = "windows", test))]
+fn windows_link_open_target(url: &str) -> Option<String> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")
+    {
+        return Some(url.to_string());
+    }
+
+    let path = if lower.starts_with("file:") {
+        windows_file_url_to_path(&url["file:".len()..])?
+    } else {
+        url.replace('/', "\\")
+    };
+    (is_windows_absolute_drive_path(&path) || is_windows_unc_share_path(&path)).then_some(path)
+}
+
+/// The path of a `file:` URL, given without its scheme: a drive path, or a
+/// UNC path for `file://server/share`. Termy's own link detection builds
+/// these without percent-encoding, so a local path that exists as written
+/// wins over its decoded form.
+#[cfg(any(target_os = "windows", test))]
+fn windows_file_url_to_path(rest: &str) -> Option<String> {
+    let local = if rest
+        .get(..12)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("//localhost/"))
+    {
+        &rest[12..]
+    } else if let Some(local) = rest.strip_prefix("///") {
+        local
+    } else if rest.starts_with("//") {
+        // `file://server/share/...` keeps its leading slashes as `\\server`.
+        rest
+    } else {
+        rest.strip_prefix('/').unwrap_or(rest)
+    };
+
+    let raw = local.replace('/', "\\");
+    if is_windows_absolute_drive_path(&raw) && std::path::Path::new(&raw).exists() {
+        return Some(raw);
+    }
+
+    let without_suffix = local.split(['?', '#']).next().unwrap_or(local);
+    Some(percent_decode(without_suffix)?.replace('/', "\\"))
+}
+
+/// `\\server\share...` with a real server name, not a `\\?\` or `\\.\` path.
+#[cfg(any(target_os = "windows", test))]
+fn is_windows_unc_share_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix(r"\\") else {
+        return false;
+    };
+    let mut parts = rest.split('\\');
+    let server = parts.next().unwrap_or_default();
+    let share = parts.next().unwrap_or_default();
+    !server.is_empty() && server != "?" && server != "." && !share.is_empty()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn is_windows_absolute_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = value.get(index + 1..index + 3)?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 #[cfg(test)]
@@ -974,6 +1154,186 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use termy_core::TerminalSize;
+
+    fn selection_test_window(cx: &mut App, tabs: usize) -> gpui_kit::WindowHandle<TerminalView> {
+        use gpui_kit::AppContext as _;
+        cx.open_window(gpui_kit::WindowOptions::default(), |window, cx| {
+            cx.new(|cx| {
+                let config = crate::config::AppConfig {
+                    tmux_enabled: false,
+                    native_tab_persistence: false,
+                    sidebar_enabled: false,
+                    ..Default::default()
+                };
+                let mut view = TerminalView::new_for_window(window, cx, config, true);
+                view.owns_persisted_session = false;
+                let size = TerminalSize {
+                    cols: 12,
+                    rows: 4,
+                    ..TerminalSize::default()
+                };
+                for _ in 0..tabs {
+                    let id = view.allocate_tab_id();
+                    let tab = TerminalView::create_native_tab(
+                        id,
+                        Terminal::new_test_display(size),
+                        size.cols,
+                        size.rows,
+                        None,
+                    );
+                    view.session.tabs.push(tab);
+                }
+                view
+            })
+        })
+        .unwrap()
+    }
+
+    fn select_on_line(view: &mut TerminalView, line: i32, last_col: usize) {
+        view.selection_anchor = Some(SelectionPos { col: 0, line });
+        view.selection_head = Some(SelectionPos {
+            col: last_col,
+            line,
+        });
+        view.selection_moved = true;
+    }
+
+    #[gpui_kit::test]
+    fn selection_follows_text_that_output_scrolls_at_the_live_bottom(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let window = selection_test_window(cx, 1);
+            window
+                .update(cx, |view, _, _| {
+                    view.session.active_tab = 0;
+                    let terminal = view.active_terminal().unwrap();
+                    terminal.hydrate_output(b"zero\r\none\r\ntwo");
+                    assert_eq!(terminal.scroll_state().0, 0);
+                    view.sync_content_scroll_baseline();
+                    select_on_line(view, 1, 2);
+                    assert_eq!(view.selected_text().as_deref(), Some("one"));
+
+                    // Output scrolls "one" into history without moving the viewport.
+                    let terminal = view.active_terminal().unwrap();
+                    let rows = usize::from(terminal.size().rows);
+                    terminal.hydrate_output("\r\nmore".repeat(rows).as_bytes());
+                    let (display_offset, history_size) = terminal.scroll_state();
+                    assert_eq!(display_offset, 0);
+                    assert!(history_size >= 2, "\"one\" must reach history");
+                    view.follow_content_scroll_with_selection();
+                    assert_eq!(view.selected_text().as_deref(), Some("one"));
+                })
+                .unwrap();
+        });
+    }
+
+    #[gpui_kit::test]
+    fn selection_ignores_scroll_offset_left_by_the_previous_pane(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let window = selection_test_window(cx, 2);
+            window
+                .update(cx, |view, _, _| {
+                    for tab in &view.session.tabs {
+                        tab.active_terminal()
+                            .unwrap()
+                            .hydrate_output(b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng");
+                    }
+                    assert!(
+                        view.session.tabs[1]
+                            .active_terminal()
+                            .unwrap()
+                            .scroll_display(2)
+                    );
+                    view.session.active_tab = 0;
+                    view.sync_content_scroll_baseline();
+
+                    view.session.active_tab = 1;
+                    select_on_line(view, 1, 0);
+                    let selected = view.selected_text();
+                    assert_eq!(selected.as_deref(), Some("e"));
+                    view.follow_content_scroll_with_selection();
+                    assert_eq!(view.selected_text(), selected);
+                })
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn content_scroll_counts_history_growth_and_scrolled_viewport_shifts() {
+        let state = |display_offset, history_size| ContentScrollBaseline {
+            pane: Some((1, "%1".into())),
+            display_offset,
+            history_size,
+        };
+        // At the live bottom only history grows.
+        assert_eq!(content_rows_scrolled(&state(0, 10), &state(0, 13)), 3);
+        // Scrolled into history the engine also raises the offset.
+        assert_eq!(content_rows_scrolled(&state(4, 10), &state(7, 13)), 3);
+        // Full history: only the offset shows the scroll.
+        assert_eq!(content_rows_scrolled(&state(4, 100), &state(6, 100)), 2);
+        assert_eq!(content_rows_scrolled(&state(0, 100), &state(0, 100)), 0);
+    }
+
+    #[test]
+    fn select_all_copies_history_and_viewport_even_while_scrolled() {
+        let size = TerminalSize {
+            cols: 12,
+            rows: 2,
+            ..TerminalSize::default()
+        };
+        for terminal in [
+            Terminal::new_test_display(size),
+            Terminal::new_tmux(size, TerminalOptions::default()),
+        ] {
+            terminal.hydrate_output(b"first\r\nsecond\r\nlast");
+            let (start, end) = full_terminal_selection_range(&terminal).unwrap();
+            assert_eq!(start, SelectionPos { line: -1, col: 0 });
+            assert_eq!(end, SelectionPos { line: 1, col: 11 });
+            assert_eq!(
+                selected_text_from_terminal(&terminal, start, end).as_deref(),
+                Some("first\nsecond\nlast")
+            );
+            assert!(terminal.scroll_display(1));
+            assert_eq!(full_terminal_selection_range(&terminal), Some((start, end)));
+            assert_eq!(
+                selected_text_from_terminal(&terminal, start, end).as_deref(),
+                Some("first\nsecond\nlast")
+            );
+        }
+    }
+
+    #[test]
+    fn select_all_uses_only_the_active_screen() {
+        let size = TerminalSize {
+            cols: 12,
+            rows: 2,
+            ..TerminalSize::default()
+        };
+        for terminal in [
+            Terminal::new_test_display(size),
+            Terminal::new_tmux(size, TerminalOptions::default()),
+        ] {
+            terminal.hydrate_output(b"history\r\nnormal\r\nlast");
+            let normal = full_terminal_selection_range(&terminal).unwrap();
+            terminal.hydrate_output(b"\x1b[?1049h\x1b[2J\x1b[Htop\r\nbottom");
+            let (start, end) = full_terminal_selection_range(&terminal).unwrap();
+            assert_eq!(start, SelectionPos { line: 0, col: 0 });
+            assert_eq!(end, SelectionPos { line: 1, col: 11 });
+            assert_eq!(
+                selected_text_from_terminal(&terminal, start, end).as_deref(),
+                Some("top\nbottom")
+            );
+            terminal.hydrate_output(b"\x1b[?1049l");
+            assert_eq!(full_terminal_selection_range(&terminal), Some(normal));
+            assert_eq!(
+                selected_text_from_terminal(&terminal, normal.0, normal.1).as_deref(),
+                Some("history\nnormal\nlast")
+            );
+        }
+    }
 
     #[test]
     fn hovered_link_contains_each_cell_in_wrapped_span() {
@@ -1005,12 +1365,19 @@ mod tests {
             placement_serial,
             image_id: 7,
             placement_id: 3,
-            png: Arc::from([placement_serial as u8]),
+            image: Arc::new(termy_core::GraphicsImage::from_rgba(
+                1,
+                1,
+                vec![placement_serial as u8; 4],
+            )),
             image_width: 20,
             image_height: 40,
             image_generation: 11,
+            animation_deadline: None,
             viewport_row,
             col,
+            col_offset: 0,
+            virtual_cell: None,
             source_x: 0,
             source_y: 0,
             source_width: 20,
@@ -1019,6 +1386,8 @@ mod tests {
             display_rows: Some(2),
             occupied_cols,
             occupied_rows,
+            clip_top_rows: 0,
+            clip_bottom_rows: 0,
             x_offset: 3,
             y_offset: 4,
             z_index,
@@ -1029,7 +1398,7 @@ mod tests {
     fn kitty_placement_bounds_and_hit_testing_match_render_geometry() {
         let mut earlier = kitty_placement(1, 2, 1, 2, 2, 4);
         let later = kitty_placement(2, 2, 1, 2, 2, 4);
-        earlier.png = Arc::from([99]);
+        earlier.image = Arc::new(termy_core::GraphicsImage::from_png(1, 1, vec![99]));
         let placements = vec![earlier, later];
 
         let bounds = kitty_graphics_placement_bounds(&placements[0], 10.0, 20.0);
@@ -1038,8 +1407,8 @@ mod tests {
             KittyGraphicsPlacementBounds {
                 left: 13.0,
                 top: 44.0,
-                width: 20.0,
-                height: 40.0,
+                width: 17.0,
+                height: 36.0,
             }
         );
         assert_eq!(
@@ -1177,8 +1546,8 @@ mod tests {
     fn kitty_image_selection_equality_ignores_png_bytes() {
         let mut first = kitty_placement(9, 0, 0, 1, 1, 0);
         let mut second = first.clone();
-        first.png = Arc::from([1, 2, 3]);
-        second.png = Arc::from([9, 8, 7]);
+        first.image = Arc::new(termy_core::GraphicsImage::from_png(1, 1, vec![1, 2, 3]));
+        second.image = Arc::new(termy_core::GraphicsImage::from_png(1, 1, vec![9, 8, 7]));
 
         assert_eq!(
             KittyImageSelection {
@@ -1200,7 +1569,7 @@ mod tests {
             placement: selected_placement.clone(),
         };
         let mut current = selected_placement;
-        current.png = Arc::from([99, 98, 97]);
+        current.image = Arc::new(termy_core::GraphicsImage::from_png(1, 1, vec![99, 98, 97]));
 
         assert!(
             selection
@@ -1253,22 +1622,143 @@ mod tests {
 
     #[test]
     fn link_modifier_requires_secondary_key() {
-        assert!(!TerminalView::is_link_modifier(gpui::Modifiers::default()));
+        assert!(!TerminalView::is_link_modifier(
+            gpui_kit::Modifiers::default()
+        ));
         assert!(TerminalView::is_link_modifier(
-            gpui::Modifiers::secondary_key()
+            gpui_kit::Modifiers::secondary_key()
         ));
     }
 
     #[test]
     fn link_modifier_ignores_alt_and_function_chords() {
-        assert!(!TerminalView::is_link_modifier(gpui::Modifiers {
+        assert!(!TerminalView::is_link_modifier(gpui_kit::Modifiers {
             alt: true,
-            ..gpui::Modifiers::secondary_key()
+            ..gpui_kit::Modifiers::secondary_key()
         }));
-        assert!(!TerminalView::is_link_modifier(gpui::Modifiers {
+        assert!(!TerminalView::is_link_modifier(gpui_kit::Modifiers {
             function: true,
-            ..gpui::Modifiers::secondary_key()
+            ..gpui_kit::Modifiers::secondary_key()
         }));
+    }
+
+    #[test]
+    fn system_opener_rejects_only_control_characters() {
+        assert!(is_safe_url_for_system_opener(
+            "https://example.com/?a=1&b=<2>|^"
+        ));
+        assert!(!is_safe_url_for_system_opener("https://example.com/\n"));
+    }
+
+    #[test]
+    fn windows_link_targets_keep_web_urls_and_map_file_urls_to_paths() {
+        assert_eq!(
+            windows_link_open_target("https://example.com/?a=1&b=2").as_deref(),
+            Some("https://example.com/?a=1&b=2")
+        );
+        assert_eq!(
+            windows_link_open_target("file:///C:/Users/me/My%20Notes.txt").as_deref(),
+            Some(r"C:\Users\me\My Notes.txt")
+        );
+        assert_eq!(
+            windows_link_open_target("file://localhost/D:/a.txt").as_deref(),
+            Some(r"D:\a.txt")
+        );
+        assert_eq!(
+            windows_link_open_target(r"C:\work\a & b.txt").as_deref(),
+            Some(r"C:\work\a & b.txt")
+        );
+    }
+
+    #[test]
+    fn windows_link_targets_open_unc_shares() {
+        for target in [
+            "file://server/share/x.txt",
+            "file://///server/share/x.txt",
+            r"\\server\share\x.txt",
+        ] {
+            assert_eq!(
+                windows_link_open_target(target).as_deref(),
+                Some(r"\\server\share\x.txt"),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_link_targets_refuse_device_paths_and_other_schemes() {
+        for target in [
+            r"\\?\UNC\server\share",
+            r"\\.\pipe\name",
+            "file://./pipe/name",
+            "ms-settings:display",
+            "search-ms:query=x",
+            "relative/path.txt",
+        ] {
+            assert_eq!(windows_link_open_target(target), None, "{target}");
+        }
+    }
+
+    #[test]
+    fn unix_link_targets_keep_web_and_mail_urls() {
+        for target in [
+            "http://example.com/a?b=1&c=2",
+            "https://example.com/path#frag",
+            "mailto:someone@example.com",
+        ] {
+            assert_eq!(
+                unix_link_open_target(target).as_deref(),
+                Some(target),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn unix_link_targets_refuse_dangerous_schemes() {
+        // The OSC 8 escape-attack vector: spoofed link text, hostile target.
+        for target in [
+            "smb://attacker.example/share",
+            "file://attacker.example/share/x.txt",
+            "vscode://ms-vscode.remote/x",
+            "javascript:alert(1)",
+            "x-apple.systempreferences:com.apple.preference",
+            "shortcuts://run-shortcut?name=x",
+            "ftp://host/x",
+            "relative/path.txt",
+            "-R",
+            "file:///no/such/termy/file/should/exist",
+        ] {
+            assert_eq!(unix_link_open_target(target), None, "{target}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_link_targets_allow_file_urls_only_for_existing_paths() {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        let path = file.path().to_str().expect("utf-8 path");
+        let url = format!("file://{path}");
+
+        assert_eq!(
+            unix_link_open_target(&url).as_deref(),
+            Some(url.as_str()),
+            "existing file should be opened"
+        );
+
+        let localhost_url = format!("file://localhost{path}");
+        assert_eq!(
+            unix_link_open_target(&localhost_url).as_deref(),
+            Some(localhost_url.as_str()),
+            "file://localhost should map to the same local path"
+        );
+
+        drop(file);
+        assert_eq!(
+            unix_link_open_target(&url),
+            None,
+            "a file that no longer exists must not be opened"
+        );
     }
 
     #[test]
@@ -1280,28 +1770,21 @@ mod tests {
     }
 
     fn non_empty_grid_lines(terminal: &Terminal) -> Vec<(i32, String)> {
-        let mut lines = Vec::new();
-        let cols = usize::from(terminal.size().cols);
-        let _ = terminal.with_tmux_grid(|grid| {
-            let Some((min_line, max_line)) = terminal_line_bounds(grid) else {
-                return;
-            };
-            for line_idx in min_line..=max_line {
-                let Some(chars) = grid_line_text(grid, line_idx, cols) else {
-                    continue;
-                };
-                let rendered = chars
-                    .iter()
-                    .filter_map(|c| *c)
+        let Some((_, lines)) = terminal_line_texts(terminal, i32::MIN, i32::MAX) else {
+            return Vec::new();
+        };
+        lines
+            .into_iter()
+            .filter_map(|(line, cells)| {
+                let text = cells
+                    .into_iter()
+                    .flatten()
                     .collect::<String>()
                     .trim_end()
                     .to_string();
-                if !rendered.is_empty() {
-                    lines.push((line_idx, rendered));
-                }
-            }
-        });
-        lines
+                (!text.is_empty()).then_some((line, text))
+            })
+            .collect()
     }
 
     #[test]
@@ -1324,7 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn tmon_detects_wrapped_urls_and_osc8_links() {
+    fn custom_engine_detects_wrapped_urls_and_osc8_links() {
         let size = TerminalSize {
             cols: 10,
             rows: 4,
@@ -1432,7 +1915,7 @@ mod tests {
                 .any(|c| c.is_some_and(|ch| !ch.is_whitespace()))
         );
 
-        let native = Terminal::new_native(size, None, None, None, None, None)
+        let native = Terminal::new_native(size, None, None, None, None, None, None)
             .expect("native terminal should initialize for row adapter test");
         // Use replay hydration here instead of a live shell command so the row
         // adapter test stays deterministic across different local shells and PTY timing.
@@ -1585,10 +2068,7 @@ mod tests {
         // "你好" — each char occupies 2 cells: char + trailing spacer.
         terminal.feed_output("你好".as_bytes());
 
-        let line = terminal
-            .with_tmux_grid(|grid| grid_line_text(grid, 0, 10))
-            .flatten()
-            .expect("line 0 should exist");
+        let line = grid_line_text(&terminal, 0, 10).expect("line 0 should exist");
 
         assert_eq!(line[0], Some('你'));
         assert_eq!(line[1], None, "trailing spacer should be None");
@@ -1617,20 +2097,14 @@ mod tests {
         // Line 1 col 0: '文', col 1: trailing spacer (None)
         terminal.feed_output("src/文".as_bytes());
 
-        let line0 = terminal
-            .with_tmux_grid(|grid| grid_line_text(grid, 0, 5))
-            .flatten()
-            .expect("line 0");
+        let line0 = grid_line_text(&terminal, 0, 5).expect("line 0");
         assert_eq!(
             line0[4],
             Some(' '),
             "leading spacer should be Some(' '), not None"
         );
 
-        let line1 = terminal
-            .with_tmux_grid(|grid| grid_line_text(grid, 1, 5))
-            .flatten()
-            .expect("line 1");
+        let line1 = grid_line_text(&terminal, 1, 5).expect("line 1");
         assert_eq!(line1[0], Some('文'));
         assert_eq!(line1[1], None, "trailing spacer should be None");
     }
@@ -1744,6 +2218,7 @@ mod tests {
                 degraded: false,
                 tmux_mouse_mode: None,
                 progress_state: ProgressState::default(),
+                program_status: Vec::new(),
                 terminal: left_terminal,
                 render_cache: std::cell::RefCell::new(TerminalPaneRenderCache::default()),
                 last_alternate_screen: std::cell::Cell::new(false),
@@ -1759,6 +2234,7 @@ mod tests {
                 degraded: false,
                 tmux_mouse_mode: None,
                 progress_state: ProgressState::default(),
+                program_status: Vec::new(),
                 terminal: right_terminal,
                 render_cache: std::cell::RefCell::new(TerminalPaneRenderCache::default()),
                 last_alternate_screen: std::cell::Cell::new(false),
@@ -1829,6 +2305,7 @@ mod tests {
                 degraded: false,
                 tmux_mouse_mode: None,
                 progress_state: ProgressState::default(),
+                program_status: Vec::new(),
                 terminal: left_terminal,
                 render_cache: std::cell::RefCell::new(TerminalPaneRenderCache::default()),
                 last_alternate_screen: std::cell::Cell::new(false),
@@ -1844,6 +2321,7 @@ mod tests {
                 degraded: false,
                 tmux_mouse_mode: None,
                 progress_state: ProgressState::default(),
+                program_status: Vec::new(),
                 terminal: right_terminal,
                 render_cache: std::cell::RefCell::new(TerminalPaneRenderCache::default()),
                 last_alternate_screen: std::cell::Cell::new(false),
@@ -1928,6 +2406,7 @@ mod tests {
                 degraded: false,
                 tmux_mouse_mode: None,
                 progress_state: ProgressState::default(),
+                program_status: Vec::new(),
                 terminal,
                 render_cache: std::cell::RefCell::new(TerminalPaneRenderCache::default()),
                 last_alternate_screen: std::cell::Cell::new(false),
@@ -2015,6 +2494,7 @@ mod tests {
                 degraded: false,
                 tmux_mouse_mode: None,
                 progress_state: ProgressState::default(),
+                program_status: Vec::new(),
                 terminal: left_terminal,
                 render_cache: std::cell::RefCell::new(TerminalPaneRenderCache::default()),
                 last_alternate_screen: std::cell::Cell::new(false),
@@ -2030,6 +2510,7 @@ mod tests {
                 degraded: false,
                 tmux_mouse_mode: None,
                 progress_state: ProgressState::default(),
+                program_status: Vec::new(),
                 terminal: right_terminal,
                 render_cache: std::cell::RefCell::new(TerminalPaneRenderCache::default()),
                 last_alternate_screen: std::cell::Cell::new(false),

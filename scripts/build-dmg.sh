@@ -39,6 +39,7 @@ Notarization options (require a signing identity):
 Environment variable defaults:
   TERMY_SIGN_IDENTITY  TERMY_ENTITLEMENTS
   TERMY_NOTARY_PROFILE TERMY_NOTARY_KEY TERMY_NOTARY_KEY_ID TERMY_NOTARY_ISSUER
+  TERMY_SPARKLE_FEED_URL TERMY_SPARKLE_PUBLIC_ED_KEY
 
 Output:
   dist/Termy-<version>-macos-<arch>[-signed].dmg
@@ -93,6 +94,60 @@ ensure_termy_url_scheme() {
   /usr/bin/plutil -lint "$plist_path" >/dev/null
 }
 
+ensure_folder_document_type() {
+  local plist_path="$1/Contents/Info.plist"
+  local plist_buddy="/usr/libexec/PlistBuddy"
+
+  [[ -f "$plist_path" ]] || die "App bundle Info.plist not found at $plist_path"
+  [[ -x "$plist_buddy" ]] || die "PlistBuddy is required to patch $plist_path"
+
+  "$plist_buddy" -c "Delete :CFBundleDocumentTypes" "$plist_path" >/dev/null 2>&1 || true
+  "$plist_buddy" -c "Add :CFBundleDocumentTypes array" "$plist_path"
+  "$plist_buddy" -c "Add :CFBundleDocumentTypes:0 dict" "$plist_path"
+  "$plist_buddy" -c "Add :CFBundleDocumentTypes:0:CFBundleTypeName string Folder" "$plist_path"
+  "$plist_buddy" -c "Add :CFBundleDocumentTypes:0:CFBundleTypeRole string Viewer" "$plist_path"
+  "$plist_buddy" -c "Add :CFBundleDocumentTypes:0:LSHandlerRank string Alternate" "$plist_path"
+  "$plist_buddy" -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes array" "$plist_path"
+  "$plist_buddy" -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes:0 string public.folder" "$plist_path"
+  "$plist_buddy" -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes:1 string public.directory" "$plist_path"
+  "$plist_buddy" -c "Add :CFBundleDocumentTypes:1 dict" "$plist_path"
+  "$plist_buddy" -c "Add :CFBundleDocumentTypes:1:CFBundleTypeRole string Shell" "$plist_path"
+  "$plist_buddy" -c "Add :CFBundleDocumentTypes:1:LSHandlerRank string Alternate" "$plist_path"
+  "$plist_buddy" -c "Add :CFBundleDocumentTypes:1:LSItemContentTypes array" "$plist_path"
+  "$plist_buddy" -c "Add :CFBundleDocumentTypes:1:LSItemContentTypes:0 string public.unix-executable" "$plist_path"
+  /usr/bin/plutil -lint "$plist_path" >/dev/null
+}
+
+install_finder_open_tab_service() {
+  local app_path="$1"
+  local exe_path="$app_path/Contents/MacOS/$APP_NAME"
+  local service_root="$app_path/Contents/Library/Services/Open new Termy tab here.workflow"
+  local service_contents="$service_root/Contents"
+  local info_source="$REPO_ROOT/scripts/file-manager/macos/Info.plist"
+  local workflow_source="$REPO_ROOT/scripts/file-manager/macos/document.wflow"
+
+  [[ -x "$exe_path" ]] || die "App binary not found at $exe_path"
+  [[ -f "$info_source" ]] || die "Finder service Info.plist not found at $info_source"
+  [[ -f "$workflow_source" ]] || die "Finder service workflow not found at $workflow_source"
+
+  mkdir -p "$service_contents"
+  cp "$info_source" "$service_contents/Info.plist"
+  cp "$workflow_source" "$service_contents/document.wflow"
+  /usr/bin/plutil -lint "$service_contents/Info.plist" "$service_contents/document.wflow" >/dev/null
+}
+
+ensure_local_network_usage_description() {
+  local plist_path="$1/Contents/Info.plist"
+  local plist_buddy="/usr/libexec/PlistBuddy"
+
+  [[ -f "$plist_path" ]] || die "App bundle Info.plist not found at $plist_path"
+  [[ -x "$plist_buddy" ]] || die "PlistBuddy is required to patch $plist_path"
+
+  "$plist_buddy" -c "Delete :NSLocalNetworkUsageDescription" "$plist_path" >/dev/null 2>&1 || true
+  "$plist_buddy" -c "Add :NSLocalNetworkUsageDescription string Termy uses the local network to connect to devices and services on your LAN, such as SSH hosts." "$plist_path"
+  /usr/bin/plutil -lint "$plist_path" >/dev/null
+}
+
 ensure_app_icon() {
   local app_path="$1"
   local plist_path="$app_path/Contents/Info.plist"
@@ -110,6 +165,49 @@ ensure_app_icon() {
   "$plist_buddy" -c "Delete :CFBundleIconFile" "$plist_path" >/dev/null 2>&1 || true
   "$plist_buddy" -c "Add :CFBundleIconFile string termy" "$plist_path"
   /usr/bin/plutil -lint "$plist_path" >/dev/null
+}
+
+# Sparkle (macOS auto updates). The private half of this EdDSA key is the
+# SPARKLE_ED_PRIVATE_KEY GitHub Actions secret, used to sign each release DMG.
+SPARKLE_PUBLIC_ED_KEY="${TERMY_SPARKLE_PUBLIC_ED_KEY:-1hTfFqyrg+XaxfZ5ywbvd20aT5YXvL15BschCg2L57o=}"
+SPARKLE_FEED_URL="${TERMY_SPARKLE_FEED_URL:-}"
+SPARKLE_CHECK_INTERVAL_SECONDS=21600
+
+embed_sparkle() {
+  local app_path="$1"
+  local plist_path="$app_path/Contents/Info.plist"
+  local plist_buddy="/usr/libexec/PlistBuddy"
+  local frameworks_dir="$app_path/Contents/Frameworks"
+  local sparkle_dir framework
+
+  sparkle_dir="$("$SCRIPT_DIR/fetch-sparkle.sh")"
+  framework="$frameworks_dir/Sparkle.framework"
+  mkdir -p "$frameworks_dir"
+  rm -rf "$framework"
+  ditto "$sparkle_dir/Sparkle.framework" "$framework"
+  # The XPC services are only needed by sandboxed apps; Termy is not sandboxed.
+  rm -rf "$framework/Versions/B/XPCServices" "$framework/XPCServices"
+
+  "$plist_buddy" -c "Delete :SUFeedURL" "$plist_path" >/dev/null 2>&1 || true
+  "$plist_buddy" -c "Add :SUFeedURL string $SPARKLE_FEED_URL" "$plist_path"
+  "$plist_buddy" -c "Delete :SUPublicEDKey" "$plist_path" >/dev/null 2>&1 || true
+  "$plist_buddy" -c "Add :SUPublicEDKey string $SPARKLE_PUBLIC_ED_KEY" "$plist_path"
+  # Checks are on by default (no first-run prompt); the app applies the
+  # auto_update setting at launch.
+  "$plist_buddy" -c "Delete :SUEnableAutomaticChecks" "$plist_path" >/dev/null 2>&1 || true
+  "$plist_buddy" -c "Add :SUEnableAutomaticChecks bool true" "$plist_path"
+  "$plist_buddy" -c "Delete :SUScheduledCheckInterval" "$plist_path" >/dev/null 2>&1 || true
+  "$plist_buddy" -c "Add :SUScheduledCheckInterval integer $SPARKLE_CHECK_INTERVAL_SECONDS" "$plist_path"
+  /usr/bin/plutil -lint "$plist_path" >/dev/null
+}
+
+# Sign Sparkle's nested code inside-out, before the enclosing app.
+sign_sparkle() {
+  local framework="$1/Contents/Frameworks/Sparkle.framework"
+  local args=(--force --options runtime --timestamp --sign "$SIGN_IDENTITY")
+  codesign "${args[@]}" "$framework/Versions/B/Autoupdate"
+  codesign "${args[@]}" "$framework/Versions/B/Updater.app"
+  codesign "${args[@]}" "$framework"
 }
 
 VERSION=""
@@ -200,6 +298,9 @@ if [[ -n "$ENTITLEMENTS" ]]; then
   [[ -f "$ENTITLEMENTS" ]] || die "Entitlements file not found: $ENTITLEMENTS"
 fi
 
+# One feed per architecture, served from the latest GitHub release.
+[[ -n "$SPARKLE_FEED_URL" ]] || SPARKLE_FEED_URL="https://github.com/lassejlv/termy/releases/latest/download/appcast-$ARCH.xml"
+
 APP_NAME="Termy"
 SUFFIX=""
 [[ "$SIGN" -eq 1 ]] && SUFFIX="-signed"
@@ -215,6 +316,7 @@ OUTPUT_DMG="$DIST_DIR/${DMG_NAME}.dmg"
 
 require_cmd cargo
 require_cmd hdiutil
+require_cmd ditto
 cargo bundle --version >/dev/null 2>&1 || die "cargo-bundle not found. Install with: cargo install cargo-bundle"
 
 if [[ "$SIGN" -eq 1 ]]; then
@@ -255,22 +357,44 @@ chmod +x "$APP_PATH/Contents/MacOS/termy-cli"
 log "Registering termy:// URL scheme in app bundle"
 ensure_termy_url_scheme "$APP_PATH"
 
+log "Registering folder Open With support in app bundle"
+ensure_folder_document_type "$APP_PATH"
+
+log "Declaring local network usage in app bundle"
+ensure_local_network_usage_description "$APP_PATH"
+
+log "Installing Finder Open new Termy tab here service"
+install_finder_open_tab_service "$APP_PATH"
+
 log "Embedding app icon in bundle"
 ensure_app_icon "$APP_PATH"
+
+log "Embedding Sparkle updater (feed: $SPARKLE_FEED_URL)"
+embed_sparkle "$APP_PATH"
 
 if [[ "$SIGN" -eq 1 ]]; then
   log "Signing app bundle with: $SIGN_IDENTITY"
   xattr -rc "$APP_PATH"
-  CODESIGN_ARGS=(--force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY")
+  # The bundled CLI is a separate executable. Sign it before the enclosing app.
+  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" \
+    "$APP_PATH/Contents/MacOS/termy-cli"
+  sign_sparkle "$APP_PATH"
+  CODESIGN_ARGS=(--force --options runtime --timestamp --sign "$SIGN_IDENTITY")
   [[ -n "$ENTITLEMENTS" ]] && CODESIGN_ARGS+=(--entitlements "$ENTITLEMENTS")
   codesign "${CODESIGN_ARGS[@]}" "$APP_PATH"
   codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+else
+  # Removing the XPC services broke Sparkle's own seal; re-seal it ad hoc.
+  codesign --force --sign - "$APP_PATH/Contents/Frameworks/Sparkle.framework"
 fi
 
 log "Preparing DMG staging folder"
 rm -rf "$DMG_ROOT"
 mkdir -p "$DMG_ROOT" "$DIST_DIR"
-cp -R "$APP_PATH" "$DMG_ROOT/"
+ditto "$APP_PATH" "$DMG_ROOT/$APP_NAME.app"
+if [[ "$SIGN" -eq 1 ]]; then
+  codesign --verify --deep --strict --verbose=2 "$DMG_ROOT/$APP_NAME.app"
+fi
 ln -s /Applications "$DMG_ROOT/Applications"
 
 log "Creating temporary DMG"
@@ -355,7 +479,7 @@ if [[ "$NOTARIZE" -eq 1 ]]; then
   xcrun stapler validate "$OUTPUT_DMG"
 
   log "Assessing final DMG with Gatekeeper"
-  spctl --assess --type open --verbose=2 "$OUTPUT_DMG"
+  spctl --assess --type open --context context:primary-signature --verbose=2 "$OUTPUT_DMG"
 fi
 
 echo "Done: $OUTPUT_DMG"

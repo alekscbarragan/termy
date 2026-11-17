@@ -1,6 +1,6 @@
 use super::state_tmux::{TmuxSessionRow, TmuxSessionStatusHint};
 use super::*;
-use termy_terminal_ui::{TmuxClient, TmuxLaunchTarget, TmuxSocketTarget};
+use crate::terminal_ui::{TmuxClient, TmuxLaunchTarget, TmuxSocketTarget};
 
 impl TerminalView {
     pub(in crate::terminal_view) fn open_tmux_session_palette_with_intent(
@@ -207,7 +207,6 @@ impl TerminalView {
         };
         if self.attach_tmux_runtime(launch, cx) {
             self.close_command_palette(cx);
-            crate::ui::toast::success(format!("Attached tmux session \"{session_name}\""));
             self.notify_overlay(cx);
         }
     }
@@ -313,11 +312,6 @@ impl TerminalView {
         self.command_palette
             .set_tmux_session_intent(TmuxSessionIntent::RenameSelect);
         self.command_palette.input_mut().clear();
-        crate::ui::toast::success(format!(
-            "Renamed tmux session \"{}\" to \"{}\"",
-            current_session_name,
-            next_session_name.trim()
-        ));
         self.refresh_tmux_session_palette_after_lifecycle_action(cx);
     }
 
@@ -351,7 +345,7 @@ impl TerminalView {
         // is mutably updating this view can re-enter and trip RefCell borrow checks.
         // Run confirm out-of-band, then re-enter through AsyncApp for the mutation.
         cx.spawn(async move |this, cx: &mut AsyncApp| {
-            let confirmed = termy_native_sdk::confirm("Kill tmux Session", &confirmation_message);
+            let confirmed = crate::native_sdk::confirm("Kill tmux Session", &confirmation_message);
             if !confirmed {
                 return;
             }
@@ -379,7 +373,6 @@ impl TerminalView {
                         return;
                     }
 
-                    crate::ui::toast::success(format!("Killed tmux session \"{session_name}\""));
                     view.refresh_tmux_session_palette_after_lifecycle_action(cx);
                 })
             });

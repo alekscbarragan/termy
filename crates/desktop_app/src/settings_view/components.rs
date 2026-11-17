@@ -32,6 +32,9 @@ impl SettingsWindow {
         section: SettingsSection,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let hover_bg = self.bg_hover();
+        let text_primary = self.text_primary();
+        let text_muted = self.text_muted();
         let subtitle = Self::settings_section_subtitle(section);
         // Quiet ghost button, rendered only while the section actually has
         // something to reset — native settings keep destructive affordances
@@ -39,33 +42,73 @@ impl SettingsWindow {
         let can_reset = self.section_has_non_default_values(section);
 
         let reset_button = can_reset.then(|| {
-            termy_ui::Button::new(format!("reset-section-{section:?}"), "Reset section")
-                .variant(termy_ui::ButtonVariant::Ghost)
-                .size(termy_ui::ButtonSize::Small)
-                .tooltip(termy_ui::Tooltip::new("Reset all settings in this section"))
+            let is_section_hovered = self.hovered_reset_section == Some(section);
+            let tooltip_bg = self.bg_elevated();
+            let tooltip_border = self.border_color();
+            let tooltip_fg = self.text_primary();
+            div()
+                .id(SharedString::from(format!("reset-section-{section:?}")))
+                .relative()
+                .px_2()
+                .py(px(5.0))
+                .rounded(px(SETTINGS_BUTTON_RADIUS))
+                .text_xs()
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .text_color(text_muted)
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover_bg).text_color(text_primary))
+                .on_hover(cx.listener(move |view, hovering: &bool, _window, cx| {
+                    if *hovering {
+                        view.hovered_reset_section = Some(section);
+                    } else if view.hovered_reset_section == Some(section) {
+                        view.hovered_reset_section = None;
+                    }
+                    cx.notify();
+                }))
+                .child("Reset section")
                 .on_click(cx.listener(move |view, _, _, cx| {
                     view.confirm_reset_section_to_defaults(section, cx);
                 }))
+                .when(is_section_hovered, move |s| {
+                    s.child(
+                        deferred(
+                            div()
+                                .absolute()
+                                .top_full()
+                                .right_0()
+                                .mt(px(6.0))
+                                .px(px(8.0))
+                                .py(px(4.0))
+                                .rounded(px(6.0))
+                                .bg(tooltip_bg)
+                                .border_1()
+                                .border_color(tooltip_border)
+                                .text_size(px(11.0))
+                                .text_color(tooltip_fg)
+                                .whitespace_nowrap()
+                                .child("Reset all settings in this section"),
+                        )
+                        .with_priority(20),
+                    )
+                })
         });
 
-        // Title and subtitle come from Termy's layout kit; Glassy owns the
-        // reset control's presentation while the app keeps the confirmation.
-        let mut header = termy_ui::SectionHeader::new(title).subtitle(subtitle);
+        // Title and subtitle come from the design system; the reset affordance
+        // keeps its hover, tooltip, and confirmation flow here because that is
+        // app behavior, not presentation.
+        let mut header = crate::design_system::SectionHeader::new(title)
+            .subtitle(subtitle)
+            .leading(self.render_section_tile(
+                section,
+                SECTION_ICON_TILE_SIZE,
+                SECTION_ICON_TILE_RADIUS,
+                SECTION_ICON_SIZE,
+                true,
+            ));
         if let Some(reset_button) = reset_button {
             header = header.action(reset_button);
         }
         header
-    }
-
-    /// Group caption for the few surfaces that build their own card instead of
-    /// going through `render_settings_group`. Styled to match the label
-    /// `termy_ui::SettingsGroup` draws, so both kinds of group read the same.
-    pub(super) fn render_group_header(&self, title: impl Into<SharedString>) -> impl IntoElement {
-        div()
-            .text_size(px(GROUP_TITLE_SIZE))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(self.text_muted())
-            .child(title.into())
     }
 
     pub(super) fn render_reset_setting_button(
@@ -73,19 +116,37 @@ impl SettingsWindow {
         setting_key: &'static str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        self.render_setting_action_button(
+            SharedString::from(format!("reset-setting-{setting_key}")),
+            "icons/settings/reset.svg",
+            "Reset to default",
+            !self.is_setting_at_default(setting_key),
+            cx,
+            move |view, _, cx| view.confirm_reset_setting_to_default(setting_key, cx),
+        )
+    }
+
+    // Keep reset and clear affordances aligned across built-in, plugin, and
+    // shortcut rows, including the empty slot when no action is available.
+    pub(super) fn render_setting_action_button(
+        &self,
+        id: SharedString,
+        icon: &'static str,
+        label: &'static str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
         let hover_bg = self.bg_hover();
         let text_primary = self.text_primary();
-        // Settings at their default value render an empty slot of the same size
-        // so controls stay column-aligned while the reset affordance stays out
-        // of sight until it applies.
-        let can_reset = !self.is_setting_at_default(setting_key);
-        let is_hovered = self.hovered_reset_setting == Some(setting_key);
+        let is_hovered = self.hovered_setting_action.as_ref() == Some(&id);
+        let hover_id = id.clone();
         let tooltip_bg = self.bg_elevated();
         let tooltip_border = self.border_color();
         let tooltip_fg = self.text_primary();
 
         div()
-            .id(SharedString::from(format!("reset-setting-{setting_key}")))
+            .id(id)
             .w(px(22.0))
             .h(px(22.0))
             .relative()
@@ -93,30 +154,30 @@ impl SettingsWindow {
             .items_center()
             .justify_center()
             .rounded(px(SETTINGS_INPUT_RADIUS))
-            .when(can_reset, |s| {
+            .when(enabled, |s| {
                 s.cursor_pointer()
                     .hover(move |s| s.bg(hover_bg))
                     .on_hover(cx.listener(move |view, hovering: &bool, _window, cx| {
                         if *hovering {
-                            view.hovered_reset_setting = Some(setting_key);
-                        } else if view.hovered_reset_setting == Some(setting_key) {
-                            view.hovered_reset_setting = None;
+                            view.hovered_setting_action = Some(hover_id.clone());
+                        } else if view.hovered_setting_action.as_ref() == Some(&hover_id) {
+                            view.hovered_setting_action = None;
                         }
                         cx.notify();
                     }))
             })
-            .children(can_reset.then(|| {
+            .children(enabled.then(|| {
                 svg()
-                    .path(SharedString::from("icons/settings/reset.svg"))
+                    .path(SharedString::from(icon))
                     .size(px(13.0))
                     .text_color(text_primary)
             }))
-            .when(can_reset, |s| {
-                s.on_click(cx.listener(move |view, _, _, cx| {
-                    view.confirm_reset_setting_to_default(setting_key, cx);
+            .when(enabled, |s| {
+                s.on_click(cx.listener(move |view, _, window, cx| {
+                    on_click(view, window, cx);
                 }))
             })
-            .when(is_hovered && can_reset, |s| {
+            .when(is_hovered && enabled, |s| {
                 s.child(
                     deferred(
                         div()
@@ -132,7 +193,7 @@ impl SettingsWindow {
                             .text_size(px(11.0))
                             .text_color(tooltip_fg)
                             .whitespace_nowrap()
-                            .child("Reset to default"),
+                            .child(label),
                     )
                     .with_priority(20),
                 )
@@ -145,6 +206,32 @@ impl SettingsWindow {
         search_key: &'static str,
         id: &'static str,
         title: &'static str,
+        description: &'static str,
+        checked: bool,
+        cx: &mut Context<Self>,
+        on_toggle: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        self.render_badged_setting_row(
+            search_key,
+            id,
+            title,
+            None,
+            description,
+            checked,
+            cx,
+            on_toggle,
+        )
+    }
+
+    /// A switch row with an optional badge after the title, such as the
+    /// "Early Preview" mark on unfinished features.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn render_badged_setting_row(
+        &mut self,
+        search_key: &'static str,
+        id: &'static str,
+        title: &'static str,
+        badge: Option<crate::design_system::Badge>,
         description: &'static str,
         checked: bool,
         cx: &mut Context<Self>,
@@ -181,7 +268,14 @@ impl SettingsWindow {
                     .min_w(px(0.0))
                     .flex_col()
                     .gap(px(1.0))
-                    .child(div().text_sm().text_color(self.text_primary()).child(title))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_sm().text_color(self.text_primary()).child(title))
+                            .children(badge),
+                    )
                     .child(
                         div()
                             .text_xs()
@@ -197,7 +291,7 @@ impl SettingsWindow {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(self.render_switch(id, checked, cx, on_toggle))
+                    .child(self.render_switch(id, title, checked, cx, on_toggle))
                     .child(self.render_reset_setting_button(search_key, cx)),
             );
 
@@ -210,7 +304,6 @@ impl SettingsWindow {
         toggle_id: &'static str,
         setting: RootSettingId,
         checked: bool,
-        success_message: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let metadata = Self::setting_metadata_or_fallback(setting_key);
@@ -223,34 +316,54 @@ impl SettingsWindow {
             cx,
             move |view, window, cx| {
                 let next = !checked;
-                match config::set_root_setting(setting, &next.to_string()) {
-                    Ok(()) => {
-                        let _ = view.reload_config_if_changed(cx);
-                        crate::ui::toast::success(success_message);
-                        if setting == RootSettingId::SimpleMode && next {
-                            window.remove_window();
-                        }
-                        cx.notify();
-                    }
-                    Err(error) => crate::ui::toast::error(error),
+                if view.apply_root_bool_setting(setting, next, cx)
+                    && setting == RootSettingId::SimpleMode
+                    && next
+                {
+                    window.remove_window();
                 }
             },
         )
     }
 
+    /// Write a boolean root setting and reload the config. Returns false
+    /// (after showing the error) when the write fails.
+    pub(super) fn apply_root_bool_setting(
+        &mut self,
+        setting: RootSettingId,
+        value: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match config::set_root_setting(setting, &value.to_string()) {
+            Ok(()) => {
+                let _ = self.reload_config_if_changed(cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                crate::ui::toast::error(error);
+                false
+            }
+        }
+    }
+
+    /// An `NSSwitch`, flipped on press. The thumb slides on the shared
+    /// switch curve; Reduce Motion snaps it.
     pub(super) fn render_switch(
         &self,
         id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
         checked: bool,
         cx: &mut Context<Self>,
         on_toggle: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
-        let view = cx.entity();
-        termy_ui::ThemeSwitch::new(id.into())
-            .on(checked)
-            .on_change(move |_next, window, cx| {
-                view.update(cx, |view, cx| {
-                    cx.stop_propagation();
+        let id: SharedString = id.into();
+        let view = cx.entity().downgrade();
+        crate::ui::native::mac_switch(id, &self.native())
+            .checked(checked)
+            .accessibility_label(label)
+            .on_change(move |_, window, cx| {
+                let _ = view.update(cx, |view, cx| {
                     on_toggle(view, window, cx);
                     cx.notify();
                 });
@@ -293,7 +406,7 @@ impl SettingsWindow {
         let mut list = div().flex().flex_col().py_1();
         for (index, option) in options.into_iter().enumerate() {
             let option_label = option.display_text();
-            let option_value = option.value.clone();
+            let option_value = option.value;
             list = list.child(
                 div()
                     .id(SharedString::from(format!(
@@ -319,7 +432,7 @@ impl SettingsWindow {
         let mut dropdown_bg = self.colors.background;
         dropdown_bg.a = 1.0;
         Some(
-            deferred(
+            deferred(crate::ui::motion::enter_from_above(
                 div()
                     .id(SharedString::from(format!(
                         "dropdown-suggestions-{field:?}"
@@ -352,7 +465,8 @@ impl SettingsWindow {
                         },
                     ))
                     .child(list),
-            )
+                SharedString::from(format!("dropdown-enter-{field:?}")),
+            ))
             .with_priority(10)
             .into_any_element(),
         )
@@ -472,7 +586,7 @@ impl SettingsWindow {
 
                 let font = Font {
                     family: self.config.ui_font_family.clone().into(),
-                    ..gpui::font("")
+                    ..gpui_kit::font("")
                 };
 
                 return div()
@@ -503,7 +617,7 @@ impl SettingsWindow {
             }
             let font = Font {
                 family: self.config.ui_font_family.clone().into(),
-                ..gpui::font("")
+                ..gpui_kit::font("")
             };
             return TextInputElement::new(
                 cx.entity(),
@@ -605,7 +719,7 @@ impl SettingsWindow {
                 input.selecting = false;
             }
         }
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -665,6 +779,7 @@ impl SettingsWindow {
         let border_color = self.border_color();
         let idle_border = self.card_border_color();
         let accent = self.accent();
+        let focus_ring = self.input_focus_ring();
         let bg_card = self.bg_card();
         let text_primary = self.text_primary();
         let text_muted = self.text_muted();
@@ -752,7 +867,7 @@ impl SettingsWindow {
                     .child(
                         div()
                             .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
                             .text_color(text_primary)
                             .child(title),
                     )
@@ -787,6 +902,9 @@ impl SettingsWindow {
                                     .bg(input_bg)
                                     .border_1()
                                     .border_color(if is_active { accent } else { idle_border })
+                                    .when(is_active, |s| {
+                                        s.shadow(vec![Self::focus_ring_shadow(focus_ring)])
+                                    })
                                     .overflow_hidden()
                                     .child(value_element),
                             )
@@ -943,13 +1061,12 @@ impl SettingsWindow {
             .border_1()
             .border_color(border_color)
             .text_color(text_primary)
-            .font_weight(gpui::FontWeight::BOLD)
+            .font_weight(gpui_kit::FontWeight::BOLD)
             .text_sm()
             .child(label)
             .on_click(cx.listener(move |view, _, _, cx| {
                 match view.step_background_opacity(delta) {
-                    Ok(true) => crate::ui::toast::success("Saved"),
-                    Ok(false) => {}
+                    Ok(_) => {}
                     Err(error) => crate::ui::toast::error(error),
                 }
                 cx.notify();
@@ -970,7 +1087,7 @@ impl SettingsWindow {
             .id("background-opacity-slider")
             .relative()
             .w(px(slider_width))
-            .h(px(SETTINGS_SWITCH_KNOB_SIZE))
+            .h(px(18.0))
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Left,
@@ -1000,8 +1117,7 @@ impl SettingsWindow {
                 cx.listener(|view, _event: &MouseUpEvent, _window, cx| {
                     cx.stop_propagation();
                     match view.finish_background_opacity_drag() {
-                        Ok(true) => crate::ui::toast::success("Saved"),
-                        Ok(false) => {}
+                        Ok(_) => {}
                         Err(error) => crate::ui::toast::error(error),
                     }
                     cx.notify();
@@ -1015,8 +1131,7 @@ impl SettingsWindow {
                     }
                     cx.stop_propagation();
                     match view.finish_background_opacity_drag() {
-                        Ok(true) => crate::ui::toast::success("Saved"),
-                        Ok(false) => {}
+                        Ok(_) => {}
                         Err(error) => crate::ui::toast::error(error),
                     }
                     cx.notify();
@@ -1058,15 +1173,16 @@ impl SettingsWindow {
                     .bg(slider_fill),
             )
             .child(
+                // `NSSlider` knob: white, with the switch thumb's soft lift.
                 div()
                     .absolute()
-                    .top(px(2.0))
-                    .left(px(slider_thumb_left))
-                    .w(px(14.0))
-                    .h(px(14.0))
+                    .top(px(1.0))
+                    .left(px(slider_thumb_left - 1.0))
+                    .w(px(16.0))
+                    .h(px(16.0))
                     .rounded_full()
-                    .bg(self.accent())
-                    .shadow_sm(),
+                    .bg(gpui_kit::white())
+                    .shadow(self.native().lift_shadow()),
             )
             .into_any_element()
     }
@@ -1140,8 +1256,8 @@ impl SettingsWindow {
         let text_primary = self.text_primary();
         let text_secondary = self.text_secondary();
         let text_muted = self.text_muted();
-        let slider_track = self.bg_hover();
-        let slider_fill = self.accent_with_alpha(0.9);
+        let slider_track = self.native().track;
+        let slider_fill = self.accent();
         let slider_width = Self::background_opacity_slider_width();
         let slider_ratio = self.effective_background_opacity();
         let slider_fill_width = slider_ratio * slider_width;
@@ -1191,7 +1307,7 @@ impl SettingsWindow {
                     .child(
                         div()
                             .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
                             .text_color(text_primary)
                             .child(title),
                     )

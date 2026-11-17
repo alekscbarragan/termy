@@ -1,4 +1,4 @@
-use gpui::TestAppContext;
+use gpui_kit::TestAppContext;
 use termy_herdr_core::{AgentId, AgentKey, RequestId, SpaceId, fake_controller};
 
 use super::*;
@@ -7,7 +7,7 @@ use crate::terminal_view::{
     PaneResizeAxis, Terminal, TerminalView,
 };
 
-#[gpui::test]
+#[gpui_kit::test]
 fn native_pane_move_to_agent_tab_is_rejected_without_mutation_or_controller_effect(
     cx: &mut TestAppContext,
 ) {

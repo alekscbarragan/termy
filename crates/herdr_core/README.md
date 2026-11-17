@@ -16,5 +16,4 @@ cargo test -p termy_herdr_core
 
 - `gpui`
 - `termy` / `crates/desktop_app`
-- `termy_config_core`
-- `termy_terminal_ui`
+- `termy_core`

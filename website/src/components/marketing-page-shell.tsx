@@ -83,8 +83,14 @@ function MarketingNav() {
           <Link to="/docs/$" params={{ _splat: '' }} className={navLinkClass}>
             Docs
           </Link>
+          <Link to="/demo" className={navLinkClass}>
+            Demo
+          </Link>
           <Link to="/releases" className={navLinkClass}>
             Releases
+          </Link>
+          <Link to="/sponsors" className={navLinkClass}>
+            Sponsors
           </Link>
           <a
             href="https://github.com/lassejlv/termy"

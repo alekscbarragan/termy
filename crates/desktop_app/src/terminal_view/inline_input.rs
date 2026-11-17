@@ -1,13 +1,13 @@
+use super::search::SearchEditCommand;
 use super::*;
-use crate::text_editing;
-use gpui::{
-    Bounds, ContentMask, ElementInputHandler, Entity, EntityInputHandler, Font, Hsla, IntoElement,
-    PaintQuad, Pixels, ShapedLine, TextRun, UTF16Selection, UnderlineStyle, Window, canvas, fill,
-    point, px, size,
+use gpui_kit::{
+    App, Bounds, ClipboardItem, ContentMask, ElementInputHandler, Entity, EntityInputHandler, Font,
+    Hsla, InputHandler, IntoElement, PaintQuad, Pixels, Point, ShapedLine, TextInputConfiguration,
+    TextRun, UTF16Selection, UnderlineStyle, Window, canvas, fill, point, px, size,
 };
 use std::ops::Range;
 
-const INLINE_INPUT_LINE_HEIGHT_MULTIPLIER: f32 = 1.35;
+use crate::text_input::INLINE_INPUT_LINE_HEIGHT_MULTIPLIER;
 
 fn ime_marked_text_range_utf16(marked_text: Option<&str>) -> Option<Range<usize>> {
     marked_text.map(|marked| 0..marked.encode_utf16().count())
@@ -23,8 +23,7 @@ fn terminal_ime_selected_text_range(ime_selected_range: Option<Range<usize>>) ->
 fn ime_candidate_bounds(
     cursor: Bounds<Pixels>,
     element_bounds: Bounds<Pixels>,
-    range_start_utf16: usize,
-    cell_width: f32,
+    range_start_x: Pixels,
 ) -> Bounds<Pixels> {
     let mut bounds = Bounds::new(
         point(
@@ -33,8 +32,27 @@ fn ime_candidate_bounds(
         ),
         cursor.size,
     );
-    bounds.origin.x += px(range_start_utf16 as f32 * cell_width);
+    bounds.origin.x += range_start_x;
     bounds
+}
+
+/// Byte offset of the first `utf16_len` UTF-16 units of `text`.
+fn utf16_prefix_byte_len(text: &str, utf16_len: usize) -> usize {
+    let mut units = 0;
+    text.char_indices()
+        .find_map(|(byte, character)| {
+            units += character.len_utf16();
+            (units > utf16_len).then_some(byte)
+        })
+        .unwrap_or(text.len())
+}
+
+/// The viewport row showing the cursor at screen row `cursor_row`, kept in
+/// the viewport while it is scrolled `display_offset` rows into history.
+fn ime_cursor_viewport_row(cursor_row: usize, display_offset: usize, rows: usize) -> usize {
+    cursor_row
+        .saturating_add(display_offset)
+        .min(rows.saturating_sub(1))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,432 +67,10 @@ enum InlineInputTarget {
 enum InlineInputNotifyTarget {
     Parent,
     Overlay,
+    ParentAndOverlay,
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct InlineInputState {
-    text: String,
-    selected_range: Range<usize>,
-    selection_reversed: bool,
-    marked_range: Option<Range<usize>>,
-    last_layout: Option<ShapedLine>,
-    last_bounds: Option<Bounds<Pixels>>,
-    last_line_offset_x: Pixels,
-    // Per-line layout cache for multiline support (line_start_byte, bounds, offset_x)
-    last_line_metas: Vec<(usize, Bounds<Pixels>, Pixels)>,
-    last_line_layouts: Vec<Option<ShapedLine>>,
-}
-
-impl InlineInputState {
-    pub(super) fn new(text: String) -> Self {
-        let mut state = Self {
-            text,
-            selected_range: 0..0,
-            selection_reversed: false,
-            marked_range: None,
-            last_layout: None,
-            last_bounds: None,
-            last_line_offset_x: px(0.0),
-            last_line_metas: Vec::new(),
-            last_line_layouts: Vec::new(),
-        };
-        state.move_to_end();
-        state
-    }
-
-    pub(super) fn text(&self) -> &str {
-        &self.text
-    }
-
-    pub(super) fn set_text(&mut self, text: String) {
-        self.text = text;
-        self.marked_range = None;
-        self.selection_reversed = false;
-        self.invalidate_layout();
-        self.move_to_end();
-    }
-
-    pub(super) fn clear(&mut self) {
-        self.set_text(String::new());
-    }
-
-    pub(super) fn move_to_end(&mut self) {
-        self.set_cursor_utf8(self.text.len());
-    }
-
-    pub(super) fn cursor_offset(&self) -> usize {
-        if self.selection_reversed {
-            self.selected_range.start
-        } else {
-            self.selected_range.end
-        }
-    }
-
-    pub(super) fn selected_range(&self) -> Range<usize> {
-        self.selected_range.clone()
-    }
-
-    pub(super) fn selected_text(&self) -> Option<String> {
-        (!self.selected_range.is_empty())
-            .then(|| self.text[self.selected_range.clone()].to_string())
-    }
-
-    pub(super) fn select_all(&mut self) {
-        self.selection_reversed = false;
-        self.selected_range = 0..self.text.len();
-    }
-
-    fn set_cursor_utf8(&mut self, offset: usize) {
-        let offset = text_editing::clamp_utf8_index(&self.text, offset);
-        self.selected_range = offset..offset;
-        self.selection_reversed = false;
-        self.marked_range = None;
-    }
-
-    fn select_to_utf8(&mut self, offset: usize) {
-        let offset = text_editing::clamp_utf8_index(&self.text, offset);
-        if self.selection_reversed {
-            self.selected_range.start = offset;
-        } else {
-            self.selected_range.end = offset;
-        }
-        if self.selected_range.end < self.selected_range.start {
-            self.selection_reversed = !self.selection_reversed;
-            self.selected_range = self.selected_range.end..self.selected_range.start;
-        }
-        self.marked_range = None;
-    }
-
-    fn set_cursor_utf16(&mut self, offset: usize) {
-        let utf8_offset = text_editing::utf16_to_utf8(&self.text, offset);
-        self.set_cursor_utf8(utf8_offset);
-    }
-
-    fn select_to_utf16(&mut self, offset: usize) {
-        let utf8_offset = text_editing::utf16_to_utf8(&self.text, offset);
-        self.select_to_utf8(utf8_offset);
-    }
-
-    fn previous_char_boundary(&self, offset: usize) -> usize {
-        text_editing::previous_char_boundary(&self.text, offset)
-    }
-
-    fn next_char_boundary(&self, offset: usize) -> usize {
-        text_editing::next_char_boundary(&self.text, offset)
-    }
-
-    fn previous_word_boundary(&self, offset: usize) -> usize {
-        text_editing::previous_word_boundary(&self.text, offset)
-    }
-
-    fn next_word_boundary(&self, offset: usize) -> usize {
-        text_editing::next_word_boundary(&self.text, offset)
-    }
-
-    fn select_range_utf8(&mut self, range: Range<usize>) {
-        self.selected_range = text_editing::clamped_utf8_range(&self.text, range);
-        self.selection_reversed = false;
-        self.marked_range = None;
-    }
-
-    fn token_range_at_utf8(&self, offset: usize) -> Range<usize> {
-        text_editing::token_range_at_utf8(&self.text, offset)
-    }
-
-    fn select_token_at_utf16(&mut self, offset_utf16: usize) {
-        let utf8_offset = text_editing::utf16_to_utf8(&self.text, offset_utf16);
-        let range = self.token_range_at_utf8(utf8_offset);
-        self.select_range_utf8(range);
-    }
-
-    fn delete_range_utf8(&mut self, range: Range<usize>) {
-        if range.start >= range.end || range.end > self.text.len() {
-            return;
-        }
-        self.text.replace_range(range.clone(), "");
-        self.set_cursor_utf8(range.start);
-        self.invalidate_layout();
-    }
-
-    fn delete_selected_or(&mut self, fallback: Range<usize>) {
-        let range = if self.selected_range.is_empty() {
-            fallback
-        } else {
-            self.selected_range.clone()
-        };
-        self.delete_range_utf8(range);
-    }
-
-    pub(super) fn move_left(&mut self) {
-        if !self.selected_range.is_empty() {
-            self.set_cursor_utf8(self.selected_range.start);
-            return;
-        }
-        let cursor = self.cursor_offset();
-        self.set_cursor_utf8(self.previous_char_boundary(cursor));
-    }
-
-    pub(super) fn move_right(&mut self) {
-        if !self.selected_range.is_empty() {
-            self.set_cursor_utf8(self.selected_range.end);
-            return;
-        }
-        let cursor = self.cursor_offset();
-        self.set_cursor_utf8(self.next_char_boundary(cursor));
-    }
-
-    pub(super) fn select_left(&mut self) {
-        let cursor = self.cursor_offset();
-        self.select_to_utf8(self.previous_char_boundary(cursor));
-    }
-
-    pub(super) fn select_right(&mut self) {
-        let cursor = self.cursor_offset();
-        self.select_to_utf8(self.next_char_boundary(cursor));
-    }
-
-    pub(super) fn move_to_start(&mut self) {
-        self.set_cursor_utf8(0);
-    }
-
-    pub(super) fn delete_backward(&mut self) {
-        let cursor = self.cursor_offset();
-        let start = self.previous_char_boundary(cursor);
-        self.delete_selected_or(start..cursor);
-    }
-
-    pub(super) fn delete_forward(&mut self) {
-        let cursor = self.cursor_offset();
-        let end = self.next_char_boundary(cursor);
-        self.delete_selected_or(cursor..end);
-    }
-
-    pub(super) fn delete_word_backward(&mut self) {
-        let cursor = self.cursor_offset();
-        let start = self.previous_word_boundary(cursor);
-        self.delete_selected_or(start..cursor);
-    }
-
-    pub(super) fn delete_word_forward(&mut self) {
-        let cursor = self.cursor_offset();
-        let end = self.next_word_boundary(cursor);
-        self.delete_selected_or(cursor..end);
-    }
-
-    pub(super) fn delete_to_start(&mut self) {
-        let cursor = self.cursor_offset();
-        self.delete_selected_or(0..cursor);
-    }
-
-    pub(super) fn delete_to_end(&mut self) {
-        let cursor = self.cursor_offset();
-        self.delete_selected_or(cursor..self.text.len());
-    }
-
-    fn invalidate_layout(&mut self) {
-        self.last_layout = None;
-        self.last_line_metas.clear();
-        self.last_line_layouts.clear();
-    }
-
-    fn update_layout_cache(
-        &mut self,
-        bounds: Bounds<Pixels>,
-        layout: Option<ShapedLine>,
-        line_offset_x: Pixels,
-        line_metas: Vec<(usize, Bounds<Pixels>, Pixels)>,
-        line_layouts: Vec<Option<ShapedLine>>,
-    ) {
-        self.last_bounds = Some(bounds);
-        self.last_layout = layout;
-        self.last_line_offset_x = line_offset_x;
-        self.last_line_metas = line_metas;
-        self.last_line_layouts = line_layouts;
-    }
-
-    fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
-        text_editing::range_from_utf16(&self.text, range_utf16)
-    }
-
-    fn range_to_utf16(&self, range_utf8: &Range<usize>) -> Range<usize> {
-        text_editing::range_to_utf16(&self.text, range_utf8)
-    }
-
-    fn utf8_to_utf16(&self, utf8_offset: usize) -> usize {
-        text_editing::utf8_to_utf16(&self.text, utf8_offset)
-    }
-
-    fn replacement_range(&self, range_utf16: Option<Range<usize>>) -> Range<usize> {
-        range_utf16
-            .as_ref()
-            .map(|range| self.range_from_utf16(range))
-            .or_else(|| self.marked_range.clone())
-            .unwrap_or_else(|| self.selected_range())
-    }
-
-    pub(super) fn text_for_range(
-        &self,
-        range_utf16: Range<usize>,
-        adjusted_range: &mut Option<Range<usize>>,
-    ) -> String {
-        let range = self.range_from_utf16(&range_utf16);
-        adjusted_range.replace(self.range_to_utf16(&range));
-        self.text[range].to_string()
-    }
-
-    pub(super) fn bounds_for_range(
-        &self,
-        range_utf16: Range<usize>,
-        fallback_bounds: Bounds<Pixels>,
-    ) -> Bounds<Pixels> {
-        let bounds = self.last_bounds.unwrap_or(fallback_bounds);
-        let range = self.range_from_utf16(&range_utf16);
-        let (start_x, end_x) = if let Some(layout) = self.last_layout.as_ref() {
-            (
-                layout.x_for_index(range.start),
-                layout.x_for_index(range.end),
-            )
-        } else {
-            (px(0.0), px(0.0))
-        };
-
-        Bounds::from_corners(
-            point(
-                bounds.left() + self.last_line_offset_x + start_x,
-                bounds.top(),
-            ),
-            point(
-                bounds.left() + self.last_line_offset_x + end_x,
-                bounds.bottom(),
-            ),
-        )
-    }
-
-    pub(super) fn selected_text_range(&self) -> UTF16Selection {
-        UTF16Selection {
-            range: self.range_to_utf16(&self.selected_range),
-            reversed: self.selection_reversed,
-        }
-    }
-
-    pub(super) fn marked_text_range(&self) -> Option<Range<usize>> {
-        self.marked_range
-            .as_ref()
-            .map(|range| self.range_to_utf16(range))
-    }
-
-    pub(super) fn character_index_for_point(&self, point: gpui::Point<Pixels>) -> usize {
-        if self.text.is_empty() {
-            return 0;
-        }
-
-        // Multiline-aware path: find which row the point is on
-        if !self.last_line_metas.is_empty() {
-            // Find the matching row by y coordinate
-            let row_idx = self
-                .last_line_metas
-                .iter()
-                .enumerate()
-                .find(|(_, (_, bounds, _))| point.y >= bounds.top() && point.y <= bounds.bottom())
-                .map_or_else(
-                    || {
-                        if point.y
-                            < self
-                                .last_line_metas
-                                .first()
-                                .map_or(px(0.0), |(_, b, _)| b.top())
-                        {
-                            0
-                        } else {
-                            self.last_line_metas.len() - 1
-                        }
-                    },
-                    |(i, _)| i,
-                );
-
-            let (line_start_byte, row_bounds, offset_x) = &self.last_line_metas[row_idx];
-            let layout = self.last_line_layouts.get(row_idx).and_then(|l| l.as_ref());
-
-            let text_left = row_bounds.left() + *offset_x;
-            let local_x = if point.x <= text_left {
-                px(0.0)
-            } else {
-                point.x - text_left
-            };
-
-            let utf8_index_in_row = layout.map_or(0, |l| l.closest_index_for_x(local_x));
-            let abs_utf8 = line_start_byte + utf8_index_in_row;
-            return self.utf8_to_utf16(abs_utf8);
-        }
-
-        // Single-line fallback
-        let Some(bounds) = self.last_bounds else {
-            return self.range_to_utf16(&self.selected_range).start;
-        };
-
-        if point.y < bounds.top() {
-            return 0;
-        }
-        if point.y > bounds.bottom() {
-            return self.utf8_to_utf16(self.text.len());
-        }
-
-        let text_left = bounds.left() + self.last_line_offset_x;
-        let local_x = if point.x <= text_left {
-            px(0.0)
-        } else {
-            point.x - text_left
-        };
-
-        let utf8_index = self
-            .last_layout
-            .as_ref()
-            .map_or(0, |layout| layout.closest_index_for_x(local_x));
-        self.utf8_to_utf16(utf8_index)
-    }
-
-    pub(super) fn unmark_text(&mut self) {
-        self.marked_range = None;
-    }
-
-    pub(super) fn replace_text_in_range(&mut self, range_utf16: Option<Range<usize>>, text: &str) {
-        let range = self.replacement_range(range_utf16);
-        self.text.replace_range(range.clone(), text);
-        let cursor = range.start + text.len();
-        self.selected_range = cursor..cursor;
-        self.selection_reversed = false;
-        self.marked_range = None;
-        self.invalidate_layout();
-    }
-
-    pub(super) fn replace_and_mark_text_in_range(
-        &mut self,
-        range_utf16: Option<Range<usize>>,
-        new_text: &str,
-        new_selected_range_utf16: Option<Range<usize>>,
-    ) {
-        let range = self.replacement_range(range_utf16);
-        self.text.replace_range(range.clone(), new_text);
-
-        if new_text.is_empty() {
-            self.marked_range = None;
-        } else {
-            self.marked_range = Some(range.start..range.start + new_text.len());
-        }
-
-        self.selection_reversed = false;
-        if let Some(local_selected_utf16) = new_selected_range_utf16 {
-            let local_selected = text_editing::range_from_utf16(new_text, &local_selected_utf16);
-            let selected_start = range.start + local_selected.start;
-            let selected_end = range.start + local_selected.end;
-            self.selected_range = selected_start..selected_end;
-        } else {
-            let cursor = range.start + new_text.len();
-            self.selected_range = cursor..cursor;
-        }
-        self.invalidate_layout();
-    }
-}
+pub(super) use crate::text_input::InlineInputState;
 
 pub(super) struct InlineInputElement {
     view: Entity<TerminalView>,
@@ -486,10 +82,7 @@ pub(super) struct InlineInputElement {
     alignment: InlineInputAlignment,
 }
 
-// Retained for upcoming inline input layout variants and to keep call sites stable
-// while alignment options are wired through additional UI surfaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(super) enum InlineInputAlignment {
     Left,
     Center,
@@ -528,7 +121,7 @@ pub(super) struct InlineInputPrepaintState {
 }
 
 impl IntoElement for InlineInputElement {
-    type Element = gpui::Canvas<InlineInputPrepaintState>;
+    type Element = gpui_kit::Canvas<InlineInputPrepaintState>;
 
     fn into_element(self) -> Self::Element {
         let focus_handle = self.focus_handle;
@@ -567,7 +160,7 @@ impl IntoElement for InlineInputElement {
                                 state.text().to_string(),
                                 state.selected_range(),
                                 state.cursor_offset(),
-                                state.marked_range.clone(),
+                                state.marked_range(),
                                 focused,
                                 cursor_visible,
                                 cursor_style,
@@ -631,13 +224,7 @@ impl IntoElement for InlineInputElement {
                 let prev_line_offset_xs: Vec<f32> = {
                     let view = prepaint_view.read(cx);
                     view.active_inline_input_state()
-                        .map(|s| {
-                            s.last_line_metas
-                                .iter()
-                                .map(|(_, _, ox)| -> f32 { (*ox).into() })
-                                .collect()
-                        })
-                        .unwrap_or_default()
+                        .map_or_default(|s| s.line_offsets().map(f32::from).collect())
                 };
 
                 // Shape each line and compute per-row offset_x
@@ -693,7 +280,7 @@ impl IntoElement for InlineInputElement {
                                 if me < line_str.len() {
                                     runs.push(TextRun {
                                         len: line_str.len() - me,
-                                        ..base_run.clone()
+                                        ..base_run
                                     });
                                 }
                                 runs
@@ -912,6 +499,8 @@ impl IntoElement for InlineInputElement {
                                 line.paint(
                                     point(row_bounds.left() + offset_x, row_bounds.top()),
                                     row_bounds.size.height,
+                                    gpui_kit::TextAlign::Left,
+                                    None,
                                     window,
                                     cx,
                                 )
@@ -977,9 +566,10 @@ impl TerminalView {
     fn inline_input_notify_target_for_target(target: InlineInputTarget) -> InlineInputNotifyTarget {
         match target {
             InlineInputTarget::CommandPalette => InlineInputNotifyTarget::Overlay,
-            InlineInputTarget::RenameTab
-            | InlineInputTarget::RenameWorkspace
-            | InlineInputTarget::Search => InlineInputNotifyTarget::Parent,
+            InlineInputTarget::Search => InlineInputNotifyTarget::ParentAndOverlay,
+            InlineInputTarget::RenameTab | InlineInputTarget::RenameWorkspace => {
+                InlineInputNotifyTarget::Parent
+            }
         }
     }
 
@@ -991,11 +581,22 @@ impl TerminalView {
         match Self::inline_input_notify_target_for_target(target) {
             InlineInputNotifyTarget::Parent => cx.notify(),
             InlineInputNotifyTarget::Overlay => self.notify_overlay(cx),
+            InlineInputNotifyTarget::ParentAndOverlay => {
+                self.notify_overlay(cx);
+                cx.notify();
+            }
         }
     }
 
     pub(super) fn notify_search_inline_input(&mut self, cx: &mut Context<Self>) {
+        self.sync_native_search_bar();
         self.notify_for_inline_input_target(InlineInputTarget::Search, cx);
+    }
+
+    /// Whether search owns text input now (nothing drawn over it does).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(super) fn search_owns_inline_input(&self) -> bool {
+        self.active_inline_input_target() == Some(InlineInputTarget::Search)
     }
 
     fn active_inline_input_target(&self) -> Option<InlineInputTarget> {
@@ -1031,7 +632,7 @@ impl TerminalView {
             .left_0()
             .right_0()
             .bottom_0()
-            .cursor(gpui::CursorStyle::IBeam)
+            .cursor(gpui_kit::CursorStyle::IBeam)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(Self::handle_inline_input_mouse_down),
@@ -1145,7 +746,7 @@ impl TerminalView {
         if !self.has_active_inline_input() {
             return false;
         }
-        self.apply_inline_input_mutation(InlineInputState::select_all, cx);
+        self.apply_inline_input_mutation(|state| state.select_all(), cx);
         true
     }
 
@@ -1176,7 +777,7 @@ impl TerminalView {
     pub(super) fn copy_active_inline_input_selection(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(selected_text) = self
             .active_inline_input_state()
-            .and_then(InlineInputState::selected_text)
+            .and_then(|state| state.selected_text())
         else {
             return self.has_active_inline_input();
         };
@@ -1195,7 +796,7 @@ impl TerminalView {
             return;
         }
 
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
 
         let target_utf16 = match self.active_inline_input_state() {
             Some(state) => state.character_index_for_point(event.position),
@@ -1257,7 +858,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_inline_input_mutation(InlineInputState::delete_backward, cx);
+        if self.forward_edit_to_native_search(SearchEditCommand::DeleteBackward) {
+            return;
+        }
+        self.apply_inline_input_mutation(|state| state.delete_backward(), cx);
     }
 
     pub(super) fn handle_inline_delete_action(
@@ -1266,7 +870,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_inline_input_mutation(InlineInputState::delete_forward, cx);
+        if self.forward_edit_to_native_search(SearchEditCommand::DeleteForward) {
+            return;
+        }
+        self.apply_inline_input_mutation(|state| state.delete_forward(), cx);
     }
 
     pub(super) fn handle_inline_move_left_action(
@@ -1275,7 +882,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_inline_input_mutation(InlineInputState::move_left, cx);
+        if self.forward_edit_to_native_search(SearchEditCommand::MoveLeft) {
+            return;
+        }
+        self.apply_inline_input_mutation(|state| state.move_left(), cx);
     }
 
     pub(super) fn handle_inline_move_right_action(
@@ -1284,7 +894,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_inline_input_mutation(InlineInputState::move_right, cx);
+        if self.forward_edit_to_native_search(SearchEditCommand::MoveRight) {
+            return;
+        }
+        self.apply_inline_input_mutation(|state| state.move_right(), cx);
     }
 
     pub(super) fn handle_inline_select_left_action(
@@ -1293,7 +906,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_inline_input_mutation(InlineInputState::select_left, cx);
+        if self.forward_edit_to_native_search(SearchEditCommand::SelectLeft) {
+            return;
+        }
+        self.apply_inline_input_mutation(|state| state.select_left(), cx);
     }
 
     pub(super) fn handle_inline_select_right_action(
@@ -1302,7 +918,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_inline_input_mutation(InlineInputState::select_right, cx);
+        if self.forward_edit_to_native_search(SearchEditCommand::SelectRight) {
+            return;
+        }
+        self.apply_inline_input_mutation(|state| state.select_right(), cx);
     }
 
     pub(super) fn handle_inline_select_all_action(
@@ -1311,7 +930,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_inline_input_mutation(InlineInputState::select_all, cx);
+        if self.forward_edit_to_native_search(SearchEditCommand::SelectAll) {
+            return;
+        }
+        self.apply_inline_input_mutation(|state| state.select_all(), cx);
     }
 
     pub(super) fn handle_inline_move_to_start_action(
@@ -1320,7 +942,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_inline_input_mutation(InlineInputState::move_to_start, cx);
+        if self.forward_edit_to_native_search(SearchEditCommand::MoveToStart) {
+            return;
+        }
+        self.apply_inline_input_mutation(|state| state.move_to_start(), cx);
     }
 
     pub(super) fn handle_inline_move_to_end_action(
@@ -1329,7 +954,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_inline_input_mutation(InlineInputState::move_to_end, cx);
+        if self.forward_edit_to_native_search(SearchEditCommand::MoveToEnd) {
+            return;
+        }
+        self.apply_inline_input_mutation(|state| state.move_to_end(), cx);
     }
 
     pub(super) fn handle_inline_delete_word_backward_action(
@@ -1338,7 +966,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_inline_input_mutation(InlineInputState::delete_word_backward, cx);
+        if self.forward_edit_to_native_search(SearchEditCommand::DeleteWordBackward) {
+            return;
+        }
+        self.apply_inline_input_mutation(|state| state.delete_word_backward(), cx);
     }
 
     pub(super) fn handle_inline_delete_word_forward_action(
@@ -1347,7 +978,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_inline_input_mutation(InlineInputState::delete_word_forward, cx);
+        if self.forward_edit_to_native_search(SearchEditCommand::DeleteWordForward) {
+            return;
+        }
+        self.apply_inline_input_mutation(|state| state.delete_word_forward(), cx);
     }
 
     pub(super) fn handle_inline_delete_to_start_action(
@@ -1356,7 +990,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_inline_input_mutation(InlineInputState::delete_to_start, cx);
+        if self.forward_edit_to_native_search(SearchEditCommand::DeleteToStart) {
+            return;
+        }
+        self.apply_inline_input_mutation(|state| state.delete_to_start(), cx);
     }
 
     pub(super) fn handle_inline_delete_to_end_action(
@@ -1365,7 +1002,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_inline_input_mutation(InlineInputState::delete_to_end, cx);
+        if self.forward_edit_to_native_search(SearchEditCommand::DeleteToEnd) {
+            return;
+        }
+        self.apply_inline_input_mutation(|state| state.delete_to_end(), cx);
     }
 }
 
@@ -1380,12 +1020,153 @@ impl TerminalView {
         // Use cursor_position() instead of cursor_state() so that IME
         // preedit is shown even when the TUI app hides the cursor.
         let (cursor_col, cursor_row) = terminal.cursor_position();
+        let cursor_row = ime_cursor_viewport_row(
+            cursor_row,
+            terminal.scroll_state().0,
+            usize::from(size.rows),
+        );
         let x = geometry.origin_x + (cursor_col as f32) * cell_width;
         let y = geometry.origin_y + (cursor_row as f32) * cell_height;
         Some(Bounds::new(
             point(px(x), px(y)),
-            gpui::size(px(cell_width), px(cell_height)),
+            gpui_kit::size(px(cell_width), px(cell_height)),
         ))
+    }
+}
+
+/// Terminal input handler that opts out of macOS press-and-hold, so held keys
+/// repeat (e.g. `hjkl` in vim) instead of opening the accent picker.
+pub(super) struct TerminalInputHandler(ElementInputHandler<TerminalView>);
+
+impl TerminalInputHandler {
+    pub(super) fn new(element_bounds: Bounds<Pixels>, view: Entity<TerminalView>) -> Self {
+        Self(ElementInputHandler::new(element_bounds, view))
+    }
+}
+
+impl InputHandler for TerminalInputHandler {
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled_input: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<UTF16Selection> {
+        self.0
+            .selected_text_range(ignore_disabled_input, window, cx)
+    }
+
+    fn marked_text_range(&mut self, window: &mut Window, cx: &mut App) -> Option<Range<usize>> {
+        self.0.marked_text_range(window, cx)
+    }
+
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<String> {
+        self.0
+            .text_for_range(range_utf16, adjusted_range, window, cx)
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        replacement_range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0
+            .replace_text_in_range(replacement_range, text, window, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0.replace_and_mark_text_in_range(
+            range_utf16,
+            new_text,
+            new_selected_range,
+            window,
+            cx,
+        );
+    }
+
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut App) {
+        self.0.unmark_text(window, cx);
+    }
+
+    fn paste(&mut self, item: ClipboardItem, window: &mut Window, cx: &mut App) {
+        self.0.paste(item, window, cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        self.0.bounds_for_range(range_utf16, window, cx)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<usize> {
+        self.0.character_index_for_point(point, window, cx)
+    }
+
+    fn set_selected_text_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0.set_selected_text_range(range_utf16, window, cx);
+    }
+
+    fn element_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
+        self.0.element_bounds(window, cx)
+    }
+
+    fn text_length_utf16(&mut self, window: &mut Window, cx: &mut App) -> Option<usize> {
+        self.0.text_length_utf16(window, cx)
+    }
+
+    fn apple_press_and_hold_enabled(&mut self) -> bool {
+        false
+    }
+
+    fn accepts_text_input(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        self.0.accepts_text_input(window, cx)
+    }
+
+    fn text_input_editable_range(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Range<usize>> {
+        self.0.text_input_editable_range(window, cx)
+    }
+
+    fn prefers_ime_for_printable_keys(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        self.0.prefers_ime_for_printable_keys(window, cx)
+    }
+
+    fn text_input_configuration(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> TextInputConfiguration {
+        self.0.text_input_configuration(window, cx)
     }
 }
 
@@ -1423,14 +1204,14 @@ impl EntityInputHandler for TerminalView {
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
         if let Some(state) = self.active_inline_input_state() {
-            return state.marked_text_range();
+            return state.marked_text_range_utf16();
         }
         ime_marked_text_range_utf16(self.ime_marked_text.as_deref())
     }
 
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.has_active_inline_input() {
-            self.apply_inline_input_mutation(InlineInputState::unmark_text, cx);
+            self.apply_inline_input_mutation(|state| state.unmark_text(), cx);
             return;
         }
         // Unmarking IME composition must not commit text to the PTY.
@@ -1496,7 +1277,7 @@ impl EntityInputHandler for TerminalView {
         &mut self,
         range_utf16: Range<usize>,
         element_bounds: Bounds<Pixels>,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         if let Some(state) = self.active_inline_input_state() {
@@ -1506,22 +1287,32 @@ impl EntityInputHandler for TerminalView {
         // content area.  Offset by element_bounds.origin to convert to
         // window coordinates so macOS positions the candidate window correctly.
         let cursor = self.ime_cursor_bounds()?;
-        let cell_width: f32 = self
-            .active_pane_ref()
-            .map(TerminalPane::terminal)
-            .map(|terminal| terminal.size().cell_width)
-            .unwrap_or_default();
-        Some(ime_candidate_bounds(
-            cursor,
-            element_bounds,
-            range_utf16.start,
-            cell_width,
-        ))
+        // The range counts UTF-16 units of the preedit, which the overlay draws
+        // as plain text from the cursor: measure that text, since a CJK glyph
+        // spans two cells and an astral character two UTF-16 units.
+        let range_start_x = self.ime_marked_text.as_deref().map_or(px(0.0), |marked| {
+            let run = TextRun {
+                len: marked.len(),
+                font: Font {
+                    family: self.font_family.clone(),
+                    ..gpui_kit::font("")
+                },
+                color: Hsla::default(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            window
+                .text_system()
+                .shape_line(marked.to_string().into(), self.font_size, &[run], None)
+                .x_for_index(utf16_prefix_byte_len(marked, range_utf16.start))
+        });
+        Some(ime_candidate_bounds(cursor, element_bounds, range_start_x))
     }
 
     fn character_index_for_point(
         &mut self,
-        point: gpui::Point<Pixels>,
+        point: gpui_kit::Point<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
@@ -1554,7 +1345,8 @@ mod tests {
     #[test]
     fn replace_text_uses_selection_when_no_range() {
         let mut state = InlineInputState::new("hello".to_string());
-        state.selected_range = 1..4;
+        state.set_cursor_utf16(1);
+        state.select_to_utf16(4);
         state.replace_text_in_range(None, "i");
         assert_eq!(state.text(), "hio");
         assert_eq!(state.selected_range(), 2..2);
@@ -1570,7 +1362,8 @@ mod tests {
     #[test]
     fn selected_text_returns_selected_inline_text() {
         let mut state = InlineInputState::new("hello world".to_string());
-        state.selected_range = 0..5;
+        state.set_cursor_utf16(0);
+        state.select_to_utf16(5);
 
         assert_eq!(state.selected_text().as_deref(), Some("hello"));
     }
@@ -1578,25 +1371,26 @@ mod tests {
     #[test]
     fn replace_and_mark_sets_marked_and_selection() {
         let mut state = InlineInputState::new("abcd".to_string());
-        state.selected_range = 1..3;
+        state.set_cursor_utf16(1);
+        state.select_to_utf16(3);
         state.replace_and_mark_text_in_range(Some(1..3), "xy", Some(0..1));
         assert_eq!(state.text(), "axyd");
-        assert_eq!(state.marked_range, Some(1..3));
+        assert_eq!(state.marked_range(), Some(1..3));
         assert_eq!(state.selected_range(), 1..2);
     }
 
     #[test]
     fn unmark_clears_marked_range() {
         let mut state = InlineInputState::new("abc".to_string());
-        state.marked_range = Some(0..2);
+        state.replace_and_mark_text_in_range(Some(0..2), "ab", None);
         state.unmark_text();
-        assert_eq!(state.marked_range, None);
+        assert_eq!(state.marked_range(), None);
     }
 
     #[test]
     fn delete_to_start_removes_prefix() {
         let mut state = InlineInputState::new("hello world".to_string());
-        state.set_cursor_utf8(5);
+        state.set_cursor_utf16(5);
         state.delete_to_start();
         assert_eq!(state.text(), " world");
         assert_eq!(state.selected_range(), 0..0);
@@ -1605,7 +1399,7 @@ mod tests {
     #[test]
     fn delete_word_backward_removes_previous_word() {
         let mut state = InlineInputState::new("hello world".to_string());
-        state.set_cursor_utf8(11);
+        state.set_cursor_utf16(11);
         state.delete_word_backward();
         assert_eq!(state.text(), "hello ");
         assert_eq!(state.selected_range(), 6..6);
@@ -1649,7 +1443,7 @@ mod tests {
         );
         assert_eq!(
             TerminalView::inline_input_notify_target_for_target(InlineInputTarget::Search),
-            InlineInputNotifyTarget::Parent
+            InlineInputNotifyTarget::ParentAndOverlay
         );
         assert_eq!(
             TerminalView::inline_input_notify_target_for_target(InlineInputTarget::RenameTab),
@@ -1687,9 +1481,26 @@ mod tests {
         let cursor = Bounds::new(point(px(10.0), px(20.0)), size(px(8.0), px(16.0)));
         let element_bounds = Bounds::new(point(px(100.0), px(200.0)), size(px(320.0), px(240.0)));
 
-        let bounds = ime_candidate_bounds(cursor, element_bounds, 2, 8.0);
+        let bounds = ime_candidate_bounds(cursor, element_bounds, px(16.0));
 
         assert_eq!(bounds.origin, point(px(126.0), px(220.0)));
         assert_eq!(bounds.size, cursor.size);
+    }
+
+    #[test]
+    fn ime_range_offsets_map_utf16_units_to_preedit_bytes() {
+        assert_eq!(utf16_prefix_byte_len("ab", 1), 1);
+        // Each CJK character is one UTF-16 unit but three bytes.
+        assert_eq!(utf16_prefix_byte_len("你好", 1), 3);
+        // An astral character is two UTF-16 units and four bytes.
+        assert_eq!(utf16_prefix_byte_len("\u{20000}x", 2), 4);
+        assert_eq!(utf16_prefix_byte_len("你好", 9), "你好".len());
+    }
+
+    #[test]
+    fn ime_cursor_row_follows_the_cursor_while_scrolled_into_history() {
+        assert_eq!(ime_cursor_viewport_row(3, 0, 24), 3);
+        assert_eq!(ime_cursor_viewport_row(3, 5, 24), 8);
+        assert_eq!(ime_cursor_viewport_row(20, 10, 24), 23);
     }
 }

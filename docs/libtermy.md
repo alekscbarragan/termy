@@ -1,17 +1,36 @@
 # libtermy
 
-`libtermy` is the embeddable Termy terminal engine. The first cut is split into:
+The public embedding guide is on the [website](https://termy.sh/docs/developer/libtermy).
+It includes Rust and C quick starts, rendering and input contracts, ownership,
+troubleshooting, and an [agent guide](https://termy.sh/docs/developer/libtermy/agents).
+The website sources are in `website/content/docs/developer/libtermy/`.
+This repository note is a compact source-oriented overview; use the matching
+`termy.h` and Rust exports for the revision you embed.
+
+`libtermy` is the embeddable Termy terminal engine. It exposes two embedding surfaces:
 
 - `termy_core`: Rust API for a single headless terminal surface.
-- `termy_ffi`: C ABI wrapper over `termy_core`.
+- `termy_core::ffi`: C ABI wrapper over `termy_core`.
+- `libtermy_engine` ([`crates/engine_ffi`](../crates/engine_ffi/README.md)): a
+  static C library over the engine alone (no PTY, config, keyring, fonts or
+  network), with full-state snapshots, a replica mode that never answers
+  queries, rich cells, mode queries, input encoders and text extraction.
+
+Both C surfaces can save and restore the engine's full state as a versioned,
+little-endian snapshot (`termy_terminal_snapshot_*`, `termy_engine_snapshot_*`);
+see `crates/core/src/terminal_engine/snapshot.rs` for what it contains.
+
+The Swift SDK in [`sdk/swift`](../sdk/swift/README.md) wraps the C ABI and adds
+AppKit and SwiftUI terminal views.
 
 The core API owns PTY startup, terminal parsing, input writes, resize, event
-draining, damage snapshots, and renderer-neutral frame snapshots. It does not
-depend on GPUI and does not expose Termy's app chrome, tabs, panes, or tmux
-session model as part of the public v1 surface.
+draining, damage snapshots, renderer-neutral frame snapshots, and canonical
+special-glyph geometry. It does not
+depend on GPUI and does not provide app chrome, tabs, pane layout, or a
+session-manager UI.
 
 `termy_core` can also load Termy's normal config format through the existing
-headless `termy_config_core` parser. Config loading returns the full parsed
+headless `termy_core::config_core` parser. Config loading returns the full parsed
 `AppConfig`, parse diagnostics, and a `TerminalRuntimeConfig` ready to pass into
 terminal creation. Missing default config files fall back to defaults without
 creating files; explicit missing paths are reported as load errors.
@@ -43,7 +62,7 @@ let frame = terminal.snapshot();
 `TermyFrame` contains a flat row-major `Vec<TermyCell>`, cursor state, scroll
 state, and cell colors as simple RGBA bytes.
 
-Rust renderers that need more than the stable flat-cell contract can use
+Rust renderers that need more than the compact flat-cell contract can use
 `Terminal::render_read`. Its `TerminalRenderRead` contains coherent viewport
 metadata, a revisioned live palette, complete cell text, exact underline style
 and color, ordered viewport scroll damage, and a render generation. For a
@@ -57,21 +76,36 @@ read coherent and allocation-bounded; it must not call back into that terminal.
 
 The underlying terminal engine is not part of the Rust embedding contract.
 `termy_core` 0.2 removes `Terminal::with_term`,
-`TerminalOptions::term_config`, and the raw Alacritty conversion helpers. Use `TerminalColor`,
+`TerminalOptions::term_config`, and the raw backend conversion helpers. Use `TerminalColor`,
 `TerminalRenderCell`, `TerminalQueryColors`, and the public `Terminal` methods
-instead. This is an intentional Rust source break; the flat frame types and C
-ABI remain unchanged.
+instead. This is an intentional Rust source break; the flat frame model remains
+available. This is a beta API: build headers, libraries, and bindings from the
+same revision rather than assuming ABI stability.
 
 Use `termy_core::measure_cell(font_family, font_size, line_height)` or
 `termy_core::measure_cell_from_config(&app_config)` to derive the
 `TerminalSize` cell width and height from Termy's font metrics instead of
 guessing a monospace ratio in the host app.
 
+### Special glyph geometry
+
+Block elements, box drawing, sextants, long Braille runs, rounded corners, and
+diagonals should not be shaped as ordinary font glyphs. Use
+`termy_core::terminal_glyph_plan` with `TerminalGlyphMetrics` and neighboring
+row characters. It returns an allocation-free `TerminalGlyphPlan` containing
+cell-relative rectangles and strokes. Rectangle snap modes tell the renderer
+whether to round edges normally or outward; the host still transforms and snaps
+the primitives in its own device coordinate space.
+
+`TerminalGlyphNeighbors::from_row` is the convenience path for a retained Rust
+row. The neighbor context preserves Termy's rule that long Braille runs use
+geometry while one- and two-cell animated spinners remain shaped text.
+
 ## C ABI
 
-Use `termy_ffi` as an opaque-handle API:
+Use `termy_core::ffi` as an opaque-handle API:
 
-- `crates/ffi/include/termy.h`
+- `crates/core/include/termy.h`
 - `termy_config_load_default`
 - `termy_config_load_path`
 - `termy_config_from_contents`
@@ -84,20 +118,43 @@ Use `termy_ffi` as an opaque-handle API:
 - `termy_terminal_resize`
 - `termy_terminal_snapshot`
 - `termy_frame_free`
+- `termy_terminal_take_frame_update`
+- `termy_frame_update_free`
+- `termy_cells_build_glyph_render_plan`
+- `termy_glyph_render_plan_free`
 - `termy_terminal_take_damage`
 - `termy_damage_free`
 - `termy_terminal_drain_events`
+- `termy_terminal_drain_events_with_clipboard`
+- `termy_terminal_kitty_clipboard_paste_events_enabled`
+- `termy_terminal_send_kitty_clipboard_paste_event`
 - `termy_event_batch_free`
 - `termy_terminal_search`
 - `termy_search_batch_free`
 
-Any returned frame, damage, event batch, search batch, or standalone byte payload must be
+Any returned frame, frame update, glyph render plan, damage, event batch, search batch, or standalone byte payload must be
 released by the matching `termy_*_free` function. Event payloads owned by an
 event batch are freed by `termy_event_batch_free`; do not free them separately.
 Search match line payloads owned by a search batch are freed by
 `termy_search_batch_free`.
 Embedders should synchronize access to a terminal handle if they call into it
 from multiple threads.
+
+Kitty OSC 5522 clipboard requests are serviced synchronously while draining
+events. C and Swift hosts that provide platform clipboard integration should use
+`termy_terminal_drain_events_with_clipboard`, enforce their own permission
+policy, and keep using that entry point while `has_more` is true. Read callbacks
+receive a callback-scoped request and must invoke the supplied reply callback
+before returning; libtermy copies response slices during that invocation. Write
+callbacks receive borrowed MIME content and return a result directly. Callbacks
+must not retain borrowed values or re-enter the same terminal handle. Missing
+read callbacks deny access and missing write callbacks report unsupported.
+
+PTY-backed terminals send generated protocol replies to their child directly.
+For display-only terminals, the protocol-reply callback receives bytes that the
+host must forward to its external transport. Before an ordinary paste, query
+`termy_terminal_kitty_clipboard_paste_events_enabled` and, when enabled, call
+`termy_terminal_send_kitty_clipboard_paste_event` with the available MIME types.
 
 `termy_terminal_new_with_options` is the host-control constructor. It accepts an
 optional loaded config plus a launch working directory, startup command, and a
@@ -123,6 +180,14 @@ passed into `termy_terminal_new_with_config`. The render config also includes
 `cell_width` and `cell_height`, measured by `termy_core`, for constructing
 `TermyFfiSize` without duplicating font metric logic in the host app.
 
+After patching a frame update into a retained full row-major cell buffer, call
+`termy_cells_build_glyph_render_plan` once with that buffer and the update's
+dirty spans. The result is sparse: each entry names an absolute cell index and
+ranges into flat rectangle and stroke arrays. Passing zero spans builds a full
+plan. Rectangle/stroke coordinates are normalized to the cell, so the host owns
+the final backend-specific transform and device-pixel snapping. Release the
+batch with `termy_glyph_render_plan_free`.
+
 Event kind values:
 
 - `1`: wakeup
@@ -137,6 +202,8 @@ Event kind values:
 - `10`: shell command finished
 - `11`: progress
 - `12`: working directory
+- `13`: [OSC 7501 program status](program-status.md), a UTF-8 JSON record snapshot in `payload`
+- `14`: input dropped; keys or a paste were discarded because the program's input backlog is full
 
 Progress state values:
 
@@ -151,7 +218,11 @@ Cursor style values:
 - `1`: line
 - `2`: block
 
-Search returns visible-frame matches only. Each `TermyFfiSearchMatch` reports the
-row, inclusive start and end columns, and the visible line text that matched.
+Terminal search covers scrollback and the live screen. Each
+`TermyFfiSearchMatch` reports a zero-based row from the oldest retained buffer
+row, inclusive start and end columns, and matching line text. Convert to a
+viewport row using `row - (history_size - display_offset)` with checked or signed
+arithmetic. The standalone Rust `search_frame` helpers only search their supplied
+frame.
 
-The C ABI header is at `crates/ffi/include/termy.h`.
+The C ABI header is at `crates/core/include/termy.h`.

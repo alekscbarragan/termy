@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use termy_herdr_core::{
-    AgentCommand, AgentKey, AgentPhase, AttachResult, AttachTicket, CatalogMirror, Confirmed,
-    ConnectionState, ControlOwnership, CreateAgentFailure, HerdrController, HerdrEvent, RequestId,
-    SpaceId, WritableAttachment,
+    AgentKey, AgentPhase, AttachResult, AttachTicket, CatalogMirror, Confirmed, ConnectionState,
+    ControlOwnership, HerdrController, HerdrEvent, RequestId, SpaceId, WritableAttachment,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -19,7 +18,7 @@ pub(super) enum ServiceOrigin {
 }
 
 impl super::TerminalView {
-    pub(crate) fn detach_all_open_herdr_agents(cx: &mut gpui::App) {
+    pub(crate) fn detach_all_open_herdr_agents(cx: &mut gpui_kit::App) {
         for terminal_window in cx
             .windows()
             .into_iter()
@@ -35,7 +34,11 @@ impl super::TerminalView {
         self.herdr_sidebar_view
     }
 
-    pub(super) fn select_sidebar_view(&mut self, view: SidebarView, cx: &mut gpui::Context<Self>) {
+    pub(super) fn select_sidebar_view(
+        &mut self,
+        view: SidebarView,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
         if self.herdr_sidebar_view == view {
             return;
         }
@@ -50,7 +53,7 @@ impl super::TerminalView {
 
     pub(in crate::terminal_view) fn process_herdr_events(
         &mut self,
-        cx: &mut gpui::Context<Self>,
+        cx: &mut gpui_kit::Context<Self>,
     ) -> bool {
         let Some(runtime) = self.herdr.as_mut() else {
             return false;
@@ -97,69 +100,7 @@ impl super::TerminalView {
         })
     }
 
-    pub(super) fn begin_herdr_create(&mut self, space: SpaceId, cx: &mut gpui::Context<Self>) {
-        if let Some(runtime) = self.herdr.as_mut() {
-            runtime.begin_create(space);
-            cx.notify();
-        }
-    }
-
-    pub(super) fn cancel_herdr_create(&mut self, cx: &mut gpui::Context<Self>) {
-        if let Some(runtime) = self.herdr.as_mut() {
-            runtime.cancel_create();
-            cx.notify();
-        }
-    }
-
-    pub(super) fn update_herdr_create_program(
-        &mut self,
-        program: String,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        if let Some(runtime) = self.herdr.as_mut() {
-            runtime.update_create_program(program);
-            cx.notify();
-        }
-    }
-
-    pub(super) fn update_herdr_create_argument(
-        &mut self,
-        index: usize,
-        argument: String,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        if let Some(runtime) = self.herdr.as_mut() {
-            runtime.update_create_argument(index, argument);
-            cx.notify();
-        }
-    }
-
-    pub(super) fn add_herdr_create_argument(&mut self, cx: &mut gpui::Context<Self>) {
-        if let Some(runtime) = self.herdr.as_mut() {
-            runtime.add_create_argument();
-            cx.notify();
-        }
-    }
-
-    pub(super) fn remove_herdr_create_argument(
-        &mut self,
-        index: usize,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        if let Some(runtime) = self.herdr.as_mut() {
-            runtime.remove_create_argument(index);
-            cx.notify();
-        }
-    }
-
-    pub(super) fn submit_herdr_create(&mut self, cx: &mut gpui::Context<Self>) {
-        if let Some(runtime) = self.herdr.as_mut() {
-            runtime.submit_create();
-            cx.notify();
-        }
-    }
-
-    pub(super) fn open_or_focus_agent(&mut self, key: AgentKey, cx: &mut gpui::Context<Self>) {
+    pub(super) fn open_or_focus_agent(&mut self, key: AgentKey, cx: &mut gpui_kit::Context<Self>) {
         #[cfg(test)]
         let runtime_kind = self
             .agent_open_runtime_kind_override
@@ -212,7 +153,7 @@ impl super::TerminalView {
     pub(super) fn detach_herdr_panes(
         &mut self,
         pane_ids: &[String],
-        cx: &mut gpui::Context<Self>,
+        cx: &mut gpui_kit::Context<Self>,
     ) -> bool {
         let result = self
             .herdr
@@ -226,7 +167,7 @@ impl super::TerminalView {
         true
     }
 
-    pub(super) fn detach_all_herdr_agents(&mut self, cx: &mut gpui::Context<Self>) {
+    pub(super) fn detach_all_herdr_agents(&mut self, cx: &mut gpui_kit::Context<Self>) {
         let result = self.herdr.as_mut().map_or(Ok(()), HerdrRuntime::detach_all);
         if let Err(message) = result {
             crate::ui::toast::error(message);
@@ -234,14 +175,14 @@ impl super::TerminalView {
         }
     }
 
-    pub(super) fn confirm_close_agent(&mut self, key: AgentKey, cx: &mut gpui::Context<Self>) {
+    pub(super) fn confirm_close_agent(&mut self, key: AgentKey, cx: &mut gpui_kit::Context<Self>) {
         let message = format!(
             "Close Agent \"{}\" in Space \"{}\"? This stops the Agent instead of detaching it.",
             key.agent.as_str(),
             key.space.as_str()
         );
-        cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
-            if !termy_native_sdk::confirm("Close Agent", &message) {
+        cx.spawn(async move |this, cx: &mut gpui_kit::AsyncApp| {
+            if !crate::native_sdk::confirm("Close Agent", &message) {
                 return;
             }
             let _ = cx.update(|cx| {
@@ -261,7 +202,7 @@ impl super::TerminalView {
         &mut self,
         key: AgentKey,
         confirmation: &Confirmed,
-        cx: &mut gpui::Context<Self>,
+        cx: &mut gpui_kit::Context<Self>,
     ) {
         let result = self
             .herdr
@@ -278,7 +219,7 @@ impl super::TerminalView {
         }
     }
 
-    fn remove_herdr_tab_without_detach(&mut self, pane_id: &str, cx: &mut gpui::Context<Self>) {
+    fn remove_herdr_tab_without_detach(&mut self, pane_id: &str, cx: &mut gpui_kit::Context<Self>) {
         match find_agent_tab(&self.session, pane_id) {
             Some(AgentTabLocation::Active(tab)) => {
                 self.session.tabs[tab].pinned = false;
@@ -453,35 +394,6 @@ pub(super) struct HerdrDrain {
     pub(super) open_failures: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct CreateAgentFormRenderInput {
-    pub(super) space: SpaceId,
-    pub(super) program: String,
-    pub(super) argv: Vec<String>,
-    pub(super) pending: bool,
-    pub(super) error: Option<String>,
-}
-
-struct CreateAgentFormState {
-    space: SpaceId,
-    program: String,
-    argv: Vec<String>,
-    pending: Option<RequestId>,
-    error: Option<String>,
-}
-
-impl CreateAgentFormState {
-    fn render_input(&self) -> CreateAgentFormRenderInput {
-        CreateAgentFormRenderInput {
-            space: self.space.clone(),
-            program: self.program.clone(),
-            argv: self.argv.clone(),
-            pending: self.pending.is_some(),
-            error: self.error.clone(),
-        }
-    }
-}
-
 struct AgentPane {
     pane_id: String,
     attachment: WritableAttachment,
@@ -496,7 +408,6 @@ pub(super) struct HerdrRuntime {
     controller: Option<HerdrController>,
     agent_panes: BTreeMap<AgentKey, AgentPane>,
     pending_opens: HashMap<RequestId, PendingAgentOpen>,
-    create_form: Option<CreateAgentFormState>,
     origin: Option<ServiceOrigin>,
 }
 
@@ -510,7 +421,6 @@ impl HerdrRuntime {
             controller: None,
             agent_panes: BTreeMap::new(),
             pending_opens: HashMap::new(),
-            create_form: None,
             origin: None,
         }
     }
@@ -541,110 +451,6 @@ impl HerdrRuntime {
             controller.catalog(),
             self.origin,
         ))
-    }
-
-    pub(super) fn create_form_input(&self) -> Option<CreateAgentFormRenderInput> {
-        self.create_form
-            .as_ref()
-            .map(CreateAgentFormState::render_input)
-    }
-
-    pub(super) fn begin_create(&mut self, space: SpaceId) {
-        self.create_form = Some(CreateAgentFormState {
-            space,
-            program: String::new(),
-            argv: vec![String::new()],
-            pending: None,
-            error: None,
-        });
-    }
-
-    pub(super) fn cancel_create(&mut self) {
-        if self
-            .create_form
-            .as_ref()
-            .is_some_and(|form| form.pending.is_none())
-        {
-            self.create_form = None;
-        }
-    }
-
-    pub(super) fn update_create_program(&mut self, program: String) {
-        if let Some(form) = self
-            .create_form
-            .as_mut()
-            .filter(|form| form.pending.is_none())
-        {
-            form.program = program;
-            form.error = None;
-        }
-    }
-
-    pub(super) fn update_create_argument(&mut self, index: usize, argument: String) {
-        let Some(form) = self
-            .create_form
-            .as_mut()
-            .filter(|form| form.pending.is_none())
-        else {
-            return;
-        };
-        if let Some(slot) = form.argv.get_mut(index) {
-            *slot = argument;
-            form.error = None;
-        }
-    }
-
-    pub(super) fn add_create_argument(&mut self) {
-        if let Some(form) = self
-            .create_form
-            .as_mut()
-            .filter(|form| form.pending.is_none())
-        {
-            form.argv.push(String::new());
-        }
-    }
-
-    pub(super) fn remove_create_argument(&mut self, index: usize) {
-        let Some(form) = self
-            .create_form
-            .as_mut()
-            .filter(|form| form.pending.is_none())
-        else {
-            return;
-        };
-        if index < form.argv.len() {
-            form.argv.remove(index);
-        }
-    }
-
-    pub(super) fn submit_create(&mut self) {
-        self.submit_create_with_request_id(RequestId::new());
-    }
-
-    fn submit_create_with_request_id(&mut self, request_id: RequestId) {
-        let Some(form) = self
-            .create_form
-            .as_mut()
-            .filter(|form| form.pending.is_none())
-        else {
-            return;
-        };
-        if form.program.is_empty() {
-            form.error = Some("Program is required".to_string());
-            return;
-        }
-        let Some(controller) = self.controller.as_mut() else {
-            form.error = Some("Herdr service connection is unavailable".to_string());
-            return;
-        };
-        let command = AgentCommand {
-            program: form.program.clone(),
-            argv: form.argv.clone(),
-        };
-        match controller.create_agent(request_id, form.space.clone(), command) {
-            Ok(()) => form.pending = Some(request_id),
-            Err(_) => form.error = Some("Could not create Agent".to_string()),
-        }
     }
 
     fn request_open(&mut self, key: AgentKey) -> Result<(), &'static str> {
@@ -780,24 +586,6 @@ impl HerdrRuntime {
                         ready.initial_output.push(bytes);
                     }
                 }
-                HerdrEvent::CreateResolved { request_id, result } => {
-                    let matches_pending = self
-                        .create_form
-                        .as_ref()
-                        .is_some_and(|form| form.pending == Some(request_id));
-                    if matches_pending {
-                        match result {
-                            Ok(_) => self.create_form = None,
-                            Err(failure) => {
-                                if let Some(form) = self.create_form.as_mut() {
-                                    form.pending = None;
-                                    form.error = Some(create_failure_message(failure));
-                                }
-                            }
-                        }
-                    }
-                    drain.should_redraw = true;
-                }
                 HerdrEvent::AttachmentChanged(request_id) => {
                     let Some(pending) = self.pending_opens.remove(&request_id) else {
                         continue;
@@ -820,6 +608,7 @@ impl HerdrRuntime {
                     drain.should_redraw = true;
                 }
                 HerdrEvent::CatalogChanged(_)
+                | HerdrEvent::CreateResolved { .. }
                 | HerdrEvent::ControlChanged { .. }
                 | HerdrEvent::ConnectionChanged(_)
                 | HerdrEvent::SessionFailed(_) => drain.should_redraw = true,
@@ -843,16 +632,8 @@ impl HerdrRuntime {
             controller: Some(controller),
             agent_panes: BTreeMap::new(),
             pending_opens: HashMap::new(),
-            create_form: None,
             origin: None,
         }
-    }
-}
-
-fn create_failure_message(failure: CreateAgentFailure) -> String {
-    match failure {
-        CreateAgentFailure::Rejected(message) => message,
-        CreateAgentFailure::Unavailable => "Could not create Agent".to_string(),
     }
 }
 
@@ -871,7 +652,7 @@ mod pane_move_tests;
 #[cfg(test)]
 mod tests {
     use crate::workspace_store::{StoredTab, StoredWorkspace};
-    use gpui::TestAppContext;
+    use gpui_kit::TestAppContext;
     use termy_core::{TerminalOptions, TerminalSize};
     use termy_herdr_core::{
         AgentId, AgentKey, AgentPhase, ControlOwnership, RequestId, SpaceId, fake_controller,
@@ -944,75 +725,6 @@ mod tests {
             input.spaces[0].agents[0].control,
             ControlOwnership::AnotherClient
         );
-    }
-
-    #[test]
-    fn create_form_preserves_exact_argument_tokens() {
-        let request_id = RequestId::new();
-        let space = SpaceId::new("space-a");
-        let key = AgentKey {
-            space: space.clone(),
-            agent: AgentId::new("agent-a"),
-        };
-        let (controller, handle) = fake_controller();
-        handle.set_create_outcome(request_id, Ok(key));
-        let mut runtime = HerdrRuntime::with_controller(controller);
-        runtime.begin_create(space.clone());
-        runtime.update_create_program("agent-program".to_string());
-        for (index, token) in ["a b", "; echo x", "$HOME", "\"quoted\""]
-            .into_iter()
-            .enumerate()
-        {
-            if index > 0 {
-                runtime.add_create_argument();
-            }
-            runtime.update_create_argument(index, token.to_string());
-        }
-
-        runtime.submit_create_with_request_id(request_id);
-
-        assert_eq!(
-            handle.created_commands(),
-            vec![(
-                space,
-                AgentCommand {
-                    program: "agent-program".to_string(),
-                    argv: vec![
-                        "a b".to_string(),
-                        "; echo x".to_string(),
-                        "$HOME".to_string(),
-                        "\"quoted\"".to_string(),
-                    ],
-                },
-            )]
-        );
-        assert!(runtime.drain().should_redraw);
-        assert!(runtime.create_form_input().is_none());
-    }
-
-    #[test]
-    fn failed_create_keeps_the_form_and_catalog_unchanged() {
-        let request_id = RequestId::new();
-        let space = SpaceId::new("space-a");
-        let (controller, handle) = fake_controller();
-        handle.set_create_outcome(
-            request_id,
-            Err(CreateAgentFailure::Rejected("invalid program".to_string())),
-        );
-        let mut runtime = HerdrRuntime::with_controller(controller);
-        runtime.begin_create(space);
-        runtime.update_create_program("bad-program".to_string());
-
-        runtime.submit_create_with_request_id(request_id);
-        assert!(runtime.drain().should_redraw);
-
-        let form = runtime.create_form_input().expect("failed form stays open");
-        assert!(!form.pending);
-        assert_eq!(form.error.as_deref(), Some("invalid program"));
-        let HerdrSidebarRenderInput::Catalog(catalog) = runtime.sidebar_input() else {
-            panic!("expected catalog");
-        };
-        assert!(catalog.spaces.is_empty());
     }
 
     #[test]
@@ -1129,7 +841,7 @@ mod tests {
         assert_eq!(runtime.agent_panes.len(), 2);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn app_quit_helper_detaches_every_open_agent_without_stopping_any(cx: &mut TestAppContext) {
         let first = AgentKey {
             space: SpaceId::new("space-a"),
@@ -1169,7 +881,7 @@ mod tests {
             .expect("inspect detached Herdr runtime");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn agent_pane_split_entry_is_refused_without_mutation_or_controller_effect(
         cx: &mut TestAppContext,
     ) {
@@ -1330,7 +1042,7 @@ mod tests {
         assert_eq!(runtime.pending_opens.len(), 1);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn tmux_open_entry_rejects_before_touching_herdr_or_session_state(cx: &mut TestAppContext) {
         let key = AgentKey {
             space: SpaceId::new("space-a"),
@@ -1387,7 +1099,7 @@ mod tests {
         assert_eq!(handle.close_effects(), 0);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn stashed_agent_open_entry_switches_to_its_workspace_and_tab(cx: &mut TestAppContext) {
         let key = AgentKey {
             space: SpaceId::new("space-a"),
@@ -1432,7 +1144,7 @@ mod tests {
         assert_eq!(handle.attach_effects(), 1);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn failed_stashed_workspace_switch_does_not_focus_a_current_workspace_tab(
         cx: &mut TestAppContext,
     ) {
@@ -1472,6 +1184,8 @@ mod tests {
                     pinned: false,
                     active_tab: 0,
                     tabs: vec![StoredTab {
+                        zoomed: false,
+                        presentation: None,
                         pinned: false,
                         manual_title: None,
                         active_pane: 0,

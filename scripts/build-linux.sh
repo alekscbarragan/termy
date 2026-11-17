@@ -51,6 +51,15 @@ read_version_from_cargo_toml() {
   ' "$REPO_ROOT/crates/desktop_app/Cargo.toml"
 }
 
+# deb and RPM versions take no leading 'v', and both formats sort '~' before the
+# release it precedes. Turning the SemVer pre-release dash into '~' (and any
+# later dashes into '.') makes 1.0.0-rc.1 -> 1.0.0~rc.1, which upgrades cleanly
+# to 1.0.0. A plain dash would be a deb revision (sorting after 1.0.0) and is
+# rejected by RPM.
+package_version() {
+  printf '%s\n' "${1#v}" | sed -e 's/-/~/' -e 's/-/./g'
+}
+
 arch_to_target() {
   case "$1" in
     x86_64|amd64) echo "x86_64-unknown-linux-gnu" ;;
@@ -161,6 +170,33 @@ mkdir -p "$DIST_DIR"
 # Shared FHS staging for deb/rpm packages: payload in /usr/lib/termy with a
 # /usr/bin/termy launcher, so assets stay a sibling of the real binary,
 # matching the tarball and AppImage layouts.
+FILE_MANAGER_DIR="$REPO_ROOT/scripts/file-manager"
+OPEN_TAB_HERE_LABEL="Open new Termy tab here"
+
+install_linux_file_manager_share() {
+  local share_root="$1"
+  local nautilus_script_source="$FILE_MANAGER_DIR/nautilus-open-tab.sh"
+  local kde_source="$FILE_MANAGER_DIR/termy-open-tab.desktop"
+  local nemo_source="$FILE_MANAGER_DIR/termy-open-tab.nemo_action"
+
+  [[ -f "$nautilus_script_source" ]] || die "Nautilus script not found at $nautilus_script_source"
+  [[ -f "$kde_source" ]] || die "KDE service menu not found at $kde_source"
+  [[ -f "$nemo_source" ]] || die "Nemo action not found at $nemo_source"
+
+  mkdir -p \
+    "$share_root/kio/servicemenus" \
+    "$share_root/kservices5/ServiceMenus" \
+    "$share_root/nemo/actions" \
+    "$share_root/nautilus/scripts" \
+    "$share_root/caja/scripts"
+
+  cp "$kde_source" "$share_root/kio/servicemenus/termy-open-tab.desktop"
+  cp "$kde_source" "$share_root/kservices5/ServiceMenus/termy-open-tab.desktop"
+  cp "$nemo_source" "$share_root/nemo/actions/termy-open-tab.nemo_action"
+  install -m 755 "$nautilus_script_source" "$share_root/nautilus/scripts/$OPEN_TAB_HERE_LABEL"
+  install -m 755 "$nautilus_script_source" "$share_root/caja/scripts/$OPEN_TAB_HERE_LABEL"
+}
+
 stage_linux_package_root() {
   local root="$1"
   local desktop_file_source="$REPO_ROOT/scripts/aur/${APP_NAME_LOWER}.desktop"
@@ -188,6 +224,10 @@ stage_linux_package_root() {
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "\${TERMY_LINUX_BACKEND:-x11}" == "x11" && -n "\${DISPLAY:-}" ]]; then
+  unset WAYLAND_DISPLAY
+fi
+
 exec /usr/lib/$APP_NAME_LOWER/termy-bin "\$@"
 LAUNCHER
   chmod 755 "$root/usr/bin/$APP_NAME_LOWER"
@@ -195,6 +235,7 @@ LAUNCHER
 
   cp "$desktop_file_source" "$root/usr/share/applications/${APP_NAME_LOWER}.desktop"
   cp "$icon_source" "$root/usr/share/pixmaps/${APP_NAME_LOWER}.png"
+  install_linux_file_manager_share "$root/usr/share"
 }
 
 case "$FORMAT" in
@@ -213,6 +254,10 @@ case "$FORMAT" in
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${TERMY_LINUX_BACKEND:-x11}" == "x11" && -n "${DISPLAY:-}" ]]; then
+  unset WAYLAND_DISPLAY
+fi
+
 exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/termy-bin" "$@"
 LAUNCHER
     chmod +x "$STAGING_DIR/$APP_NAME_LOWER/$APP_NAME_LOWER" "$STAGING_DIR/$APP_NAME_LOWER/termy-bin"
@@ -221,6 +266,12 @@ LAUNCHER
       mkdir -p "$STAGING_DIR/$APP_NAME_LOWER/assets"
       cp -r "$REPO_ROOT/assets/"* "$STAGING_DIR/$APP_NAME_LOWER/assets/" 2>/dev/null || true
     fi
+
+    mkdir -p "$STAGING_DIR/$APP_NAME_LOWER/file-manager"
+    cp "$REPO_ROOT/scripts/aur/${APP_NAME_LOWER}.desktop" "$STAGING_DIR/$APP_NAME_LOWER/file-manager/termy.desktop"
+    cp "$FILE_MANAGER_DIR/termy-open-tab.desktop" "$STAGING_DIR/$APP_NAME_LOWER/file-manager/"
+    cp "$FILE_MANAGER_DIR/termy-open-tab.nemo_action" "$STAGING_DIR/$APP_NAME_LOWER/file-manager/"
+    install -m 755 "$FILE_MANAGER_DIR/nautilus-open-tab.sh" "$STAGING_DIR/$APP_NAME_LOWER/file-manager/nautilus-open-tab.sh"
 
     # Embed a tarball-local installer.
     cat > "$STAGING_DIR/$APP_NAME_LOWER/install.sh" <<'INSTALL_SCRIPT'
@@ -242,9 +293,30 @@ cat > "$INSTALL_DIR/termy" <<'LAUNCHER'
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${TERMY_LINUX_BACKEND:-x11}" == "x11" && -n "${DISPLAY:-}" ]]; then
+  unset WAYLAND_DISPLAY
+fi
+
 exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/termy-bin" "$@"
 LAUNCHER
 chmod +x "$INSTALL_DIR/termy" "$INSTALL_DIR/termy-bin" "$INSTALL_DIR/termy-cli"
+
+if [[ -d "$SCRIPT_DIR/file-manager" ]]; then
+  SHARE_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+  mkdir -p \
+    "$SHARE_HOME/applications" \
+    "$SHARE_HOME/kio/servicemenus" \
+    "$SHARE_HOME/kservices5/ServiceMenus" \
+    "$SHARE_HOME/nemo/actions" \
+    "$SHARE_HOME/nautilus/scripts" \
+    "$SHARE_HOME/caja/scripts"
+  cp "$SCRIPT_DIR/file-manager/termy.desktop" "$SHARE_HOME/applications/termy.desktop"
+  cp "$SCRIPT_DIR/file-manager/termy-open-tab.desktop" "$SHARE_HOME/kio/servicemenus/termy-open-tab.desktop"
+  cp "$SCRIPT_DIR/file-manager/termy-open-tab.desktop" "$SHARE_HOME/kservices5/ServiceMenus/termy-open-tab.desktop"
+  cp "$SCRIPT_DIR/file-manager/termy-open-tab.nemo_action" "$SHARE_HOME/nemo/actions/termy-open-tab.nemo_action"
+  install -m 755 "$SCRIPT_DIR/file-manager/nautilus-open-tab.sh" "$SHARE_HOME/nautilus/scripts/Open new Termy tab here"
+  install -m 755 "$SCRIPT_DIR/file-manager/nautilus-open-tab.sh" "$SHARE_HOME/caja/scripts/Open new Termy tab here"
+fi
 
 echo "Installed termy and termy-cli to $INSTALL_DIR/"
 echo "Make sure $INSTALL_DIR is in your PATH"
@@ -263,7 +335,7 @@ INSTALL_SCRIPT
     APPDIR="$APPIMAGE_STAGING_ROOT/${APP_NAME}.AppDir"
     APPIMAGE_NAME="${APP_NAME}-${VERSION}-${OS_NAME}-${ARCH}.AppImage"
     OUTPUT_PATH="$DIST_DIR/$APPIMAGE_NAME"
-    DESKTOP_FILE_SOURCE="$REPO_ROOT/packaging/linux/${APP_NAME_LOWER}.desktop"
+    DESKTOP_FILE_SOURCE="$REPO_ROOT/scripts/aur/${APP_NAME_LOWER}.desktop"
     ICON_SOURCE="$REPO_ROOT/assets/${APP_NAME_LOWER}_icon.png"
 
     log "Creating AppImage staging directory"
@@ -290,13 +362,21 @@ INSTALL_SCRIPT
       cat > "$APPDIR/${APP_NAME_LOWER}.desktop" <<EOF
 [Desktop Entry]
 Name=$APP_NAME
-Exec=$APP_NAME_LOWER
+Exec=$APP_NAME_LOWER %F
 Icon=$APP_NAME_LOWER
 Type=Application
 Categories=System;TerminalEmulator;
+MimeType=inode/directory;x-scheme-handler/termy;
+Actions=open-tab-here;
+
+[Desktop Action open-tab-here]
+Name=Open new Termy tab here
+Exec=$APP_NAME_LOWER --new-tab --working-directory %f
 EOF
       cp "$APPDIR/${APP_NAME_LOWER}.desktop" "$APPDIR/usr/share/applications/${APP_NAME_LOWER}.desktop"
     fi
+
+    install_linux_file_manager_share "$APPDIR/usr/share"
 
     [[ -f "$ICON_SOURCE" ]] || die "Linux app icon not found at $ICON_SOURCE"
     cp "$ICON_SOURCE" "$APPDIR/${APP_NAME_LOWER}.png"
@@ -307,6 +387,10 @@ EOF
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ "${TERMY_LINUX_BACKEND:-x11}" == "x11" && -n "${DISPLAY:-}" ]]; then
+  unset WAYLAND_DISPLAY
+fi
 
 exec "$HERE/usr/bin/termy" "$@"
 APP_RUN
@@ -332,8 +416,7 @@ APP_RUN
     DEB_NAME="${APP_NAME}-${VERSION}-${OS_NAME}-${ARCH}.deb"
     OUTPUT_PATH="$DIST_DIR/$DEB_NAME"
 
-    # Debian version strings must start with a digit.
-    DEB_VERSION="${VERSION#v}"
+    DEB_VERSION="$(package_version "$VERSION")"
     case "$ARCH" in
       x86_64) DEB_ARCH="amd64" ;;
       aarch64) DEB_ARCH="arm64" ;;
@@ -357,7 +440,7 @@ Section: x11
 Priority: optional
 Homepage: https://github.com/lassejlv/termy
 Description: Minimal GPUI-powered terminal
- Termy is a terminal emulator built with GPUI and alacritty_terminal.
+ Termy is a terminal emulator built with GPUI and Termy's custom terminal engine.
 EOF
 
     log "Creating deb package"
@@ -377,9 +460,7 @@ EOF
     RPM_NAME="${APP_NAME}-${VERSION}-${OS_NAME}-${ARCH}.rpm"
     OUTPUT_PATH="$DIST_DIR/$RPM_NAME"
 
-    # RPM version strings must not contain dashes or a leading 'v'.
-    RPM_VERSION="${VERSION#v}"
-    [[ "$RPM_VERSION" != *-* ]] || die "RPM version must not contain dashes: $RPM_VERSION"
+    RPM_VERSION="$(package_version "$VERSION")"
 
     log "Creating rpm staging directory"
     rm -rf "$RPM_STAGING_ROOT"
@@ -402,7 +483,7 @@ URL: https://github.com/lassejlv/termy
 AutoReqProv: no
 
 %description
-Termy is a terminal emulator built with GPUI and alacritty_terminal.
+Termy is a terminal emulator built with GPUI and Termy's custom terminal engine.
 
 %install
 cp -a "$RPM_ROOT/." "%{buildroot}/"
@@ -413,6 +494,11 @@ cp -a "$RPM_ROOT/." "%{buildroot}/"
 /usr/lib/$APP_NAME_LOWER
 /usr/share/applications/$APP_NAME_LOWER.desktop
 /usr/share/pixmaps/$APP_NAME_LOWER.png
+/usr/share/kio/servicemenus/termy-open-tab.desktop
+/usr/share/kservices5/ServiceMenus/termy-open-tab.desktop
+/usr/share/nemo/actions/termy-open-tab.nemo_action
+"/usr/share/nautilus/scripts/Open new Termy tab here"
+"/usr/share/caja/scripts/Open new Termy tab here"
 EOF
 
     log "Creating rpm package"

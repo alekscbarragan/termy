@@ -1,0 +1,324 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "@fontsource-variable/inter/opsz.css";
+@import "@fontsource-variable/jetbrains-mono";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans: "Inter Variable", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* Termy Next's own roles. */
+  --color-panel: var(--panel);
+  --color-raised: var(--raised);
+  --color-terminal: var(--terminal);
+  --color-soft: var(--soft);
+  --color-faint: var(--faint);
+  --color-dim: var(--dim);
+  --color-brand: var(--brand);
+  --color-on-brand: var(--on-brand);
+  --color-blocked: var(--blocked);
+  --color-done: var(--done);
+  --color-failed: var(--failed);
+  --color-code: var(--code);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+}
+
+/* Near-black neutrals, with Termy's Tokyo Night colors kept for terminal text
+   and program states. */
+:root {
+  --background: #0a0a0a;
+  --foreground: #ededed;
+  --card: #111111;
+  --card-foreground: #ededed;
+  --popover: #1a1a1a;
+  --popover-foreground: #ededed;
+  --primary: #7aa2f7;
+  --primary-foreground: #10192e;
+  --secondary: #141414;
+  --secondary-foreground: #ededed;
+  --muted: #1a1a1a;
+  --muted-foreground: #8f8f8f;
+  --accent: #1a1a1a;
+  --accent-foreground: #ededed;
+  --border: rgb(255 255 255 / 8%);
+  --input: rgb(255 255 255 / 14%);
+  --ring: #7aa2f7;
+  --radius: 0.75rem;
+
+  --panel: #111111;
+  --raised: #1a1a1a;
+  --terminal: #0a0a0a;
+  --soft: #a1a1a1;
+  --faint: #8f8f8f;
+  --dim: #737373;
+  --code: #c0caf5;
+  --brand: #7aa2f7;
+  --on-brand: #10192e;
+  --blocked: #7dcfff;
+  --done: #9ece6a;
+  --failed: #f7768e;
+
+  color-scheme: dark;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply bg-background font-sans text-foreground antialiased;
+  }
+  ::selection {
+    background: rgb(122 162 247 / 35%);
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+@layer components {
+  /* A band of warm light that crosses the hero title now and then. */
+  .text-shimmer {
+    background-image: linear-gradient(
+      100deg,
+      var(--foreground) 40%,
+      #fff 46%,
+      #d6e2ff 50%,
+      #fff 54%,
+      var(--foreground) 60%
+    );
+    background-size: 250% 100%;
+    background-position: 100% 0;
+    background-clip: text;
+    color: transparent;
+    animation: text-shimmer 7s ease-in-out 1.2s infinite;
+  }
+
+  /* The loader a working program shows in its tab. */
+  .working-dots > span {
+    animation: working-dot 1.2s ease-in-out infinite;
+  }
+  .working-dots > span:nth-child(2) {
+    animation-delay: 0.15s;
+  }
+  .working-dots > span:nth-child(3) {
+    animation-delay: 0.3s;
+  }
+
+  /* The dithered light at the foot of the hero, the stages and the footer. */
+  .dither {
+    image-rendering: pixelated;
+    pointer-events: none;
+    user-select: none;
+  }
+
+  .caret {
+    animation: caret 1.1s steps(1) infinite;
+  }
+
+  /* Sections rise in once as they enter. */
+  .reveal {
+    animation: reveal linear both;
+    animation-timeline: view();
+    animation-range: entry 0% entry 40%;
+  }
+
+  /* Docs pages: Markdown from src/content/docs. */
+  .docs-prose {
+    @apply text-[16px] leading-[27px] text-soft;
+
+    & > * + * {
+      margin-top: 20px;
+    }
+    & h2 {
+      @apply mt-16 scroll-mt-24 text-[26px] leading-8 font-semibold tracking-[-0.02em] text-foreground;
+    }
+    & > h2:first-child {
+      margin-top: 0;
+    }
+    & h3 {
+      @apply mt-10 scroll-mt-24 text-[19px] leading-7 font-semibold tracking-[-0.01em] text-foreground;
+    }
+    & h2 + *,
+    & h3 + * {
+      margin-top: 14px;
+    }
+    & a {
+      @apply text-foreground underline decoration-white/25 underline-offset-[4px] transition-colors hover:decoration-white/70;
+    }
+    & strong {
+      @apply font-medium text-foreground;
+    }
+    & :not(pre) > code {
+      @apply font-mono text-[0.875em] text-code;
+    }
+    & kbd {
+      @apply rounded-[5px] bg-[#1f1f1f] px-1.5 py-0.5 font-sans text-[14px] text-foreground;
+    }
+    & ul {
+      @apply flex flex-col gap-2 pl-5;
+      list-style: disc;
+    }
+    & ul li::marker {
+      color: #5a5a5a;
+    }
+
+    /* Ordered lists are steps: numbered rows between hairlines. */
+    & ol {
+      counter-reset: step;
+      @apply border-t border-white/6;
+    }
+    & ol > li {
+      counter-increment: step;
+      @apply relative border-b border-white/6 py-5 pl-[52px] text-[15px] leading-6;
+    }
+    & ol > li::before {
+      content: counter(step, decimal-leading-zero);
+      @apply absolute top-5 left-0 font-mono text-[14px] leading-6 text-brand;
+    }
+
+    & blockquote {
+      @apply rounded-[10px] border border-brand/18 bg-brand/6 py-4 pr-[18px] pl-[34px] text-[15px] leading-6 text-[#c9d3f5];
+      position: relative;
+    }
+    & blockquote::before {
+      content: '';
+      @apply absolute top-4 bottom-4 left-[18px] w-[3px] rounded-full bg-brand;
+    }
+    & blockquote strong {
+      @apply text-foreground;
+    }
+
+    & table {
+      @apply w-full rounded-xl border border-white/8 text-[15px] leading-[22px] wrap-break-word;
+      border-collapse: separate;
+      border-spacing: 0;
+    }
+    & thead th {
+      @apply bg-panel px-5 py-3 text-left text-[12px] leading-4 font-medium tracking-[0.06em] text-dim uppercase;
+    }
+    & th,
+    & td {
+      @apply border-b border-white/[0.04] px-5 py-3.5 align-top;
+    }
+    & thead th {
+      @apply border-white/6;
+    }
+    & tbody tr:last-child td {
+      @apply border-b-0;
+    }
+    & td:first-child {
+      @apply text-foreground md:whitespace-nowrap;
+    }
+    & td:first-child code {
+      @apply text-[#7dcfff];
+    }
+    /* Too narrow for columns: each row becomes its name over its text. */
+    @media (width < 48rem) {
+      & thead {
+        @apply hidden;
+      }
+      & tr {
+        @apply block border-b border-white/[0.04] px-4 py-3.5;
+      }
+      & tbody tr:last-child {
+        @apply border-b-0;
+      }
+      & td {
+        @apply block border-0 p-0;
+      }
+      & td + td {
+        @apply mt-1;
+      }
+    }
+
+    & .code-frame {
+      @apply overflow-hidden rounded-xl border border-white/8 bg-secondary;
+    }
+    & .code-frame figcaption {
+      @apply flex h-[42px] items-center justify-between border-b border-white/6 px-4 text-[13px] text-faint;
+    }
+    & .code-frame .code-title {
+      @apply font-mono text-[#a8a8a8];
+    }
+    & .code-frame button {
+      @apply text-faint transition-colors hover:text-foreground;
+    }
+    & .code-frame pre {
+      @apply px-5 py-[18px] font-mono text-[14px] leading-6;
+      background-color: transparent !important;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .text-shimmer,
+    .working-dots > span,
+    .caret,
+    .reveal {
+      animation: none;
+    }
+  }
+}
+
+@keyframes text-shimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  40%,
+  100% {
+    background-position: 0% 0;
+  }
+}
+
+@keyframes working-dot {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  40% {
+    opacity: 1;
+  }
+}
+
+@keyframes caret {
+  50% {
+    opacity: 0;
+  }
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+    translate: 0 24px;
+  }
+  to {
+    opacity: 1;
+    translate: 0 0;
+  }
+}

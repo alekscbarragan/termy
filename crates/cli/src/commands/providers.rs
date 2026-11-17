@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use termy_command_core::{
+use termy_core::command_core::{
     CommandCapabilities, CommandId, CommandUnavailableReason, KeybindLineRef,
     default_resolved_keybinds, parse_keybind_directives_from_iter, resolve_keybinds,
 };
-use termy_config_core::{AppConfig, config_path};
-use termy_theme_core::{ANSI_COLOR_NAMES, ThemeColors, format_hex, parse_theme_colors_json};
+use termy_core::config_core::{AppConfig, config_path};
+use termy_core::theme_core::{ANSI_COLOR_NAMES, ThemeColors, format_hex};
 
 pub fn config_file_path() -> Result<PathBuf, String> {
     config_path().ok_or_else(|| "Could not determine config directory".to_string())
@@ -13,7 +13,11 @@ pub fn config_file_path() -> Result<PathBuf, String> {
 
 pub fn list_action_lines() -> Vec<String> {
     let config = load_config_for_providers();
-    action_lines_for_capabilities(config.tmux_enabled, detect_install_cli_available())
+    action_lines_for_capabilities(
+        config.tmux_enabled,
+        detect_install_cli_available(),
+        config.multiplexer_enabled,
+    )
 }
 
 pub fn list_keybind_lines() -> Vec<String> {
@@ -26,10 +30,28 @@ pub fn list_keybind_lines() -> Vec<String> {
 }
 
 pub fn list_theme_lines() -> Vec<String> {
-    termy_themes::available_theme_ids()
+    theme_lines(installed_themes_dir().as_deref())
+}
+
+/// Built-in theme ids first, then local themes from the config's `themes`
+/// directory.
+fn theme_lines(themes_dir: Option<&Path>) -> Vec<String> {
+    let mut lines: Vec<String> = termy_core::themes::builtin_themes()
+        .iter()
+        .map(|theme| theme.id.to_string())
+        .collect();
+
+    let installed: Vec<String> = themes_dir
+        .map_or_default(termy_core::themes::local_theme_ids)
         .into_iter()
-        .map(ToString::to_string)
-        .collect()
+        .filter(|id| !lines.contains(id))
+        .collect();
+    lines.extend(installed);
+    lines
+}
+
+fn installed_themes_dir() -> Option<PathBuf> {
+    Some(config_path()?.parent()?.join("themes"))
 }
 
 pub fn list_color_lines() -> Vec<String> {
@@ -62,7 +84,7 @@ pub fn show_config_lines() -> Result<Vec<String>, String> {
         lines.push("(not created yet - using defaults)".to_string());
         lines.push(String::new());
         lines.extend(
-            termy_config_core::DEFAULT_CONFIG_TEMPLATE
+            termy_core::config_core::DEFAULT_CONFIG_TEMPLATE
                 .lines()
                 .map(ToString::to_string),
         );
@@ -75,7 +97,7 @@ pub fn show_config_lines() -> Result<Vec<String>, String> {
         lines.push("(empty file - using defaults)".to_string());
         lines.push(String::new());
         lines.extend(
-            termy_config_core::DEFAULT_CONFIG_TEMPLATE
+            termy_core::config_core::DEFAULT_CONFIG_TEMPLATE
                 .lines()
                 .map(ToString::to_string),
         );
@@ -97,13 +119,14 @@ pub fn active_theme_id() -> String {
 pub fn active_theme_colors() -> Result<ThemeColors, String> {
     let config = load_config_for_providers();
     let theme_id = config.theme.clone();
-    let mut colors = if theme_id.eq_ignore_ascii_case(termy_config_core::SHELL_DECIDE_THEME_ID) {
-        terminal_default_theme_colors()
-    } else {
-        load_installed_theme_colors(&theme_id)
-            .or_else(|| termy_themes::resolve_theme(&theme_id))
-            .ok_or_else(|| format!("Unknown theme: {theme_id}"))?
-    };
+    let mut colors =
+        if theme_id.eq_ignore_ascii_case(termy_core::config_core::SHELL_DECIDE_THEME_ID) {
+            terminal_default_theme_colors()
+        } else {
+            load_installed_theme_colors(&theme_id)
+                .or_else(|| termy_core::themes::builtin_theme(&theme_id))
+                .ok_or_else(|| format!("Unknown theme: {theme_id}"))?
+        };
 
     apply_custom_colors(&mut colors, &config.colors);
     Ok(colors)
@@ -121,16 +144,26 @@ pub fn load_config_for_providers() -> AppConfig {
 
 #[cfg(test)]
 fn action_lines_for_tmux_enabled(tmux_enabled: bool) -> Vec<String> {
-    action_lines_for_capabilities(tmux_enabled, detect_install_cli_available())
+    action_lines_for_capabilities(tmux_enabled, detect_install_cli_available(), false)
 }
 
-fn action_lines_for_capabilities(tmux_enabled: bool, install_cli_available: bool) -> Vec<String> {
+fn action_lines_for_capabilities(
+    tmux_enabled: bool,
+    install_cli_available: bool,
+    multiplexer_enabled: bool,
+) -> Vec<String> {
     let capabilities = command_capabilities(tmux_enabled, install_cli_available);
 
     CommandId::all()
         .map(|id| {
-            let (available, tmux_required, restart_required) =
+            let (mut available, tmux_required, mut restart_required) =
                 command_metadata_for_id(id, capabilities);
+            // Detached windows exist only with the built-in multiplexer, which
+            // applies after a restart.
+            if id == CommandId::ReopenDetachedWindow && !multiplexer_enabled {
+                available = false;
+                restart_required = true;
+            }
             format!(
                 "{}\tavailable={}\ttmux_required={}\trestart_required={}",
                 id.config_name(),
@@ -142,10 +175,10 @@ fn action_lines_for_capabilities(tmux_enabled: bool, install_cli_available: bool
         .collect()
 }
 
-pub fn terminal_default_theme_colors() -> termy_themes::ThemeColors {
-    use termy_themes::Rgb8;
+pub fn terminal_default_theme_colors() -> termy_core::themes::ThemeColors {
+    use termy_core::themes::Rgb8;
 
-    termy_themes::ThemeColors {
+    termy_core::themes::ThemeColors {
         ansi: [
             Rgb8::new(0x00, 0x00, 0x00),
             Rgb8::new(0xCD, 0x00, 0x00),
@@ -171,21 +204,10 @@ pub fn terminal_default_theme_colors() -> termy_themes::ThemeColors {
 }
 
 fn load_installed_theme_colors(theme_id: &str) -> Option<ThemeColors> {
-    let normalized = termy_theme_core::normalize_theme_id(theme_id);
-    if normalized.is_empty() {
-        return None;
-    }
-
-    let config_path = config_path()?;
-    let theme_path = config_path
-        .parent()?
-        .join("themes")
-        .join(format!("{normalized}.json"));
-    let contents = std::fs::read_to_string(theme_path).ok()?;
-    parse_theme_colors_json(&contents).ok()
+    termy_core::themes::load_local_theme(&installed_themes_dir()?, theme_id)
 }
 
-fn apply_custom_colors(colors: &mut ThemeColors, custom: &termy_config_core::CustomColors) {
+fn apply_custom_colors(colors: &mut ThemeColors, custom: &termy_core::config_core::CustomColors) {
     if let Some(color) = custom.foreground {
         colors.foreground = convert_config_color(color);
     }
@@ -202,20 +224,20 @@ fn apply_custom_colors(colors: &mut ThemeColors, custom: &termy_config_core::Cus
     }
 }
 
-fn convert_config_color(color: termy_config_core::Rgb8) -> termy_theme_core::Rgb8 {
-    termy_theme_core::Rgb8::new(color.r, color.g, color.b)
+fn convert_config_color(color: termy_core::config_core::Rgb8) -> termy_core::theme_core::Rgb8 {
+    termy_core::theme_core::Rgb8::new(color.r, color.g, color.b)
 }
 
 #[cfg(test)]
 fn keybind_lines_for_tmux_enabled(
-    lines: &[termy_config_core::KeybindConfigLine],
+    lines: &[termy_core::config_core::KeybindConfigLine],
     tmux_enabled: bool,
 ) -> Vec<String> {
     keybind_lines_for_capabilities(lines, tmux_enabled, detect_install_cli_available())
 }
 
 fn keybind_lines_for_capabilities(
-    lines: &[termy_config_core::KeybindConfigLine],
+    lines: &[termy_core::config_core::KeybindConfigLine],
     tmux_enabled: bool,
     install_cli_available: bool,
 ) -> Vec<String> {
@@ -239,8 +261,8 @@ fn keybind_lines_for_capabilities(
 }
 
 fn resolve_keybinds_for_lines(
-    lines: &[termy_config_core::KeybindConfigLine],
-) -> Vec<termy_command_core::ResolvedKeybind> {
+    lines: &[termy_core::config_core::KeybindConfigLine],
+) -> Vec<termy_core::command_core::ResolvedKeybind> {
     let (directives, _warnings) =
         parse_keybind_directives_from_iter(lines.iter().map(|line| KeybindLineRef {
             line_number: line.line_number,
@@ -250,7 +272,7 @@ fn resolve_keybinds_for_lines(
 }
 
 fn detect_install_cli_available() -> bool {
-    !termy_cli_install_core::is_cli_installed()
+    !termy_core::cli_install_core::is_cli_installed()
 }
 
 fn command_capabilities(tmux_enabled: bool, install_cli_available: bool) -> CommandCapabilities {
@@ -355,14 +377,14 @@ fn list_fonts_impl() -> Vec<String> {
 mod tests {
     use super::{
         action_lines_for_capabilities, action_lines_for_tmux_enabled,
-        keybind_lines_for_capabilities, keybind_lines_for_tmux_enabled, list_theme_lines,
-        resolve_keybinds_for_lines,
+        keybind_lines_for_capabilities, keybind_lines_for_tmux_enabled, resolve_keybinds_for_lines,
+        theme_lines,
     };
-    use termy_command_core::{
+    use termy_core::command_core::{
         CommandId, KeybindLineRef, default_resolved_keybinds, parse_keybind_directives_from_iter,
         resolve_keybinds,
     };
-    use termy_config_core::KeybindConfigLine;
+    use termy_core::config_core::KeybindConfigLine;
 
     fn fixture_keybind_lines() -> Vec<KeybindConfigLine> {
         vec![
@@ -399,7 +421,7 @@ mod tests {
 
     #[test]
     fn list_actions_reports_install_cli_unavailable_when_probe_is_false() {
-        let actions = action_lines_for_capabilities(true, false);
+        let actions = action_lines_for_capabilities(true, false, false);
         let install_cli_line = actions
             .iter()
             .find(|line| line.starts_with(CommandId::InstallCli.config_name()))
@@ -410,8 +432,29 @@ mod tests {
     }
 
     #[test]
+    fn reopen_detached_window_is_available_only_with_the_multiplexer() {
+        let line = |multiplexer_enabled| {
+            action_lines_for_capabilities(false, true, multiplexer_enabled)
+                .into_iter()
+                .find(|line| {
+                    line.starts_with(&format!(
+                        "{}\t",
+                        CommandId::ReopenDetachedWindow.config_name()
+                    ))
+                })
+                .expect("missing reopen_detached_window action metadata")
+        };
+        let off = line(false);
+        assert!(off.contains("available=false"), "{off}");
+        assert!(off.contains("restart_required=true"), "{off}");
+        let on = line(true);
+        assert!(on.contains("available=true"), "{on}");
+        assert!(on.contains("restart_required=false"), "{on}");
+    }
+
+    #[test]
     fn list_actions_reports_restart_not_required_when_tmux_runtime_is_active() {
-        let actions = action_lines_for_capabilities(true, true);
+        let actions = action_lines_for_capabilities(true, true, true);
         let resize_pane_line = actions
             .iter()
             .find(|line| line.starts_with(CommandId::ResizePaneLeft.config_name()))
@@ -498,9 +541,36 @@ mod tests {
         assert!(resize_pane_line.contains("restart_required=false"));
     }
 
+    fn builtin_ids() -> Vec<String> {
+        termy_core::themes::builtin_themes()
+            .iter()
+            .map(|theme| theme.id.to_string())
+            .collect()
+    }
+
     #[test]
-    fn themes_are_sourced_from_theme_registry() {
-        let themes = list_theme_lines();
-        assert!(themes.is_empty());
+    fn list_themes_includes_builtin_themes() {
+        let themes = theme_lines(None);
+        assert_eq!(themes, builtin_ids());
+        for theme in &themes {
+            assert!(
+                termy_core::themes::builtin_theme(theme).is_some(),
+                "{theme}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_themes_appends_local_themes_sorted() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["My Theme.json", "custom.json", "dracula.json", "notes.txt"] {
+            std::fs::write(temp.path().join(name), "{}").unwrap();
+        }
+
+        let themes = theme_lines(Some(temp.path()));
+
+        let mut expected = builtin_ids();
+        expected.extend(["custom".to_string(), "my-theme".to_string()]);
+        assert_eq!(themes, expected);
     }
 }

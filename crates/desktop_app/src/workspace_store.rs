@@ -2,7 +2,7 @@
 //! layouts. A fresh database imports legacy `native-tabs.json` once and reads
 //! it no further.
 //!
-//! sqlx is async-first while the app runs on gpui/smol, so the store owns a
+//! sqlx is async-first while the app runs on GPUI Kit, so the store owns a
 //! small single-threaded tokio runtime and exposes blocking methods. Callers
 //! already run persistence work off the UI thread (debounced write threads),
 //! or accept a fast blocking call (startup restore, quit-time sync).
@@ -14,39 +14,9 @@ use std::path::Path;
 
 pub(crate) const WORKSPACE_STORE_FILE: &str = "workspaces.db";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StoredPane {
-    pub(crate) left: u16,
-    pub(crate) top: u16,
-    pub(crate) width: u16,
-    pub(crate) height: u16,
-    pub(crate) buffer: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StoredTab {
-    pub(crate) pinned: bool,
-    pub(crate) manual_title: Option<String>,
-    pub(crate) active_pane: usize,
-    /// Pane split layout tree, serialized as JSON in the same shape the
-    /// legacy file format used.
-    pub(crate) layout_tree_json: Option<String>,
-    pub(crate) panes: Vec<StoredPane>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StoredWorkspace {
-    pub(crate) name: String,
-    pub(crate) pinned: bool,
-    pub(crate) active_tab: usize,
-    pub(crate) tabs: Vec<StoredTab>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StoredSession {
-    pub(crate) workspaces: Vec<StoredWorkspace>,
-    pub(crate) active_workspace: usize,
-}
+pub use termy_core::session_model::{
+    StoredPane, StoredSession, StoredTab, StoredTabPresentation, StoredWorkspace,
+};
 
 pub(crate) struct WorkspaceStore {
     runtime: tokio::runtime::Runtime,
@@ -72,7 +42,8 @@ CREATE TABLE IF NOT EXISTS tabs (
     pinned INTEGER NOT NULL DEFAULT 0,
     manual_title TEXT,
     active_pane INTEGER NOT NULL DEFAULT 0,
-    layout_tree TEXT
+    layout_tree TEXT,
+    zoomed INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS panes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,6 +65,10 @@ CREATE TABLE IF NOT EXISTS named_layouts (
 
 const STORE_VERSION: &str = "1";
 
+/// Set once the built-in multiplexer has imported the saved session. Any later
+/// local-mode save clears it, so that newer session can be imported again.
+const IMPORTED_INTO_MULTIPLEXER_KEY: &str = "imported_into_multiplexer";
+
 fn store_error(context: &str, error: sqlx::Error) -> String {
     format!("{context}: {error}")
 }
@@ -114,6 +89,12 @@ async fn ensure_workspace_columns(pool: &SqlitePool) -> Result<(), String> {
             .execute(pool)
             .await
             .map_err(|error| store_error("Failed to migrate workspace pinned state", error))?;
+    }
+    if !table_has_column(pool, "tabs", "zoomed").await? {
+        sqlx::query("ALTER TABLE tabs ADD COLUMN zoomed INTEGER NOT NULL DEFAULT 0")
+            .execute(pool)
+            .await
+            .map_err(|error| store_error("Failed to migrate tab zoom state", error))?;
     }
     Ok(())
 }
@@ -198,7 +179,7 @@ impl WorkspaceStore {
                 for (tab_position, tab) in workspace.tabs.iter().enumerate() {
                     let tab_id = sqlx::query(
                         "INSERT INTO tabs(workspace_id, position, pinned, manual_title, \
-                         active_pane, layout_tree) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                         active_pane, layout_tree, zoomed) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     )
                     .bind(workspace_id)
                     .bind(tab_position as i64)
@@ -206,6 +187,7 @@ impl WorkspaceStore {
                     .bind(tab.manual_title.as_deref())
                     .bind(tab.active_pane as i64)
                     .bind(tab.layout_tree_json.as_deref())
+                    .bind(tab.zoomed)
                     .execute(&mut *tx)
                     .await
                     .map_err(|error| store_error("Failed to write tab", error))?
@@ -241,6 +223,11 @@ impl WorkspaceStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|error| store_error("Failed to write store version", error))?;
+            sqlx::query("DELETE FROM meta WHERE key = ?1")
+                .bind(IMPORTED_INTO_MULTIPLEXER_KEY)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| store_error("Failed to reset multiplexer import", error))?;
 
             tx.commit()
                 .await
@@ -261,7 +248,7 @@ impl WorkspaceStore {
             }
 
             let tab_rows = sqlx::query(
-                "SELECT id, workspace_id, pinned, manual_title, active_pane, layout_tree \
+                "SELECT id, workspace_id, pinned, manual_title, active_pane, layout_tree, zoomed \
                  FROM tabs ORDER BY workspace_id, position",
             )
             .fetch_all(&self.pool)
@@ -279,11 +266,13 @@ impl WorkspaceStore {
             for row in pane_rows {
                 let tab_id: i64 = row.get("tab_id");
                 panes_by_tab.entry(tab_id).or_default().push(StoredPane {
+                    session_id: None,
                     left: clamp_cell(row.get::<i64, _>("pane_left")),
                     top: clamp_cell(row.get::<i64, _>("pane_top")),
                     width: clamp_cell(row.get::<i64, _>("pane_width")).max(1),
                     height: clamp_cell(row.get::<i64, _>("pane_height")).max(1),
                     buffer: row.get("buffer"),
+                    zoom_steps: 0,
                 });
             }
 
@@ -299,6 +288,8 @@ impl WorkspaceStore {
                     .entry(workspace_id)
                     .or_default()
                     .push(StoredTab {
+                        zoomed: row.get("zoomed"),
+                        presentation: None,
                         pinned: row.get("pinned"),
                         manual_title: row.get("manual_title"),
                         active_pane: row.get::<i64, _>("active_pane").max(0) as usize,
@@ -340,7 +331,32 @@ impl WorkspaceStore {
             Ok(Some(StoredSession {
                 workspaces,
                 active_workspace,
+                zoom_steps: 0,
             }))
+        })
+    }
+
+    /// `true` once the built-in multiplexer imported the saved session and
+    /// local mode has not saved a newer one since.
+    pub(crate) fn imported_into_multiplexer(&self) -> Result<bool, String> {
+        self.runtime.block_on(async {
+            let row = sqlx::query("SELECT value FROM meta WHERE key = ?1")
+                .bind(IMPORTED_INTO_MULTIPLEXER_KEY)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|error| store_error("Failed to read multiplexer import", error))?;
+            Ok(row.is_some())
+        })
+    }
+
+    pub(crate) fn mark_imported_into_multiplexer(&self) -> Result<(), String> {
+        self.runtime.block_on(async {
+            sqlx::query("INSERT OR REPLACE INTO meta(key, value) VALUES(?1, '1')")
+                .bind(IMPORTED_INTO_MULTIPLEXER_KEY)
+                .execute(&self.pool)
+                .await
+                .map_err(|error| store_error("Failed to record multiplexer import", error))?;
+            Ok(())
         })
     }
 
@@ -510,37 +526,47 @@ mod tests {
                     active_tab: 1,
                     tabs: vec![
                         StoredTab {
+                            zoomed: false,
+                            presentation: None,
                             pinned: true,
                             manual_title: Some("build".to_string()),
                             active_pane: 0,
                             layout_tree_json: None,
                             panes: vec![StoredPane {
+                                session_id: None,
                                 left: 0,
                                 top: 0,
                                 width: 80,
                                 height: 24,
                                 buffer: Some("hello".to_string()),
+                                zoom_steps: 0,
                             }],
                         },
                         StoredTab {
+                            zoomed: true,
+                            presentation: None,
                             pinned: false,
                             manual_title: None,
                             active_pane: 1,
                             layout_tree_json: Some("{\"kind\":\"leaf\",\"pane\":0}".to_string()),
                             panes: vec![
                                 StoredPane {
+                                    session_id: None,
                                     left: 0,
                                     top: 0,
                                     width: 40,
                                     height: 24,
                                     buffer: None,
+                                    zoom_steps: 0,
                                 },
                                 StoredPane {
+                                    session_id: None,
                                     left: 40,
                                     top: 0,
                                     width: 40,
                                     height: 24,
                                     buffer: None,
+                                    zoom_steps: 0,
                                 },
                             ],
                         },
@@ -551,21 +577,26 @@ mod tests {
                     pinned: false,
                     active_tab: 0,
                     tabs: vec![StoredTab {
+                        zoomed: false,
+                        presentation: None,
                         pinned: false,
                         manual_title: Some("Docs".to_string()),
                         active_pane: 0,
                         layout_tree_json: None,
                         panes: vec![StoredPane {
+                            session_id: None,
                             left: 0,
                             top: 0,
                             width: 80,
                             height: 24,
                             buffer: None,
+                            zoom_steps: 0,
                         }],
                     }],
                 },
             ],
             active_workspace: 1,
+            zoom_steps: 0,
         }
     }
 
@@ -580,6 +611,63 @@ mod tests {
         assert!(!store.is_fresh().expect("fresh check"));
         let loaded = store.load_session().expect("load").expect("session");
         assert_eq!(loaded, session);
+    }
+
+    #[test]
+    fn session_round_trips_tab_zoom() {
+        let (_dir, store) = test_store();
+        let session = sample_session();
+        store.save_session(&session).expect("save");
+        let loaded = store.load_session().expect("load").expect("session");
+        let zoomed = loaded
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .map(|tab| tab.zoomed)
+            .collect::<Vec<_>>();
+        assert_eq!(zoomed, vec![false, true, false]);
+    }
+
+    #[test]
+    fn opening_a_store_without_the_zoom_column_migrates_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(WORKSPACE_STORE_FILE);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let options = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = SqlitePool::connect_with(options).await.expect("connect");
+            sqlx::raw_sql(&SCHEMA.replace(",\n    zoomed INTEGER NOT NULL DEFAULT 0", ""))
+                .execute(&pool)
+                .await
+                .expect("old schema");
+            assert!(!table_has_column(&pool, "tabs", "zoomed").await.unwrap());
+            pool.close().await;
+        });
+
+        let store = WorkspaceStore::open(&path).expect("open");
+        let session = sample_session();
+        store.save_session(&session).expect("save");
+        assert_eq!(store.load_session().expect("load"), Some(session));
+    }
+
+    #[test]
+    fn multiplexer_import_marker_resets_on_local_save() {
+        let (_dir, store) = test_store();
+        store.save_session(&sample_session()).expect("save");
+        assert!(!store.imported_into_multiplexer().expect("read marker"));
+        store.mark_imported_into_multiplexer().expect("mark");
+        assert!(store.imported_into_multiplexer().expect("read marker"));
+        // Reading the session back does not make it importable again.
+        store.load_session().expect("load");
+        assert!(store.imported_into_multiplexer().expect("read marker"));
+        // A newer local session can be imported once more.
+        store.save_session(&sample_session()).expect("save");
+        assert!(!store.imported_into_multiplexer().expect("read marker"));
     }
 
     #[test]

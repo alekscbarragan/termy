@@ -1,5 +1,24 @@
 use super::*;
-use termy_command_core::{CommandCapabilities, CommandUnavailableReason};
+use termy_core::command_core::{CommandCapabilities, CommandUnavailableReason};
+
+pub(in super::super) trait NumberedPaneAction: gpui_kit::Action {
+    const COMMAND: CommandAction;
+}
+
+macro_rules! numbered_pane_actions {
+    ($($action:ident),+ $(,)?) => {
+        $(
+            impl NumberedPaneAction for commands::$action {
+                const COMMAND: CommandAction = CommandAction::$action;
+            }
+        )+
+    };
+}
+
+numbered_pane_actions!(
+    FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusPane5, FocusPane6, FocusPane7, FocusPane8,
+    FocusPane9,
+);
 
 impl TerminalView {
     fn shortcut_action_allowed_with_active_inline_input(action: CommandAction) -> bool {
@@ -15,6 +34,7 @@ impl TerminalView {
             CommandAction::ManageTmuxSessions => Some(CommandPaletteMode::TmuxSessions),
             CommandAction::ManageSavedLayouts => Some(CommandPaletteMode::Layouts),
             CommandAction::RunTask => Some(CommandPaletteMode::Tasks),
+            CommandAction::BrowseReleaseNotes => Some(CommandPaletteMode::Releases),
             _ => None,
         }
     }
@@ -80,10 +100,11 @@ impl TerminalView {
         self.maybe_suppress_tab_switch_hint_for_action(action, cx);
 
         #[cfg(target_os = "windows")]
-        if action == CommandAction::ManageTmuxSessions || action.to_command_id().is_tmux_only() {
-            // Defensive guard: custom keybinds can still target tmux actions even when
-            // Windows UI entries are hidden.
-            crate::ui::toast::info("tmux integration is unsupported on Windows");
+        if action == CommandAction::ManageTmuxSessions
+            && !self.runtime_uses_tmux()
+            && self.cached_tmux_command_prefix.is_empty()
+        {
+            crate::ui::toast::info("Configure tmux_command_prefix to use tmux on Windows");
             self.notify_overlay(cx);
             return;
         }
@@ -149,9 +170,13 @@ impl TerminalView {
             CommandAction::RunTask => {
                 self.open_tasks_palette(cx);
             }
+            CommandAction::BrowseReleaseNotes => {
+                self.browse_release_notes_action(cx);
+            }
             CommandAction::Quit => {
                 self.execute_quit_command_action(action, window, cx);
             }
+            CommandAction::ToggleTabBarVisibility if self.toggle_native_window_tab_bar(window) => {}
             CommandAction::ToggleTabBarVisibility => {
                 let next_visibility = if self.should_render_tab_strip_chrome() {
                     TabBarVisibility::ForceHidden
@@ -174,7 +199,10 @@ impl TerminalView {
             | CommandAction::ImportColors
             | CommandAction::AppInfo
             | CommandAction::OpenSettings
-            | CommandAction::CheckForUpdates => {
+            | CommandAction::NewWindow
+            | CommandAction::ReopenDetachedWindow
+            | CommandAction::CheckForUpdates
+            | CommandAction::ViewReleaseNotes => {
                 self.execute_app_system_command_action(action, cx);
             }
             CommandAction::RestartApp => {
@@ -207,6 +235,15 @@ impl TerminalView {
             | CommandAction::FocusPaneDown
             | CommandAction::FocusPaneNext
             | CommandAction::FocusPanePrevious
+            | CommandAction::FocusPane1
+            | CommandAction::FocusPane2
+            | CommandAction::FocusPane3
+            | CommandAction::FocusPane4
+            | CommandAction::FocusPane5
+            | CommandAction::FocusPane6
+            | CommandAction::FocusPane7
+            | CommandAction::FocusPane8
+            | CommandAction::FocusPane9
             | CommandAction::ResizePaneLeft
             | CommandAction::ResizePaneRight
             | CommandAction::ResizePaneUp
@@ -219,6 +256,13 @@ impl TerminalView {
             }
             CommandAction::Copy | CommandAction::Paste | CommandAction::SelectAll => {
                 self.execute_input_command_action(action, cx);
+            }
+            CommandAction::ClearScreen => {
+                // Form feed is the control character produced by Ctrl+L.
+                self.write_terminal_input(b"\x0c", cx);
+                if self.clear_selection() {
+                    cx.notify();
+                }
             }
             CommandAction::ZoomIn | CommandAction::ZoomOut | CommandAction::ZoomReset => {
                 self.execute_layout_command_action(action, cx);
@@ -307,6 +351,33 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         self.execute_command_action(CommandAction::CheckForUpdates, true, window, cx);
+    }
+
+    pub(in super::super) fn handle_reopen_detached_window_action(
+        &mut self,
+        _: &commands::ReopenDetachedWindow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command_action(CommandAction::ReopenDetachedWindow, true, window, cx);
+    }
+
+    pub(in super::super) fn handle_view_release_notes_action(
+        &mut self,
+        _: &commands::ViewReleaseNotes,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command_action(CommandAction::ViewReleaseNotes, true, window, cx);
+    }
+
+    pub(in super::super) fn handle_browse_release_notes_action(
+        &mut self,
+        _: &commands::BrowseReleaseNotes,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command_action(CommandAction::BrowseReleaseNotes, true, window, cx);
     }
 
     pub(in super::super) fn handle_toggle_tab_bar_visibility_action(
@@ -664,6 +735,15 @@ impl TerminalView {
         self.execute_command_action(CommandAction::FocusPanePrevious, true, window, cx);
     }
 
+    pub(in super::super) fn handle_focus_pane_position_action<A: NumberedPaneAction>(
+        &mut self,
+        _: &A,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command_action(A::COMMAND, true, window, cx);
+    }
+
     pub(in super::super) fn handle_resize_pane_left_action(
         &mut self,
         _: &commands::ResizePaneLeft,
@@ -734,6 +814,24 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         self.execute_command_action(CommandAction::Paste, true, window, cx);
+    }
+
+    pub(in super::super) fn handle_select_all_action(
+        &mut self,
+        _: &commands::SelectAll,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command_action(CommandAction::SelectAll, true, window, cx);
+    }
+
+    pub(in super::super) fn handle_clear_screen_action(
+        &mut self,
+        _: &commands::ClearScreen,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command_action(CommandAction::ClearScreen, true, window, cx);
     }
 
     pub(in super::super) fn handle_zoom_in_action(
@@ -875,6 +973,10 @@ mod tests {
         assert_eq!(
             TerminalView::command_palette_mode_for_action(CommandAction::RunTask),
             Some(CommandPaletteMode::Tasks)
+        );
+        assert_eq!(
+            TerminalView::command_palette_mode_for_action(CommandAction::BrowseReleaseNotes),
+            Some(CommandPaletteMode::Releases)
         );
         assert_eq!(
             TerminalView::command_palette_mode_for_action(CommandAction::OpenConfig),

@@ -1,7 +1,7 @@
 use super::*;
+use crate::terminal_ui::TmuxNotification;
 use crate::terminal_view::runtime::TMUX_MOUSE_MODE_SUBSCRIPTION_NAME;
 use std::time::{Duration, Instant};
-use termy_terminal_ui::TmuxNotification;
 
 fn parse_tmux_mouse_mode_subscription(value: &str) -> Option<TmuxPaneMouseMode> {
     let [standard, button, any, sgr, utf8] = value.as_bytes() else {
@@ -62,7 +62,7 @@ impl TerminalView {
                 self.tmux_runtime_mut().resize_wakeup_scheduled = true;
                 let wakeup_tx = self.event_wakeup_tx.clone();
                 cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                    smol::Timer::after(delay).await;
+                    cx.background_executor().timer(delay).await;
                     let _ = cx.update(|cx| {
                         this.update(cx, |view, _cx| {
                             // The delayed callback can outlive tmux runtime; guard before any
@@ -134,7 +134,9 @@ impl TerminalView {
         self.tmux_runtime_mut().title_refresh_wakeup_scheduled = true;
         let wakeup_tx = self.event_wakeup_tx.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            smol::Timer::after(Duration::from_millis(TMUX_TITLE_REFRESH_DEBOUNCE_MS)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(TMUX_TITLE_REFRESH_DEBOUNCE_MS))
+                .await;
             let _ = cx.update(|cx| {
                 this.update(cx, |view, _cx| {
                     // Same safety rule as resize wakeups: this task can fire after runtime
@@ -184,6 +186,15 @@ impl TerminalView {
                 TmuxNotification::Output { pane_id, bytes } => {
                     if let Some(terminal) = self.pane_terminal_by_id(&pane_id) {
                         terminal.feed_output(&bytes);
+                        let replies = {
+                            let mut clipboard_text = ClipboardTextCache::default();
+                            let mut reply_host =
+                                GpuiClipboardReplyHost::new(cx, &mut clipboard_text);
+                            terminal.drain_kitty_clipboard_events(&mut reply_host)
+                        };
+                        for reply in replies {
+                            let _ = self.tmux_send_input_to_pane(&pane_id, &reply);
+                        }
                         if self.is_active_pane_id(&pane_id) {
                             should_redraw = true;
                             self.schedule_tmux_title_refresh();
@@ -233,7 +244,7 @@ impl TerminalView {
                     runtime.title_refresh_deadline = None;
                     runtime.title_refresh_wakeup_scheduled = false;
                 }
-                if self.refresh_tmux_snapshot() {
+                if self.refresh_tmux_snapshot_if_changed() {
                     should_redraw = true;
                 }
             }

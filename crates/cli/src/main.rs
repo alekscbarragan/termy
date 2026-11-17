@@ -17,6 +17,14 @@ struct Cli {
     )]
     working_directory: Option<PathBuf>,
 
+    /// Open a separate terminal window
+    #[arg(long, conflicts_with = "new_tab")]
+    new_window: bool,
+
+    /// Open a tab in the running terminal window
+    #[arg(long, conflicts_with = "new_window")]
+    new_tab: bool,
+
     /// Open Termy with this working directory
     #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
@@ -27,6 +35,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Control persistent terminal sessions; responses are JSON
+    Mux(commands::mux::Args),
     /// Install and manage plugins
     Plugin {
         #[command(subcommand)]
@@ -73,7 +83,7 @@ enum Action {
     #[command(name = "-validate-config")]
     ValidateConfig,
 
-    /// Prettify configuration file (removes comments, formats consistently)
+    /// Prettify configuration file (removes comments, formats consistently; keeps a .bak copy)
     #[command(name = "-prettify-config")]
     PrettifyConfig,
 
@@ -84,43 +94,15 @@ enum Action {
     /// Check for updates
     #[command(name = "-update")]
     Update,
-
-    /// Export the current resolved theme into a Termy themes repo checkout
-    #[command(name = "-export-theme")]
-    ExportTheme {
-        /// Local path to the termy-org/themes checkout
-        #[arg(long)]
-        repo: PathBuf,
-        /// Theme slug, normalized to Termy's theme id format
-        #[arg(long)]
-        slug: String,
-        /// Display name for the theme
-        #[arg(long)]
-        name: String,
-        /// Semver version, for example 1.0.0
-        #[arg(long)]
-        version: String,
-        /// Theme description
-        #[arg(long, default_value = "")]
-        description: String,
-        /// Overwrite an existing files/<version>.json
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Validate a Termy themes repo checkout
-    #[command(name = "-validate-theme-repo")]
-    ValidateThemeRepo {
-        /// Local path to the termy-org/themes checkout
-        #[arg(long)]
-        repo: PathBuf,
-    },
 }
 
 #[derive(Subcommand)]
 enum PluginCommand {
     /// Install a plugin from a local directory or GitHub repository
-    #[command(visible_alias = "install")]
+    #[command(
+        visible_alias = "install",
+        after_help = termy_core::plugin_runtime::PLUGIN_FULL_ACCESS_WARNING
+    )]
     Add {
         /// Local plugin directory, GitHub repository, or /tree/<ref>/<path> URL
         #[arg(value_name = "SOURCE")]
@@ -131,7 +113,7 @@ enum PluginCommand {
         /// Plugin directory inside a GitHub repository
         #[arg(long, value_name = "PATH")]
         path: Option<String>,
-        /// Accept the trusted-code warning without prompting
+        /// Install from GitHub without the confirmation prompt
         #[arg(long)]
         yes: bool,
     },
@@ -178,10 +160,11 @@ enum PluginCommand {
     },
 
     /// Update an installed GitHub plugin
+    #[command(after_help = termy_core::plugin_runtime::PLUGIN_FULL_ACCESS_WARNING)]
     Update {
         /// Installed plugin ID
         id: String,
-        /// Accept the trusted-code warning without prompting
+        /// Update without the confirmation prompt
         #[arg(long)]
         yes: bool,
     },
@@ -198,14 +181,36 @@ enum PluginCommand {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--multiplexer-host")) {
+        let result = std::env::args_os()
+            .nth(2)
+            .ok_or_else(|| anyhow::anyhow!("session directory required"))
+            .and_then(|root| termy_core::multiplexer::run_host(std::path::Path::new(&root)));
+        if let Err(error) = result {
+            eprintln!("session host failed: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // Scripts read `termy mux` failures as JSON, argument errors too.
+        Err(error)
+            if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("mux")) =>
+        {
+            commands::mux::parse_error(error)
+        }
+        Err(error) => error.exit(),
+    };
 
-    if let Some(path) = cli.working_directory.or(cli.path) {
-        commands::open::run(path);
+    let path = cli.working_directory.or(cli.path);
+    if path.is_some() || cli.new_window || cli.new_tab {
+        commands::open::run(path, cli.new_window, cli.new_tab);
         return;
     }
 
     match cli.action {
+        Some(Action::Mux(args)) => commands::mux::run(args),
         Some(Action::Plugin { command }) => commands::plugins::run(command),
         Some(Action::Version) => commands::version::run(),
         Some(Action::Help) => commands::help::run(),
@@ -225,15 +230,6 @@ fn main() {
         Some(Action::PrettifyConfig) => commands::prettify_config::run(),
         Some(Action::Tui) => commands::tui::run(),
         Some(Action::Update) => commands::update::run(),
-        Some(Action::ExportTheme {
-            repo,
-            slug,
-            name,
-            version,
-            description,
-            force,
-        }) => commands::theme_repo::export_theme(repo, slug, name, version, description, force),
-        Some(Action::ValidateThemeRepo { repo }) => commands::theme_repo::validate_theme_repo(repo),
         None => {
             // No subcommand: show help
             commands::help::run();

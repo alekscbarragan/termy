@@ -40,9 +40,6 @@ impl SettingsWindow {
                 SettingsSection::Terminal => self.render_terminal_section(cx).into_any_element(),
                 SettingsSection::Ssh => self.render_ssh_section(cx).into_any_element(),
                 SettingsSection::Tabs => self.render_tabs_section(cx).into_any_element(),
-                SettingsSection::ThemeStore => {
-                    self.render_theme_store_section(cx).into_any_element()
-                }
                 SettingsSection::Plugins => self.render_plugins_section(cx).into_any_element(),
                 SettingsSection::Advanced => self.render_advanced_section(cx).into_any_element(),
                 SettingsSection::Colors => self.render_colors_section(cx).into_any_element(),
@@ -64,7 +61,7 @@ impl SettingsWindow {
         let app_icon = self.config.app_icon;
         let theme_mode_is_system = matches!(
             self.config.theme_mode,
-            termy_config_core::AppearanceMode::System
+            termy_core::config_core::AppearanceMode::System
         );
         let chrome_contrast = self.config.chrome_contrast;
         let font_family = self.config.font_family.clone();
@@ -133,8 +130,8 @@ impl SettingsWindow {
                 app_icon_meta.title,
                 app_icon_meta.description,
                 match app_icon {
-                    termy_config_core::AppIcon::TermyDefault => "default",
-                    termy_config_core::AppIcon::TermyOld => "old",
+                    termy_core::config_core::AppIcon::TermyDefault => "default",
+                    termy_core::config_core::AppIcon::TermyOld => "old",
                 }
                 .to_string(),
                 cx,
@@ -146,7 +143,6 @@ impl SettingsWindow {
                 "chrome-contrast-toggle",
                 RootSettingId::ChromeContrast,
                 chrome_contrast,
-                "Saved",
                 cx,
             ),
             self.render_root_bool_setting_row(
@@ -154,7 +150,6 @@ impl SettingsWindow {
                 "blur-toggle",
                 RootSettingId::BackgroundBlur,
                 background_blur,
-                "Saved",
                 cx,
             ),
             self.render_background_opacity_row(
@@ -168,7 +163,6 @@ impl SettingsWindow {
                 "background-opacity-cells-toggle",
                 RootSettingId::BackgroundOpacityCells,
                 background_opacity_cells,
-                "Saved",
                 cx,
             ),
         ]);
@@ -248,7 +242,7 @@ impl SettingsWindow {
     ) -> AnyElement {
         // Card chrome, label, and the hairlines between rows all come from the
         // design system now; the rows themselves stay owned by this view.
-        termy_ui::SettingsGroup::new(title.into())
+        crate::design_system::SettingsGroup::new(title.into())
             .children(rows)
             .into_any_element()
     }
@@ -271,12 +265,58 @@ impl SettingsWindow {
 
         let section = section.child(self.render_terminal_shell_group(cx));
 
+        let row = self.render_multiplexer_setting_row(cx);
+        let section = section.child(self.render_settings_group("Sessions", vec![row]));
         let section = section.child(self.render_terminal_tmux_group(cx));
 
         section
             .child(self.render_terminal_scrolling_group(cx))
             .child(self.render_terminal_clipboard_group(cx))
             .child(self.render_terminal_ui_group(cx))
+    }
+
+    /// The built-in multiplexer is an early preview: its row says so, and
+    /// turning it on asks for confirmation first. Turning it off does not.
+    fn render_multiplexer_setting_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let metadata = Self::setting_metadata_or_fallback("multiplexer_enabled");
+        let enabled = self.config.multiplexer_enabled;
+        self.render_badged_setting_row(
+            "multiplexer_enabled",
+            "multiplexer-enabled-toggle",
+            metadata.title,
+            Some(
+                crate::design_system::Badge::new("Early Preview")
+                    .tone(crate::design_system::Tone::Warning),
+            ),
+            metadata.description,
+            enabled,
+            cx,
+            move |view, _, cx| {
+                if enabled {
+                    view.apply_root_bool_setting(RootSettingId::MultiplexerEnabled, false, cx);
+                } else {
+                    view.confirm_enable_multiplexer(cx);
+                }
+            },
+        )
+    }
+
+    fn confirm_enable_multiplexer(&mut self, cx: &mut Context<Self>) {
+        let title = "Enable Built-in Multiplexer?";
+        let message = "The built-in multiplexer is an early preview. It may have bugs, lose \
+                       sessions, or change between releases. It applies after restarting Termy.";
+
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            if !crate::native_sdk::confirm(title, message) {
+                // The switch already flipped on; redraw it off.
+                let _ = this.update(cx, |_, cx| cx.notify());
+                return;
+            }
+            let _ = this.update(cx, |view, cx| {
+                view.apply_root_bool_setting(RootSettingId::MultiplexerEnabled, true, cx);
+            });
+        })
+        .detach();
     }
 
     pub(super) fn render_terminal_cursor_group(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -289,7 +329,6 @@ impl SettingsWindow {
                 "cursor_blink-toggle",
                 RootSettingId::CursorBlink,
                 cursor_blink,
-                "Saved",
                 cx,
             ),
             self.render_editable_row(
@@ -312,7 +351,6 @@ impl SettingsWindow {
             "macos_option_as_alt-toggle",
             RootSettingId::MacosOptionAsAlt,
             macos_option_as_alt,
-            "Saved",
             cx,
         )];
         self.render_settings_group("Keyboard", rows)
@@ -324,6 +362,7 @@ impl SettingsWindow {
         let shell_meta = Self::setting_metadata_or_fallback("shell");
         let term_meta = Self::setting_metadata_or_fallback("term");
         let colorterm_meta = Self::setting_metadata_or_fallback("colorterm");
+        let term_program_meta = Self::setting_metadata_or_fallback("term_program");
         #[cfg(target_os = "windows")]
         let shell = self
             .config
@@ -379,6 +418,14 @@ impl SettingsWindow {
                 colorterm,
                 cx,
             ),
+            self.render_editable_row(
+                "term_program",
+                EditableField::TermProgram,
+                term_program_meta.title,
+                term_program_meta.description,
+                self.editable_field_value(EditableField::TermProgram),
+                cx,
+            ),
         ]);
         self.render_settings_group("Shell environment", rows)
     }
@@ -398,7 +445,6 @@ impl SettingsWindow {
             "tmux_enabled-toggle",
             RootSettingId::TmuxEnabled,
             tmux_enabled,
-            "Saved. Use Tmux Sessions to switch runtime now.",
             cx,
         )];
 
@@ -408,7 +454,6 @@ impl SettingsWindow {
                 "tmux_persistence-toggle",
                 RootSettingId::TmuxPersistence,
                 tmux_persistence,
-                "Saved",
                 cx,
             ));
             rows.push(self.render_root_bool_setting_row(
@@ -416,7 +461,6 @@ impl SettingsWindow {
                 "tmux_exclusive-toggle",
                 RootSettingId::TmuxExclusive,
                 tmux_exclusive,
-                "Saved",
                 cx,
             ));
             rows.push(self.render_root_bool_setting_row(
@@ -424,7 +468,6 @@ impl SettingsWindow {
                 "tmux_show_active_pane_border-toggle",
                 RootSettingId::TmuxShowActivePaneBorder,
                 tmux_show_active_pane_border,
-                "Saved",
                 cx,
             ));
             rows.push(self.render_editable_row(
@@ -507,6 +550,7 @@ impl SettingsWindow {
     pub(super) fn render_terminal_clipboard_group(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let copy_on_select = self.config.copy_on_select;
         let copy_on_select_toast = self.config.copy_on_select_toast;
+        let clipboard_read_meta = Self::setting_metadata_or_fallback("clipboard_read");
 
         let rows = vec![
             self.render_root_bool_setting_row(
@@ -514,7 +558,6 @@ impl SettingsWindow {
                 "copy_on_select-toggle",
                 RootSettingId::CopyOnSelect,
                 copy_on_select,
-                "Saved",
                 cx,
             ),
             self.render_root_bool_setting_row(
@@ -522,7 +565,14 @@ impl SettingsWindow {
                 "copy_on_select_toast-toggle",
                 RootSettingId::CopyOnSelectToast,
                 copy_on_select_toast,
-                "Saved",
+                cx,
+            ),
+            self.render_editable_row(
+                "clipboard_read",
+                EditableField::ClipboardRead,
+                clipboard_read_meta.title,
+                clipboard_read_meta.description,
+                self.editable_field_value(EditableField::ClipboardRead),
                 cx,
             ),
         ];
@@ -557,7 +607,6 @@ impl SettingsWindow {
                 "command_palette_show_keybinds-toggle",
                 RootSettingId::CommandPaletteShowKeybinds,
                 command_palette_show_keybinds,
-                "Saved",
                 cx,
             ),
         ];
@@ -579,31 +628,6 @@ impl SettingsWindow {
             .child(self.render_tabs_strip_group(cx))
             .child(self.render_tabs_sidebar_group(cx))
             .child(self.render_tabs_titlebar_group(cx))
-    }
-
-    pub(super) fn render_theme_store_section(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        self.ensure_theme_store_themes_loaded(cx);
-
-        let toolbar = self.render_theme_store_toolbar(cx);
-        let status = self.render_theme_store_status(cx);
-        let grid = self.render_theme_store_grid(cx);
-
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(14.0))
-            .child(self.render_section_header(
-                "Themes",
-                "Browse and install community themes",
-                SettingsSection::ThemeStore,
-                cx,
-            ))
-            .child(toolbar)
-            .when_some(status, |s, status| s.child(status))
-            .child(grid)
     }
 
     pub(super) fn render_tabs_title_group(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -634,7 +658,6 @@ impl SettingsWindow {
                 "tab_title_shell_integration-toggle",
                 RootSettingId::TabTitleShellIntegration,
                 shell_integration,
-                "Saved",
                 cx,
             ),
             self.render_editable_row(
@@ -691,7 +714,23 @@ impl SettingsWindow {
         let close_visibility_meta = Self::setting_metadata_or_fallback("tab_close_visibility");
         let width_mode_meta = Self::setting_metadata_or_fallback("tab_width_mode");
         let bar_position_meta = Self::setting_metadata_or_fallback("tab_bar_position");
-        let mut rows = vec![
+        let mut rows = Vec::new();
+        // macOS: AppKit window tabs vs Termy's strip; Windows: Windows 11-style
+        // vs Termy's strip. Linux has only Termy's strip.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let tab_style = self.editable_field_value(EditableField::TabStyle);
+            let tab_style_meta = Self::setting_metadata_or_fallback("tab_style");
+            rows.push(self.render_editable_row(
+                "tab_style",
+                EditableField::TabStyle,
+                tab_style_meta.title,
+                tab_style_meta.description,
+                tab_style,
+                cx,
+            ));
+        }
+        rows.extend([
             self.render_editable_row(
                 "tab_bar_position",
                 EditableField::TabBarPosition,
@@ -721,17 +760,15 @@ impl SettingsWindow {
                 "tab_switch_modifier_hints-toggle",
                 RootSettingId::TabSwitchModifierHints,
                 show_switch_hints,
-                "Saved",
                 cx,
             ),
-        ];
+        ]);
 
         rows.push(self.render_root_bool_setting_row(
             "auto_hide_tabbar",
             "auto_hide_tabbar-toggle",
             RootSettingId::AutoHideTabbar,
             auto_hide_tabbar,
-            "Saved",
             cx,
         ));
 
@@ -748,7 +785,6 @@ impl SettingsWindow {
                 "sidebar_enabled-toggle",
                 RootSettingId::SidebarEnabled,
                 sidebar_enabled,
-                "Saved",
                 cx,
             ),
             self.render_editable_row(
@@ -771,629 +807,10 @@ impl SettingsWindow {
             "show_termy_in_titlebar-toggle",
             RootSettingId::ShowTermyInTitlebar,
             show_termy,
-            "Saved",
             cx,
         )];
 
         self.render_settings_group("Title bar", rows)
-    }
-
-    pub(super) fn render_theme_store_toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let border_color = self.border_color();
-        let bg_input = self.bg_input();
-        let hover_bg = self.bg_hover();
-        let text_primary = self.text_primary();
-        let text_secondary = self.text_secondary();
-        let text_muted = self.text_muted();
-        let accent = self.accent();
-        let store_url = "https://github.com/termy-org/themes";
-        let query_text = self.theme_store_search_state.text().to_string();
-        let has_query = !query_text.trim().is_empty();
-        let is_search_active = self.theme_store_search_active;
-        let normalized_query = query_text.trim().to_ascii_lowercase();
-        let total_theme_count = self.theme_store_themes.len();
-        let installed_theme_count = self.theme_store_installed_versions.len();
-
-        let search_content = if is_search_active {
-            let font = Font {
-                family: self.config.ui_font_family.clone().into(),
-                ..gpui::font("")
-            };
-            TextInputElement::new(
-                cx.entity(),
-                self.focus_handle.clone(),
-                font,
-                px(SETTINGS_INPUT_TEXT_SIZE),
-                text_secondary.into(),
-                self.accent_with_alpha(0.3).into(),
-                TextInputAlignment::Left,
-            )
-            .into_any_element()
-        } else if has_query {
-            div()
-                .text_size(px(SETTINGS_INPUT_TEXT_SIZE))
-                .text_color(text_secondary)
-                .child(query_text)
-                .into_any_element()
-        } else {
-            div()
-                .text_size(px(SETTINGS_INPUT_TEXT_SIZE))
-                .text_color(text_muted)
-                .child("Search themes...")
-                .into_any_element()
-        };
-
-        let search_input = div()
-            .id("theme-store-search-input")
-            .h(px(32.0))
-            .px_3()
-            .rounded(px(SETTINGS_INPUT_RADIUS))
-            .bg(bg_input)
-            .border_1()
-            .border_color(if is_search_active {
-                accent
-            } else {
-                border_color
-            })
-            .overflow_hidden()
-            .cursor_text()
-            .flex_1()
-            .min_w(px(220.0))
-            .flex()
-            .items_center()
-            .child(
-                div()
-                    .w_full()
-                    .h(px(20.0))
-                    .overflow_hidden()
-                    .child(search_content),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|view, event: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    view.active_input = None;
-                    view.sidebar_search_active = false;
-                    view.theme_store_search_active = true;
-                    let index = view
-                        .theme_store_search_state
-                        .character_index_for_point(event.position);
-                    if event.modifiers.shift {
-                        view.theme_store_search_state.select_to_utf16(index);
-                    } else if event.click_count >= 3 {
-                        view.theme_store_search_state.select_all();
-                    } else if event.click_count == 2 {
-                        view.theme_store_search_state.select_token_at_utf16(index);
-                    } else {
-                        view.theme_store_search_state.set_cursor_utf16(index);
-                    }
-                    view.theme_store_search_selecting = event.click_count == 1;
-                    view.focus_handle.focus(window);
-                    cx.notify();
-                }),
-            )
-            .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _window, cx| {
-                if !view.theme_store_search_selecting || !event.dragging() {
-                    return;
-                }
-                let index = view
-                    .theme_store_search_state
-                    .character_index_for_point(event.position);
-                view.theme_store_search_state.select_to_utf16(index);
-                cx.notify();
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|view, _event: &MouseUpEvent, _window, cx| {
-                    if view.theme_store_search_selecting {
-                        view.theme_store_search_selecting = false;
-                        cx.notify();
-                    }
-                }),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|view, _event: &MouseUpEvent, _window, cx| {
-                    if view.theme_store_search_selecting {
-                        view.theme_store_search_selecting = false;
-                        cx.notify();
-                    }
-                }),
-            );
-
-        let filtered_count = if has_query {
-            self.theme_store_themes
-                .iter()
-                .filter(|theme| {
-                    let haystack = format!(
-                        "{} {} {}",
-                        theme.name.to_ascii_lowercase(),
-                        theme.slug.to_ascii_lowercase(),
-                        theme.description.to_ascii_lowercase()
-                    );
-                    haystack.contains(&normalized_query)
-                })
-                .count()
-        } else {
-            total_theme_count
-        };
-        let availability_label = if self.theme_store_loading {
-            "Syncing".to_string()
-        } else if self.theme_store_error.is_some() {
-            "Unavailable".to_string()
-        } else if has_query {
-            format!(
-                "{filtered_count} result{}",
-                if filtered_count == 1 { "" } else { "s" }
-            )
-        } else {
-            format!("{total_theme_count} available")
-        };
-
-        let installed_chip: Option<AnyElement> = if installed_theme_count > 0 {
-            Some(
-                div()
-                    .h(px(26.0))
-                    .px_2()
-                    .rounded(px(SETTINGS_INPUT_RADIUS))
-                    .text_xs()
-                    .text_color(text_muted)
-                    .whitespace_nowrap()
-                    .flex()
-                    .items_center()
-                    .child(format!("· {installed_theme_count} installed"))
-                    .into_any_element(),
-            )
-        } else {
-            None
-        };
-
-        div()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .child(search_input)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(text_secondary)
-                    .whitespace_nowrap()
-                    .child(availability_label),
-            )
-            .when_some(installed_chip, |s, chip| s.child(chip))
-            .child(div().flex_1())
-            .child(
-                div()
-                    .id("theme-store-open-link")
-                    .h(px(28.0))
-                    .px_3()
-                    .rounded(px(SETTINGS_BUTTON_RADIUS))
-                    .border_1()
-                    .border_color(border_color)
-                    .bg(bg_input)
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(text_secondary)
-                    .whitespace_nowrap()
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .hover(move |s| s.bg(hover_bg).text_color(text_primary))
-                    .child("Open repo ↗")
-                    .on_click(cx.listener(move |_view, _, _, cx| {
-                        if let Err(error) = SettingsWindow::open_url(store_url) {
-                            crate::ui::toast::error(error);
-                        }
-                        cx.notify();
-                    })),
-            )
-            .into_any_element()
-    }
-
-    pub(super) fn render_theme_store_status(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let bg_elevated = self.bg_elevated();
-        let border_color = self.border_color();
-        let text_primary = self.text_primary();
-        let text_muted = self.text_muted();
-        let accent = self.accent();
-        let active_border = self.accent_with_alpha(0.55);
-        let bg_card = self.bg_card();
-        let accent_hover = self.accent_with_alpha(0.8);
-        let button_text = self.contrasting_text_for_fill(accent, bg_card);
-        let button_hover_text = self.contrasting_text_for_fill(accent_hover, bg_card);
-
-        if self.theme_store_loading {
-            return Some(
-                div()
-                    .py(px(CARD_ROW_PADDING_Y + 2.0))
-                    .px(px(CARD_ROW_PADDING_X))
-                    .rounded(px(SETTINGS_CARD_RADIUS))
-                    .bg(bg_elevated)
-                    .border_1()
-                    .border_color(border_color)
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(text_primary)
-                                    .child("Syncing theme registry"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(text_muted)
-                                    .child("Fetching the latest themes from GitHub."),
-                            ),
-                    )
-                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(accent))
-                    .into_any_element(),
-            );
-        }
-        if let Some(error) = self.theme_store_error.clone() {
-            return Some(
-                div()
-                    .py(px(CARD_ROW_PADDING_Y + 2.0))
-                    .px(px(CARD_ROW_PADDING_X))
-                    .rounded(px(SETTINGS_CARD_RADIUS))
-                    .bg(bg_elevated)
-                    .border_1()
-                    .border_color(active_border)
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(text_primary)
-                                    .child("Registry did not respond"),
-                            )
-                            .child(div().text_xs().text_color(text_muted).child(error)),
-                    )
-                    .child(
-                        div()
-                            .id("theme-store-retry-btn")
-                            .h(px(28.0))
-                            .px_3()
-                            .rounded(px(SETTINGS_BUTTON_RADIUS))
-                            .bg(accent)
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(button_text)
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(move |s| s.bg(accent_hover).text_color(button_hover_text))
-                            .child("Retry")
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.theme_store_loaded = false;
-                                view.refresh_theme_store_themes(cx);
-                            })),
-                    )
-                    .into_any_element(),
-            );
-        }
-        if self.theme_store_from_cache {
-            return Some(
-                div()
-                    .py(px(8.0))
-                    .px(px(CARD_ROW_PADDING_X))
-                    .rounded(px(SETTINGS_INPUT_RADIUS))
-                    .bg(self.accent_with_alpha(0.08))
-                    .text_xs()
-                    .text_color(text_muted)
-                    .child("Showing cached themes — registry unreachable.")
-                    .into_any_element(),
-            );
-        }
-        None
-    }
-
-    pub(super) fn render_theme_store_grid(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let bg_elevated = self.bg_elevated();
-        let border_color = self.border_color();
-        let text_primary = self.text_primary();
-        let text_muted = self.text_muted();
-
-        if self.theme_store_themes.is_empty()
-            && (self.theme_store_loading || self.theme_store_error.is_some())
-        {
-            return div().into_any_element();
-        }
-
-        let query_text = self.theme_store_search_state.text().to_string();
-        let normalized_query = query_text.trim().to_ascii_lowercase();
-
-        if self.theme_store_themes.is_empty() {
-            return div()
-                .py(px(28.0))
-                .px(px(CARD_ROW_PADDING_X))
-                .rounded(px(SETTINGS_CARD_RADIUS))
-                .bg(bg_elevated)
-                .border_1()
-                .border_color(border_color)
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(4.0))
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(text_primary)
-                        .child("No themes yet"),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(text_muted)
-                        .child("Registry is reachable but has no published themes."),
-                )
-                .into_any_element();
-        }
-
-        let filtered_themes: Vec<ThemeStoreTheme> = self
-            .theme_store_themes
-            .iter()
-            .filter(|theme| {
-                if normalized_query.is_empty() {
-                    return true;
-                }
-                let haystack = format!(
-                    "{} {} {}",
-                    theme.name.to_ascii_lowercase(),
-                    theme.slug.to_ascii_lowercase(),
-                    theme.description.to_ascii_lowercase()
-                );
-                haystack.contains(&normalized_query)
-            })
-            .take(30)
-            .cloned()
-            .collect();
-
-        if filtered_themes.is_empty() {
-            return div()
-                .py(px(28.0))
-                .px(px(CARD_ROW_PADDING_X))
-                .rounded(px(SETTINGS_CARD_RADIUS))
-                .bg(bg_elevated)
-                .border_1()
-                .border_color(border_color)
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(4.0))
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(text_primary)
-                        .child("No matching themes"),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(text_muted)
-                        .child("Try a different name, slug, or style keyword."),
-                )
-                .into_any_element();
-        }
-
-        let cards: Vec<AnyElement> = filtered_themes
-            .into_iter()
-            .map(|theme| self.render_theme_store_card(theme, cx))
-            .collect();
-
-        div()
-            .flex()
-            .flex_wrap()
-            .justify_center()
-            .gap(px(10.0))
-            .children(cards)
-            .into_any_element()
-    }
-
-    pub(super) fn render_theme_store_card(
-        &self,
-        theme: ThemeStoreTheme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let bg_elevated = self.bg_elevated();
-        let border_color = self.border_color();
-        let text_primary = self.text_primary();
-        let text_secondary = self.text_secondary();
-        let text_muted = self.text_muted();
-        let accent = self.accent();
-        let active_border = self.accent_with_alpha(0.50);
-
-        let version_label = theme
-            .latest_version
-            .clone()
-            .unwrap_or_else(|| "n/a".to_string());
-        let slug_key = theme.slug.to_ascii_lowercase();
-        let installed_version = self.theme_store_installed_versions.get(&slug_key).cloned();
-        let installed_any = installed_version.is_some();
-        let is_installed = installed_version.as_ref().is_some_and(|version| {
-            theme
-                .latest_version
-                .as_deref()
-                .is_none_or(|latest| version.eq_ignore_ascii_case(latest))
-        });
-        let has_update = installed_any && !is_installed;
-        let description = if theme.description.trim().is_empty() {
-            "No description provided.".to_string()
-        } else {
-            theme.description.clone()
-        };
-
-        let install_theme = theme.clone();
-        let uninstall_slug = theme.slug.clone();
-
-        let action_button: AnyElement = if is_installed {
-            let view = cx.entity();
-            termy_ui::Button::new(format!("theme-store-uninstall-{}", theme.slug), "Uninstall")
-                .variant(termy_ui::ButtonVariant::Secondary)
-                .size(termy_ui::ButtonSize::Small)
-                .flex_1()
-                .on_click(move |_, _, cx| {
-                    view.update(cx, |view, cx| {
-                        view.uninstall_theme_store_theme(&uninstall_slug, cx);
-                        cx.notify();
-                    });
-                })
-                .into_any_element()
-        } else {
-            let label = if has_update { "Update" } else { "Install" };
-            let view = cx.entity();
-            let ui = termy_ui::tokens(cx);
-            termy_ui::Button::new(format!("theme-store-install-{}", theme.slug), label)
-                .size(termy_ui::ButtonSize::Small)
-                .bg(ui.accent)
-                .border_color(ui.accent)
-                .text_color(ui.text_on_accent)
-                .flex_1()
-                .on_click(move |_, _, cx| {
-                    view.update(cx, |view, cx| {
-                        view.confirm_install_theme_store_theme(install_theme.clone(), cx);
-                    });
-                })
-                .into_any_element()
-        };
-
-        let status_dot_color = if is_installed {
-            accent
-        } else if has_update {
-            self.accent_with_alpha(0.55)
-        } else {
-            border_color
-        };
-
-        let swatch_colors: Vec<Rgba> = {
-            let resolved = crate::theme_store::load_installed_theme_colors(&theme.slug)
-                .or_else(|| crate::theme_store::load_installed_theme_colors(&theme.name));
-            if let Some(colors) = resolved {
-                let palette_indices = [1usize, 2, 4, 3, 5, 6, 14];
-                palette_indices
-                    .iter()
-                    .map(|&i| {
-                        let c = colors.ansi[i];
-                        Rgba {
-                            r: c.r as f32 / 255.0,
-                            g: c.g as f32 / 255.0,
-                            b: c.b as f32 / 255.0,
-                            a: 1.0,
-                        }
-                    })
-                    .collect()
-            } else {
-                let mut muted = text_muted;
-                muted.a *= 0.35;
-                vec![muted; 7]
-            }
-        };
-
-        let mut swatch_row = div().flex().items_center().gap(px(5.0));
-        for color in swatch_colors {
-            swatch_row = swatch_row.child(div().w(px(11.0)).h(px(11.0)).rounded_full().bg(color));
-        }
-
-        let theme_name = theme.name;
-        let theme_slug = theme.slug;
-
-        div()
-            .flex_grow()
-            .flex_shrink()
-            .flex_basis(px(240.0))
-            .min_w(px(240.0))
-            .max_w(px(360.0))
-            .bg(bg_elevated)
-            .border_1()
-            .border_color(if is_installed || has_update {
-                active_border
-            } else {
-                border_color
-            })
-            .rounded(px(SETTINGS_CARD_RADIUS))
-            .overflow_hidden()
-            .flex()
-            .flex_col()
-            .p(px(14.0))
-            .gap(px(10.0))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .w(px(8.0))
-                            .h(px(8.0))
-                            .rounded_full()
-                            .bg(status_dot_color),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(text_primary)
-                            .overflow_hidden()
-                            .child(theme_name),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(text_muted)
-                            .whitespace_nowrap()
-                            .child(format!("v{version_label}")),
-                    ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(text_muted)
-                    .overflow_hidden()
-                    .child(theme_slug),
-            )
-            .child(swatch_row)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(text_secondary)
-                    .line_height(px(16.0))
-                    .overflow_hidden()
-                    .child(description),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(action_button),
-            )
-            .into_any_element()
     }
 
     pub(super) fn render_advanced_section(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1453,7 +870,6 @@ impl SettingsWindow {
                 "native-tab-persistence-toggle",
                 RootSettingId::NativeTabPersistence,
                 native_tab_persistence,
-                "Saved",
                 cx,
             ),
             self.render_root_bool_setting_row(
@@ -1461,7 +877,6 @@ impl SettingsWindow {
                 "native-layout-autosave-toggle",
                 RootSettingId::NativeLayoutAutosave,
                 native_layout_autosave,
-                "Saved",
                 cx,
             ),
             self.render_root_bool_setting_row(
@@ -1469,7 +884,6 @@ impl SettingsWindow {
                 "native-buffer-persistence-toggle",
                 RootSettingId::NativeBufferPersistence,
                 native_buffer_persistence,
-                "Saved",
                 cx,
             ),
         ];
@@ -1481,7 +895,6 @@ impl SettingsWindow {
                 "warn_on_quit-toggle",
                 RootSettingId::WarnOnQuit,
                 always_warn_on_quit,
-                "Saved",
                 cx,
             ),
             self.render_root_bool_setting_row(
@@ -1489,7 +902,6 @@ impl SettingsWindow {
                 "warn_on_quit_with_running_process-toggle",
                 RootSettingId::WarnOnQuitWithRunningProcess,
                 warn_on_quit_with_running_process,
-                "Saved",
                 cx,
             ),
         ];
@@ -1522,7 +934,6 @@ impl SettingsWindow {
                 "auto_update-toggle",
                 RootSettingId::AutoUpdate,
                 auto_update,
-                "Saved",
                 cx,
             ),
             self.render_root_bool_setting_row(
@@ -1530,7 +941,6 @@ impl SettingsWindow {
                 "simple_mode-toggle",
                 RootSettingId::SimpleMode,
                 simple_mode,
-                "Saved",
                 cx,
             ),
             self.render_root_bool_setting_row(
@@ -1538,7 +948,6 @@ impl SettingsWindow {
                 "show_debug_overlay-toggle",
                 RootSettingId::ShowDebugOverlay,
                 show_debug_overlay,
-                "Saved",
                 cx,
             ),
         ];
@@ -1575,7 +984,7 @@ impl SettingsWindow {
                     .rounded(px(SETTINGS_INPUT_RADIUS))
                     .bg(accent)
                     .text_sm()
-                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
                     .text_color(button_text)
                     .cursor_pointer()
                     .hover(move |s| s.bg(accent_hover).text_color(button_hover_text))
@@ -1606,6 +1015,16 @@ impl SettingsWindow {
             .child(safety_group)
             .child(window_group)
             .child(behavior_group)
+            .children({
+                #[cfg(target_os = "macos")]
+                {
+                    Some(self.render_default_terminal_group(cx))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    None::<AnyElement>
+                }
+            })
             .child(config_group)
     }
 }

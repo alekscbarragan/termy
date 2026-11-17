@@ -1,15 +1,22 @@
 use super::super::*;
-use super::presentation::{palette_item_category, palette_item_icon_path, shortcut_keycaps};
-use super::state::{command_palette_layout_for_viewport, command_palette_viewport_height};
+use super::presentation::{
+    palette_item_category, palette_item_icon_path, palette_item_tint_category, shortcut_keycaps,
+};
+use super::state::{
+    ReleaseListState, command_palette_layout_for_viewport, command_palette_viewport_height,
+};
 use super::style::{
     COMMAND_PALETTE_PANEL_RADIUS, COMMAND_PALETTE_ROW_RADIUS, COMMAND_PALETTE_SHORTCUT_RADIUS,
-    CommandPaletteStyle,
+    CommandPaletteStyle, category_tint,
 };
 use super::*;
 use crate::ui::scrollbar::{self, ScrollbarPaintStyle, ScrollbarRange};
-use gpui::prelude::FluentBuilder;
-use gpui::uniform_list;
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::uniform_list;
 use std::ops::Range;
+
+/// How far the palette travels down as it arrives, in points.
+const COMMAND_PALETTE_ENTER_TRAVEL: f32 = 8.0;
 
 /// Renders a row title with the query's matched characters accented. Disabled
 /// rows and rows without a query keep flat text.
@@ -17,18 +24,31 @@ fn highlighted_title(
     title: String,
     highlights: &[Range<usize>],
     is_enabled: bool,
+    is_selected: bool,
     style: &CommandPaletteStyle,
 ) -> AnyElement {
+    let weight = if is_selected && is_enabled {
+        gpui_kit::FontWeight::MEDIUM
+    } else {
+        gpui_kit::FontWeight::NORMAL
+    };
     if highlights.is_empty() || !is_enabled {
-        return title.into_any_element();
+        return div().font_weight(weight).child(title).into_any_element();
     }
 
-    let highlight = gpui::HighlightStyle {
-        color: Some(style.match_text.into()),
-        font_weight: Some(gpui::FontWeight::BOLD),
+    // Matched characters go bold in the row's own color, as Spotlight does;
+    // on the accent fill that color is white.
+    let match_color = if is_selected {
+        style.selected_text()
+    } else {
+        style.match_text
+    };
+    let highlight = gpui_kit::HighlightStyle {
+        color: Some(match_color.into()),
+        font_weight: Some(gpui_kit::FontWeight::BOLD),
         ..Default::default()
     };
-    let runs: Vec<(Range<usize>, gpui::HighlightStyle)> = highlights
+    let runs: Vec<(Range<usize>, gpui_kit::HighlightStyle)> = highlights
         .iter()
         .filter(|range| {
             range.end <= title.len()
@@ -39,21 +59,44 @@ fn highlighted_title(
         .collect();
 
     if runs.is_empty() {
-        return title.into_any_element();
+        return div().font_weight(weight).child(title).into_any_element();
     }
 
-    gpui::StyledText::new(title)
-        .with_highlights(runs)
+    div()
+        .font_weight(weight)
+        .child(gpui_kit::StyledText::new(title).with_highlights(runs))
         .into_any_element()
 }
 
-/// Draws a keybinding as one chip per key: `⇧⌘K` reads as three caps, and a
-/// multi-keystroke binding puts extra space between its keystrokes.
-fn shortcut_keycap_row(
-    label: &str,
-    text_color: gpui::Rgba,
-    style: &CommandPaletteStyle,
+fn palette_icon_tile(
+    icon_path: &'static str,
+    tile_bg: gpui_kit::Background,
+    glyph: gpui_kit::Rgba,
+    tile_size: f32,
+    tile_radius: f32,
+    icon_size: f32,
 ) -> AnyElement {
+    div()
+        .flex_none()
+        .w(px(tile_size))
+        .h(px(tile_size))
+        .rounded(px(tile_radius))
+        .bg(tile_bg)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            gpui_kit::svg()
+                .path(gpui_kit::SharedString::from(icon_path))
+                .size(px(icon_size))
+                .text_color(glyph),
+        )
+        .into_any_element()
+}
+
+/// Draws a keybinding the way `NSMenu` shows key equivalents: plain text
+/// glyphs, with a little extra space between the keystrokes of a chord.
+fn shortcut_label(label: &str, text_color: gpui_kit::Rgba) -> AnyElement {
     let keystrokes = shortcut_keycaps(label);
     if keystrokes.is_empty() {
         return div().into_any_element();
@@ -64,39 +107,73 @@ fn shortcut_keycap_row(
         .flex()
         .items_center()
         .gap(px(COMMAND_PALETTE_KEYSTROKE_GAP))
-        .children(keystrokes.into_iter().map(|keycaps| {
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(COMMAND_PALETTE_KEYCAP_GAP))
-                .children(keycaps.into_iter().map(|keycap| {
-                    div()
-                        .flex_none()
-                        .h(px(20.0))
-                        .min_w(px(20.0))
-                        .px(px(5.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(COMMAND_PALETTE_SHORTCUT_RADIUS))
-                        .bg(style.shortcut_bg)
-                        .text_size(px(10.0))
-                        .text_color(text_color)
-                        .child(keycap)
-                }))
-        }))
+        .text_size(px(13.0))
+        .text_color(text_color)
+        .children(
+            keystrokes
+                .into_iter()
+                .map(|keycaps| div().flex_none().child(keycaps.concat())),
+        )
+        .into_any_element()
+}
+
+/// A keycap in the palette footer.
+fn footer_keycap(key: &str, style: &CommandPaletteStyle) -> AnyElement {
+    div()
+        .flex_none()
+        .h(px(18.0))
+        .min_w(px(20.0))
+        .px(px(5.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.0))
+        .bg(style.shortcut_bg)
+        .border_1()
+        .border_color(style.native.separator)
+        .text_size(px(11.0))
+        .text_color(style.shortcut_text)
+        .child(key.to_string())
         .into_any_element()
 }
 
 impl TerminalView {
+    /// The palette arriving like a popover: it fades in while settling a few
+    /// points down onto its resting place, on the shared card curve. Each
+    /// opening replays it; Reduce Motion shows it in place.
+    fn command_palette_enter(&self, panel: impl IntoElement, cx: &App) -> AnyElement {
+        use crate::ui::native::{CARD_IN, sample};
+        use gpui_kit::AnimationExt as _;
+
+        let panel = div().child(panel);
+        if cx.reduce_motion() || true {
+            return panel.into_any_element();
+        }
+        let id = gpui_kit::SharedString::from(format!(
+            "command-palette-enter-{}",
+            self.command_palette.open_generation()
+        ));
+        panel
+            .with_animation(
+                id,
+                gpui_kit::Animation::new(CARD_IN.duration),
+                move |panel, t| {
+                    let eased = sample(CARD_IN.curve, t);
+                    panel
+                        .opacity(t.min(1.0))
+                        .mt(px(-COMMAND_PALETTE_ENTER_TRAVEL * (1.0 - eased)))
+                },
+            )
+            .into_any_element()
+    }
+
     pub(super) fn command_palette_scrollbar_range(
         &self,
         viewport_height: f32,
         item_count: usize,
     ) -> ScrollbarRange {
         let scroll_handle = self.command_palette.base_scroll_handle();
-        let max_offset_from_handle: f32 = scroll_handle.max_offset().height.into();
+        let max_offset_from_handle: f32 = scroll_handle.max_offset().y.into();
         let estimated_content_height = item_count as f32 * COMMAND_PALETTE_ROW_HEIGHT;
         let estimated_max_offset = (estimated_content_height - viewport_height).max(0.0);
         let max_offset = max_offset_from_handle.max(estimated_max_offset);
@@ -188,7 +265,7 @@ impl TerminalView {
         item_count: usize,
     ) -> Option<scrollbar::ScrollbarMetrics> {
         let scroll_handle = self.command_palette.base_scroll_handle();
-        let max_offset_from_handle: f32 = scroll_handle.max_offset().height.into();
+        let max_offset_from_handle: f32 = scroll_handle.max_offset().y.into();
         let estimated_content_height = item_count as f32 * COMMAND_PALETTE_ROW_HEIGHT;
         let estimated_max_offset = (estimated_content_height - viewport_height).max(0.0);
         let max_offset = max_offset_from_handle.max(estimated_max_offset);
@@ -263,7 +340,8 @@ impl TerminalView {
                 | CommandPaletteItemKind::TaskCreate { .. }
                 | CommandPaletteItemKind::Task { .. }
                 | CommandPaletteItemKind::AppInfoEntry { .. }
-                | CommandPaletteItemKind::AppInfoCopyAll { .. } => None,
+                | CommandPaletteItemKind::AppInfoCopyAll { .. }
+                | CommandPaletteItemKind::ReleaseNotes { .. } => None,
             };
             let title = item.title.clone();
             let title_highlights = self.command_palette.filtered_title_highlights(index);
@@ -273,40 +351,35 @@ impl TerminalView {
                 .status_hint
                 .clone()
                 .or_else(|| (!is_enabled).then(|| COMMAND_PALETTE_UNAVAILABLE_HINT.to_string()));
-            let text_color = if is_enabled {
+            let selected_row = is_selected && is_enabled;
+            let text_color = if selected_row {
+                style.selected_text()
+            } else if is_enabled {
                 style.primary_text
             } else {
                 style.muted_text
             };
-            let shortcut_text = if is_enabled {
-                style.shortcut_text
+            let shortcut_text = if selected_row {
+                crate::ui::native::with_alpha(style.selected_text(), 0.85)
+            } else if is_enabled {
+                style.native.tertiary
             } else {
                 style.muted_text
             };
             let icon_path = palette_item_icon_path(&item);
-            // Selection is carried by the row background and accent bar alone;
-            // a tint flip here would make every unselected row read as dimmed.
-            let icon_tint = if is_enabled {
-                style.icon_text
-            } else {
-                style.muted_text
-            };
+            let tint_category = palette_item_tint_category(&item);
+            let tint = category_tint(&self.colors, tint_category);
+            let icon_tile = palette_icon_tile(
+                icon_path,
+                style.icon_tile_fill(tint, selected_row),
+                style.icon_tile_glyph(is_enabled),
+                COMMAND_PALETTE_ICON_TILE_SIZE,
+                COMMAND_PALETTE_ICON_TILE_RADIUS,
+                COMMAND_PALETTE_ROW_ICON_SIZE,
+            );
             let category = show_categories
                 .then(|| palette_item_category(&item))
                 .flatten();
-
-            let selection_accent = is_selected.then(|| {
-                div()
-                    .absolute()
-                    .left_0()
-                    .top(px(COMMAND_PALETTE_SELECTED_ACCENT_INSET_Y))
-                    .w(px(COMMAND_PALETTE_SELECTED_ACCENT_WIDTH))
-                    .h(px((COMMAND_PALETTE_ROW_HEIGHT
-                        - (COMMAND_PALETTE_SELECTED_ACCENT_INSET_Y * 2.0))
-                        .max(0.0)))
-                    .rounded_full()
-                    .bg(style.selected_accent)
-            });
 
             rows.push(
                 div()
@@ -321,7 +394,6 @@ impl TerminalView {
                     } else {
                         transparent
                     })
-                    .children(selection_accent)
                     .when(is_enabled, |row| row.cursor_pointer())
                     .on_mouse_move(
                         cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
@@ -353,19 +425,15 @@ impl TerminalView {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(12.0))
+                                    .gap(px(10.0))
                                     .flex_1()
                                     .min_w(px(0.0))
-                                    .child(
-                                        gpui::svg()
-                                            .path(gpui::SharedString::from(icon_path))
-                                            .size(px(COMMAND_PALETTE_ROW_ICON_SIZE))
-                                            .text_color(icon_tint),
-                                    )
+                                    .child(icon_tile)
                                     .child(div().flex_1().truncate().child(highlighted_title(
                                         title,
                                         &title_highlights,
                                         is_enabled,
+                                        is_selected,
                                         &style,
                                     ))),
                             )
@@ -374,36 +442,26 @@ impl TerminalView {
                                     .flex()
                                     .items_center()
                                     .gap(px(6.0))
+                                    .gap(px(10.0))
                                     .children(category.map(|label| {
                                         div()
                                             .flex_none()
                                             .max_w(px(COMMAND_PALETTE_ROW_CATEGORY_MAX_WIDTH))
-                                            // Sits a touch further from the key
-                                            // chips than they sit from each other.
-                                            .mr(px(4.0))
-                                            .overflow_hidden()
                                             .truncate()
                                             .text_size(px(11.0))
-                                            .text_color(style.muted_text)
+                                            .text_color(shortcut_text)
                                             .child(label)
                                     }))
                                     .children(status_hint.map(|label| {
                                         div()
                                             .flex_none()
-                                            .h(px(20.0))
-                                            .px(px(6.0))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded(px(COMMAND_PALETTE_SHORTCUT_RADIUS))
-                                            .bg(style.shortcut_bg)
-                                            .text_size(px(10.0))
-                                            .text_color(style.muted_text)
+                                            .text_size(px(11.0))
+                                            .text_color(shortcut_text)
                                             .child(label)
                                     }))
-                                    .children(shortcut.map(|label| {
-                                        shortcut_keycap_row(&label, shortcut_text, &style)
-                                    })),
+                                    .children(
+                                        shortcut.map(|label| shortcut_label(&label, shortcut_text)),
+                                    ),
                             ),
                     )
                     .into_any_element(),
@@ -477,6 +535,7 @@ impl TerminalView {
                     }
                 }
                 CommandPaletteMode::AppInfo => "App Info".to_string(),
+                CommandPaletteMode::Releases => "Release Notes".to_string(),
             }
         };
         // (keycap, action) pairs for the footer bar. An empty keycap renders the
@@ -549,12 +608,15 @@ impl TerminalView {
                 CommandPaletteMode::AppInfo => {
                     &[("↵", "Copy"), ("esc", "Back"), ("↑↓", "Navigate")]
                 }
+                CommandPaletteMode::Releases => {
+                    &[("↵", "View Notes"), ("esc", "Back"), ("↑↓", "Navigate")]
+                }
             }
         };
         let style = CommandPaletteStyle::resolve(self);
         let input_font = Font {
             family: self.ui_font_family.clone(),
-            ..gpui::font("")
+            ..gpui_kit::font("")
         };
         let empty_state_message = match self.command_palette.mode() {
             CommandPaletteMode::TmuxSessions
@@ -562,25 +624,37 @@ impl TerminalView {
                     == TmuxSessionIntent::AttachOrSwitch
                     && self.command_palette.input().text().trim().is_empty() =>
             {
-                "No tmux sessions found. Type a name and press Enter to create one."
+                "No tmux sessions found. Type a name and press Enter to create one.".to_string()
             }
             CommandPaletteMode::Layouts
                 if self.command_palette.saved_layout_intent() == SavedLayoutIntent::Browse
                     && self.command_palette.input().text().trim().is_empty() =>
             {
-                "No saved layouts yet. Save the current split setup from here."
+                "No saved layouts yet. Save the current split setup from here.".to_string()
             }
             CommandPaletteMode::Tasks => match self.command_palette.task_intent() {
                 TaskIntent::Browse if self.command_palette.input().text().trim().is_empty() => {
-                    "No tasks configured. Create one here or add task.<name>.command entries to config.txt."
+                    "No tasks configured. Create one here or add task.<name>.command entries to config.txt.".to_string()
                 }
                 TaskIntent::CreateGlobalInput | TaskIntent::CreateLayoutInput => {
-                    "Enter a task as name: command"
+                    "Enter a task as name: command".to_string()
                 }
-                _ => "No matching items",
+                _ => "No matching items".to_string(),
             },
-            CommandPaletteMode::PluginInputs => "No matching options",
-            _ => "No matching items",
+            CommandPaletteMode::PluginInputs => "No matching options".to_string(),
+            CommandPaletteMode::Releases => match &self.command_palette.release_list {
+                ReleaseListState::Loading | ReleaseListState::Idle => {
+                    "Loading releases…".to_string()
+                }
+                ReleaseListState::Failed(message) => message.clone(),
+                ReleaseListState::Ready(_)
+                    if self.command_palette.input().text().trim().is_empty() =>
+                {
+                    "No GitHub releases found".to_string()
+                }
+                ReleaseListState::Ready(_) => "No matching items".to_string(),
+            },
+            _ => "No matching items".to_string(),
         };
 
         let list = if let Some(plugin_ui) = plugin_ui.clone() {
@@ -595,21 +669,24 @@ impl TerminalView {
         } else if item_count == 0 {
             div()
                 .w_full()
-                .py(px(28.0))
-                .px(px(24.0))
+                .h(px(list_height))
                 .flex()
                 .flex_col()
                 .items_center()
-                .gap(px(10.0))
-                .child(
-                    gpui::svg()
-                        .path(gpui::SharedString::from("icons/settings/search.svg"))
-                        .size(px(20.0))
-                        .text_color(style.muted_text),
-                )
+                .justify_center()
+                .gap(px(12.0))
+                .px(px(24.0))
+                .child(palette_icon_tile(
+                    "icons/settings/search.svg",
+                    style.icon_tile_fill(category_tint(&self.colors, "Search"), false),
+                    style.icon_tile_glyph(true),
+                    COMMAND_PALETTE_EMPTY_TILE_SIZE,
+                    COMMAND_PALETTE_EMPTY_TILE_RADIUS,
+                    COMMAND_PALETTE_EMPTY_ICON_SIZE,
+                ))
                 .child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(px(13.0))
                         .text_color(style.muted_text)
                         .text_center()
                         .child(empty_state_message),
@@ -623,7 +700,7 @@ impl TerminalView {
             )
             .flex_1()
             .h(px(list_height))
-            .track_scroll(self.command_palette.scroll_handle().clone())
+            .track_scroll(self.command_palette.scroll_handle())
             .into_any_element();
             let mut list_container = div()
                 .w_full()
@@ -636,8 +713,8 @@ impl TerminalView {
                 let drag_active = self.command_palette_scrollbar_drag.is_some();
                 let paint_style = ScrollbarPaintStyle {
                     width: COMMAND_PALETTE_SCROLLBAR_WIDTH,
-                    track_radius: 4.0,
-                    thumb_radius: 4.0,
+                    track_radius: 6.0,
+                    thumb_radius: 6.0,
                     thumb_inset: 1.0,
                     marker_inset: 0.0,
                     marker_radius: 0.0,
@@ -657,7 +734,7 @@ impl TerminalView {
                         .pr(px(2.0))
                         .cursor_pointer()
                         .child(
-                            gpui::canvas(
+                            gpui_kit::canvas(
                                 move |bounds, _, cx| {
                                     bounds_entity.update(cx, |view, _| {
                                         view.command_palette_scrollbar_lane_bounds = Some(bounds);
@@ -696,14 +773,13 @@ impl TerminalView {
             list_container.into_any_element()
         };
 
-        let scrim_color = gpui::Rgba {
+        let scrim_color = gpui_kit::Rgba {
             r: 0.0,
             g: 0.0,
             b: 0.0,
             a: COMMAND_PALETTE_SCRIM_ALPHA,
         };
-        let mut divider = style.muted_text;
-        divider.a = COMMAND_PALETTE_DIVIDER_ALPHA;
+        let divider = style.native.separator;
 
         // Breadcrumb, not a trailing tag: which sub-mode you are in decides what
         // Enter does, so it reads before the query instead of after it.
@@ -719,10 +795,11 @@ impl TerminalView {
                     .h(px(22.0))
                     .px(px(8.0))
                     .rounded(px(COMMAND_PALETTE_SHORTCUT_RADIUS))
-                    .bg(style.shortcut_bg)
+                    .bg(style.native.fill)
                     .overflow_hidden()
                     .text_size(px(11.0))
-                    .text_color(style.primary_text)
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .text_color(style.muted_text)
                     .flex()
                     .items_center()
                     .child(div().min_w(px(0.0)).truncate().child(mode_title))
@@ -748,8 +825,9 @@ impl TerminalView {
             .items_center()
             .gap(px(12.0))
             .child(
-                gpui::svg()
-                    .path(gpui::SharedString::from("icons/settings/search.svg"))
+                gpui_kit::svg()
+                    .path(gpui_kit::SharedString::from("icons/settings/search.svg"))
+                    .flex_none()
                     .size(px(18.0))
                     .text_color(style.muted_text),
             )
@@ -758,7 +836,7 @@ impl TerminalView {
                 div()
                     .flex_1()
                     .min_w(px(0.0))
-                    .h(px(22.0))
+                    .h(px(COMMAND_PALETTE_INPUT_TEXT_SIZE + 6.0))
                     .relative()
                     .overflow_hidden()
                     .children(input_placeholder.map(|placeholder| {
@@ -793,11 +871,19 @@ impl TerminalView {
         let footer = div()
             .w_full()
             .h(px(COMMAND_PALETTE_FOOTER_HEIGHT))
-            .px(px(COMMAND_PALETTE_ROW_PADDING_X))
+            .pl(px(COMMAND_PALETTE_ROW_PADDING_X + 8.0))
+            .pr(px(COMMAND_PALETTE_ROW_PADDING_X + 4.0))
             .flex()
             .items_center()
             .justify_between()
-            .gap(px(10.0))
+            .gap(px(14.0))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(11.0))
+                    .text_color(style.native.tertiary)
+                    .child(result_counter),
+            )
             .child(
                 div()
                     .flex()
@@ -810,21 +896,7 @@ impl TerminalView {
                             .flex_none()
                             .flex()
                             .items_center()
-                            .gap(px(5.0))
-                            .children((!key.is_empty()).then(|| {
-                                div()
-                                    .flex_none()
-                                    .h(px(16.0))
-                                    .px(px(5.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(COMMAND_PALETTE_SHORTCUT_RADIUS))
-                                    .bg(style.shortcut_bg)
-                                    .text_size(px(10.0))
-                                    .text_color(style.shortcut_text)
-                                    .child(*key)
-                            }))
+                            .gap(px(6.0))
                             .child(
                                 div()
                                     .text_size(px(11.0))
@@ -832,14 +904,8 @@ impl TerminalView {
                                     .whitespace_nowrap()
                                     .child(*action),
                             )
+                            .children((!key.is_empty()).then(|| footer_keycap(key, &style)))
                     })),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(px(11.0))
-                    .text_color(style.muted_text)
-                    .child(result_counter),
             );
 
         let panel = div()
@@ -849,7 +915,7 @@ impl TerminalView {
             .bg(style.panel_bg)
             .border_1()
             .border_color(style.panel_border)
-            .shadow_lg()
+            .shadow(style.native.popover_shadow())
             .overflow_hidden()
             .flex()
             .flex_col()
@@ -861,7 +927,13 @@ impl TerminalView {
             )
             .child(input_head)
             .child(div().h(px(1.0)).w_full().bg(divider))
-            .child(div().w_full().px(px(6.0)).py(px(6.0)).child(list))
+            .child(
+                div()
+                    .w_full()
+                    .px(px(COMMAND_PALETTE_LIST_PADDING_Y))
+                    .py(px(COMMAND_PALETTE_LIST_PADDING_Y))
+                    .child(list),
+            )
             .child(div().h(px(1.0)).w_full().bg(divider))
             .child(footer);
 
@@ -919,7 +991,7 @@ impl TerminalView {
                     .flex_col()
                     .items_center()
                     .pt(px(layout.top_offset))
-                    .child(panel),
+                    .child(self.command_palette_enter(panel, cx)),
             )
             .into_any()
     }

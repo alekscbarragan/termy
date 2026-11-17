@@ -4,17 +4,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::protocol::TerminalQueryColors;
-use crate::runtime::{
-    TerminalCursorStyle, TerminalRuntimeConfig, WindowsShell as RuntimeWindowsShell,
-    WorkingDirFallback as RuntimeWorkingDirFallback,
-};
-use crate::{TerminalColor, TermyColor};
-use termy_config_core::{
+use crate::config_core::{
     AppConfig, ConfigDiagnostic, CursorStyle, SHELL_DECIDE_THEME_ID, SystemAppearance,
-    WindowsShell, WorkingDirFallback, resolve_active_theme,
+    resolve_active_theme,
 };
-use termy_themes::{ThemeColors, normalize_theme_id, parse_theme_colors_json};
+use crate::protocol::TerminalQueryColors;
+use crate::runtime::{TerminalCursorStyle, TerminalRuntimeConfig};
+use crate::themes::ThemeColors;
+use crate::{TerminalColor, TermyColor};
 
 #[derive(Debug, Clone)]
 pub struct LoadedTermyConfig {
@@ -58,7 +55,7 @@ impl Error for TermyConfigError {
 }
 
 pub fn load_config_from_default_path() -> Result<LoadedTermyConfig, TermyConfigError> {
-    let Some(path) = termy_config_core::config_path() else {
+    let Some(path) = crate::config_core::config_path() else {
         return Ok(default_loaded_config(None));
     };
 
@@ -113,24 +110,15 @@ pub fn runtime_config_from_app_config_with_query_colors(
     config: &AppConfig,
     query_colors: TerminalQueryColors,
 ) -> TerminalRuntimeConfig {
-    let working_dir_fallback = match config.working_dir_fallback {
-        WorkingDirFallback::Home => RuntimeWorkingDirFallback::Home,
-        WorkingDirFallback::Process => RuntimeWorkingDirFallback::Process,
-    };
-
     TerminalRuntimeConfig {
         shell: config.shell.clone(),
-        windows_shell: match config.windows_shell {
-            WindowsShell::Cmd => RuntimeWindowsShell::Cmd,
-            WindowsShell::PowerShell => RuntimeWindowsShell::PowerShell,
-            WindowsShell::PowerShellCore => RuntimeWindowsShell::PowerShellCore,
-            WindowsShell::GitBash => RuntimeWindowsShell::GitBash,
-        },
+        windows_shell: config.windows_shell,
         term: config.term.clone(),
         colorterm: config.colorterm.clone(),
+        term_program: config.term_program,
         environment: Default::default(),
         query_colors,
-        working_dir_fallback,
+        working_dir_fallback: config.working_dir_fallback,
         scrollback_history: config.scrollback_history,
         default_cursor_style: match config.cursor_style {
             CursorStyle::Line => TerminalCursorStyle::Line,
@@ -185,12 +173,12 @@ pub fn resolve_theme_colors_from_app_config(
         terminal_default_theme_colors()
     } else {
         load_installed_theme_colors(&active_theme, config_path)
-            .or_else(|| builtin_theme_colors(&active_theme))
+            .or_else(|| crate::themes::builtin_theme(&active_theme))
             .unwrap_or_else(|| match (config.theme_mode, system_appearance) {
-                (termy_config_core::AppearanceMode::System, SystemAppearance::Light) => {
-                    termy_themes::termy_light()
+                (crate::config_core::AppearanceMode::System, SystemAppearance::Light) => {
+                    crate::themes::termy_light()
                 }
-                _ => termy_themes::termy(),
+                _ => crate::themes::termy(),
             })
     };
     apply_custom_colors(&mut colors, &config.colors);
@@ -216,49 +204,17 @@ pub fn terminal_query_colors_from_resolved_theme(
 }
 
 fn load_installed_theme_colors(theme_id: &str, config_path: Option<&Path>) -> Option<ThemeColors> {
-    let normalized = normalize_theme_id(theme_id);
-    if normalized.is_empty() {
-        return None;
-    }
-
     let owned_config_path;
     let config_path = if let Some(path) = config_path {
         path
     } else {
-        owned_config_path = termy_config_core::config_path()?;
+        owned_config_path = crate::config_core::config_path()?;
         owned_config_path.as_path()
     };
-    let theme_path = config_path
-        .parent()?
-        .join("themes")
-        .join(format!("{normalized}.json"));
-    let contents = std::fs::read_to_string(theme_path).ok()?;
-    parse_theme_colors_json(&contents).ok()
+    crate::themes::load_local_theme(&config_path.parent()?.join("themes"), theme_id)
 }
 
-fn builtin_theme_colors(theme_id: &str) -> Option<ThemeColors> {
-    match normalize_theme_id(theme_id).as_str() {
-        "termy" => Some(termy_themes::termy()),
-        "termy-light" | "termylight" => Some(termy_themes::termy_light()),
-        "tokyo-night" | "tokyonight" => Some(termy_themes::tokyo_night()),
-        "catppuccin-mocha" | "catppuccin" | "catppuccinmocha" => {
-            Some(termy_themes::catppuccin_mocha())
-        }
-        "dracula" => Some(termy_themes::dracula()),
-        "gruvbox-dark" | "gruvbox" | "gruvboxdark" => Some(termy_themes::gruvbox_dark()),
-        "nord" => Some(termy_themes::nord()),
-        "solarized-dark" | "solarized" | "solarizeddark" => Some(termy_themes::solarized_dark()),
-        "one-dark" | "one" | "onedark" => Some(termy_themes::one_dark()),
-        "monokai" => Some(termy_themes::monokai()),
-        "material-dark" | "material" | "materialdark" => Some(termy_themes::material_dark()),
-        "palenight" => Some(termy_themes::palenight()),
-        "tomorrow-night" | "tomorrow" | "tomorrownight" => Some(termy_themes::tomorrow_night()),
-        "oceanic-next" | "oceanic" | "oceanicnext" => Some(termy_themes::oceanic_next()),
-        _ => termy_themes::resolve_theme(theme_id),
-    }
-}
-
-fn apply_custom_colors(colors: &mut ThemeColors, custom: &termy_config_core::CustomColors) {
+fn apply_custom_colors(colors: &mut ThemeColors, custom: &crate::config_core::CustomColors) {
     if let Some(color) = custom.foreground {
         colors.foreground = theme_rgb_from_config_rgb(color);
     }
@@ -285,15 +241,15 @@ fn terminal_default_theme_colors() -> ThemeColors {
     }
 }
 
-fn theme_rgb_from_terminal_color(color: TerminalColor) -> termy_themes::Rgb8 {
-    termy_themes::Rgb8::new(color.r, color.g, color.b)
+fn theme_rgb_from_terminal_color(color: TerminalColor) -> crate::themes::Rgb8 {
+    crate::themes::Rgb8::new(color.r, color.g, color.b)
 }
 
-fn theme_rgb_from_config_rgb(color: termy_config_core::Rgb8) -> termy_themes::Rgb8 {
-    termy_themes::Rgb8::new(color.r, color.g, color.b)
+fn theme_rgb_from_config_rgb(color: crate::config_core::Rgb8) -> crate::themes::Rgb8 {
+    crate::themes::Rgb8::new(color.r, color.g, color.b)
 }
 
-fn term_color_from_rgb(color: termy_themes::Rgb8) -> TermyColor {
+fn term_color_from_rgb(color: crate::themes::Rgb8) -> TermyColor {
     TermyColor {
         r: color.r,
         g: color.g,
@@ -318,16 +274,20 @@ mod tests {
     #[test]
     fn parses_runtime_fields_from_contents() {
         let loaded = load_config_from_contents(
-            "theme = nord\nshell = /bin/zsh\nterm = screen-256color\ncolorterm = none\nscrollback = 42\ncursor_style = line\n",
+            "theme = termy-light\nshell = /bin/zsh\nterm = screen-256color\ncolorterm = none\nterm_program = termy\nscrollback = 42\ncursor_style = line\n",
         );
 
         assert_eq!(loaded.runtime_config.shell.as_deref(), Some("/bin/zsh"));
         assert_eq!(loaded.runtime_config.term, "screen-256color");
         assert_eq!(loaded.runtime_config.colorterm, None);
+        assert_eq!(
+            loaded.runtime_config.term_program,
+            crate::TermProgram::Termy
+        );
         assert_eq!(loaded.runtime_config.scrollback_history, 42);
-        assert_eq!(loaded.runtime_config.query_colors.background.r, 0x2e);
-        assert_eq!(loaded.runtime_config.query_colors.background.g, 0x34);
-        assert_eq!(loaded.runtime_config.query_colors.background.b, 0x40);
+        assert_eq!(loaded.runtime_config.query_colors.background.r, 0xfa);
+        assert_eq!(loaded.runtime_config.query_colors.background.g, 0xfa);
+        assert_eq!(loaded.runtime_config.query_colors.background.b, 0xf9);
         assert_eq!(
             loaded.runtime_config.default_cursor_style,
             TerminalCursorStyle::Line
@@ -374,11 +334,45 @@ mod tests {
     }
 
     #[test]
+    fn builtin_themes_resolve_offline_and_local_theme_files_override_them() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.txt");
+        let config = AppConfig {
+            theme_mode: crate::config_core::AppearanceMode::Manual,
+            theme: "dracula".to_string(),
+            ..AppConfig::default()
+        };
+        let dracula = crate::themes::builtin_theme("dracula").expect("built-in dracula");
+
+        let colors = resolve_theme_colors_from_app_config(
+            &config,
+            Some(&config_path),
+            SystemAppearance::Dark,
+        );
+        assert_eq!(colors.background, term_color_from_rgb(dracula.background));
+
+        let themes_dir = tempdir.path().join("themes");
+        fs::create_dir_all(&themes_dir).expect("themes dir");
+        let custom = crate::themes::nord();
+        fs::write(
+            themes_dir.join("dracula.json"),
+            crate::themes::theme_colors_json_pretty(&custom, None).expect("json"),
+        )
+        .expect("write theme");
+        let colors = resolve_theme_colors_from_app_config(
+            &config,
+            Some(&config_path),
+            SystemAppearance::Dark,
+        );
+        assert_eq!(colors.background, term_color_from_rgb(custom.background));
+    }
+
+    #[test]
     fn missing_system_light_theme_uses_light_builtin_fallback() {
         let tempdir = tempdir().expect("tempdir");
         let config_path = tempdir.path().join("config.txt");
         let config = AppConfig {
-            theme_mode: termy_config_core::AppearanceMode::System,
+            theme_mode: crate::config_core::AppearanceMode::System,
             theme_light: "missing-light-theme".to_string(),
             ..AppConfig::default()
         };

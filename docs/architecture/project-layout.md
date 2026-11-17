@@ -1,58 +1,127 @@
 # Project Layout
 
-Termy is a single repository with several product surfaces. Keep changes in the smallest owner that can express the behavior.
+The Rust workspace contains the desktop app, CLI, core, WASM adapter, Node PTY
+addon, engine C library, and relay. Keep shared behavior in core and boundary
+adapters in their owning packages; add modules instead of a crate for each helper.
 
-## Main Areas
+## Desktop: `crates/desktop_app` (`termy`)
 
-- `crates/desktop_app/` owns the desktop app shell: GPUI windows, app chrome, settings, onboarding, menus, and app-only interaction behavior.
-- `crates/desktop_app/src/terminal_view/` owns the GPUI terminal experience: rendering, tabs, panes, command palette, search UI, mouse/input handling, and app runtime coordination.
-- `crates/core/` owns the reusable headless libtermy runtime/API used by embedders. It must stay independent of GPUI and app UI code.
-- `crates/tmon/` owns the experimental renderer-neutral terminal engine and native PTY/ConPTY runtime.
-- `crates/plugin_runtime/` owns plugin discovery, descriptor/action validation, and the on-demand Bun host with one Worker per plugin. It must stay independent of GPUI and desktop command execution.
-- `crates/terminal_ui/` owns the GPUI terminal grid and keystroke adapters plus tmux pane display/client support used by the desktop app. Shared headless terminal types are imported directly from `termy_core`.
-- `crates/tmux_control_core/` owns the UI-agnostic tmux control-mode protocol and transport shared by terminal UI and FFI.
-- `crates/ui/` owns Termy's design system in GPUI: theme-derived color tokens, layout metrics, and stateless chrome components. It must stay free of config, command, plugin, and SSH domain crates.
-- `crates/config_core/`, `crates/command_core/`, `crates/theme_core/`, `crates/search/`, and `crates/herdr_core/` own pure domain logic shared by product surfaces.
-- `crates/ssh_core/` owns saved SSH host validation, non-secret persistence, exact OpenSSH arguments, and system-keychain credential lifecycle.
-- `crates/ffi/` exposes libtermy to C-compatible hosts.
-- `website/` owns the public website and user-facing docs.
-- `docs/` owns contributor and architecture docs inside the repo.
-- `scripts/` owns packaging, platform, and release support.
-- `assets/` owns app icons, shell completions, UI icons, and media.
-- `tools/` owns standalone benchmark and development packages outside the main Cargo workspace.
-- `skills/` owns agent-facing workflows that must stay aligned with Termy's public contracts.
+- `src/terminal_view/`: windows, tabs, panes, terminal interaction and persistence.
+- `src/settings_view/`, `src/onboarding/`, and `src/ui/`: application workflows and presentation.
+- `src/terminal_ui/`: GPUI terminal grid, pixel snapping, input adapters, and tmux pane display.
+- `src/design_system/`: stateless GPUI controls, tokens, metrics, and icons.
+- `src/native_sdk/`: platform clipboard, permissions, and file-manager integration.
+- `src/auto_update/`: update checks and installation coordinated with GPUI.
 
-## Workspace Crates
+The library target exposes presentation helpers to the desktop binary, examples,
+and integration tests. It is part of the same package. `text_input/` owns shared
+Unicode editing and IME state; inline overlays retain their own geometry adapter.
+`commands.rs` owns the visibility policy shared by menus and the command palette.
 
-- `termy` (`crates/desktop_app/`) is the product app and the only crate that should own complete user-facing desktop workflows.
-- `termy_core` (`crates/core/`) is the headless runtime/API for embedders.
-- `tmon` (`crates/tmon/`) is the experimental standalone terminal engine.
-- `termy_plugin_runtime` (`crates/plugin_runtime/`) is the GPUI-free TypeScript plugin runtime consumed by the desktop app.
-- `termy_terminal_ui` (`crates/terminal_ui/`) is the GPUI-facing terminal adapter used by the desktop app.
-- `termy_tmux_control_core` (`crates/tmux_control_core/`) is the shared headless tmux control-mode layer.
-- `termy_ui` (`crates/ui/`) is the GPUI design system: tokens, metrics, and chrome components shared by settings-style surfaces.
-- `termy_command_core`, `termy_config_core`, `termy_theme_core`, `termy_search`, `termy_ssh_core`, `termy_herdr_core`, and `termy_themes` are pure domain crates.
-- `termy_ffi` and `termy_native_sdk` are embedding/native-integration surfaces.
-- `termy_cli`, `termy_cli_install_core`, `termy_release_core`, and `termy_auto_update` own command-line, install, release, and update support.
-- Desktop update presentation and toast state live under `crates/desktop_app/src/ui/` because they have no non-desktop consumers.
-- `xtask` owns repository automation such as generated docs.
+## Core: `crates/core` (`termy_core`)
 
-Each crate should have a local `README.md` with `Owner`, `Validation`, and `Forbidden Dependencies` sections.
-The `crates/README.md` file is the workspace crate index.
+Core is headless and shared by desktop and CLI. Its existing terminal API remains
+at the library root. Supporting modules are grouped by responsibility:
 
-## Boundary Rules
+- `multiplexer/`: persistent session host, authenticated IPC, clients, and layout operations.
+- `session_model/`: saved windows, workspaces, tabs, panes, and split geometry.
+- `terminal_engine/`: engine state, parser, grid, mode-to-input conversion, and native PTY/ConPTY transport.
+- `pty.rs`: raw PTY process API for hosts that supply their own terminal engine.
+- `launch_policy.rs`: shared launch choices and history bounds, reexported by config and runtime.
+- `paste.rs`: engine-independent paste filtering, newline conversion, and bracket framing.
+- `tmux_control_core/`: tmux control-mode protocol and transport.
+- `config_core/`, `command_core/`, `theme_core/`, `themes/`, and `search_engine/`: shared configuration, commands, themes, and search.
+- `plugin_runtime/` and `ssh_core/`: plugin execution and SSH host management.
+- `cli_install_core/` and `release_core/`: installation and release helpers.
+- `ffi/`: C ABI, with its public header at `include/termy.h`.
 
-- Keep `termy_core` headless. Do not add GPUI, app chrome, command palette, or desktop-window concerns there.
-- Keep `termy_plugin_runtime` headless. It may return typed plugin commands and actions, but the desktop app owns their presentation and execution.
-- Keep pure domain crates free of GPUI and app-specific presentation code.
-- Keep `termy_ffi` aligned with the reusable core contract rather than copying desktop app behavior.
-- Put user-visible app behavior in `crates/desktop_app/`; extract to sibling crates only when the behavior is shared by multiple surfaces or needs isolated tests.
-- Update repo docs and public website docs together when a public behavior or embedding contract changes.
-- Keep release packaging rooted in `scripts/` and documented in [Release Packaging](release-packaging.md). Do not add parallel packaging entrypoints unless they become the documented source of truth.
-- Keep root-level directory indexes (`crates/README.md`, `docs/README.md`, `scripts/README.md`, `skills/README.md`, and `tools/README.md`) aligned with ownership changes.
+The default `native` feature carries the PTY runtime, config files, plugins,
+multiplexer, SSH and the C ABI. `--no-default-features` builds only the headless
+engine (parser, grid, input encoding, kitty protocols, glyph geometry, themes),
+which is what `crates/wasm` compiles for `wasm32-unknown-unknown`.
 
-## Validation
+`termy-session-host` remains a standalone binary target inside this package.
+The shared library artifact is `libtermy_core` (`termy_core.dll` on Windows);
+C exports and header contracts are unchanged.
 
-Use `just check-boundaries` after changing crate dependencies, crate README metadata, generated docs, dependency policy, command/keybind behavior, or config behavior. Use `cargo check --workspace` after moving modules or changing cross-crate contracts.
+## Herdr: `crates/herdr_core` (`termy_herdr_core`)
 
-For release planning and codebase quality gates, see [ROADMAP.md](../../ROADMAP.md) and [docs/engineering/](../engineering/).
+Herdr identities, lifecycle vocabulary, exact commands, trusted executable
+vetting, the private transport seam, the catalog mirror, and controller policy.
+It is pure domain logic: only `uuid` (and `tempfile` for tests), with no GPUI,
+desktop, or `termy_core` dependency. The desktop app owns Herdr UI and state.
+
+## CLI: `crates/cli` (`termy_cli`)
+
+- `src/commands/`: terminal launch, plugin and config commands, JSON multiplexer controls.
+- `src/xtask/`: repository automation, generated documentation, dependency checks, and performance tooling.
+
+The default binary is `termy-cli`. Run repository tooling with
+`cargo run -p termy_cli --bin xtask -- <command>`.
+
+## Web: `crates/wasm` (`termy_wasm`) and `packages/`
+
+`crates/wasm` is the wasm-bindgen surface over the engine-only `termy_core`.
+`packages/` is a Bun workspace of npm packages built with tsdown:
+`@termysh/core` (wasm + headless API), `@termysh/web` (browser terminal) and
+`@termysh/xterm` (xterm.js-compatible adapter). See `packages/README.md`.
+They are published manually by `.github/workflows/npm-publish.yml`, separate
+from desktop releases.
+
+## Engine C library: `crates/engine_ffi` (`termy_engine_ffi`)
+
+`crates/engine_ffi` builds `libtermy_engine` (static, shared and rlib), a C ABI
+over the engine-only `termy_core` for hosts that own their transport and
+renderer, such as clients mirroring a remote multiplexer. Its header is
+`crates/engine_ffi/include/termy_engine.h`; it covers full-state snapshots,
+a replica mode that never answers queries, cells with grapheme clusters, mode
+queries, input encoders and text extraction. `scripts/package-libtermy-engine.sh`
+packages it per target (musl Linux, macOS, plus an xcframework on macOS).
+
+`crates/pty` (`termy_pty`) is the Node-API addon behind `@termysh/pty`, a
+node-pty replacement. It wraps `termy_core::pty` (the `pty` feature: the native
+PTY process layer with no other dependencies). Prebuilt binaries ship as
+per-platform npm packages; see `packages/pty/README.md`.
+
+## iPhone app and relay: `ios/`, `remote/`, `crates/relay` (`termy_relay`)
+
+`ios/` is the Termy iPhone app (SwiftUI, `xcodegen generate` makes
+`Termy.xcodeproj`). Pair it from **Termy Next → Settings → Mobile** by scanning
+a short-lived QR code and approving the phone on the Mac. Accounts and the
+`termy remote` CLI are no longer part of this flow.
+
+`next/Sources/TermyNextCore/NextPaths.swift` resolves Next's isolated support and
+configuration directories for the session host, plugins, and app configuration.
+
+`remote/` is TermyRemoteKit: device identity, QR pairing, encryption, messages,
+and relay transport. `next/Sources/TermyRemoteHost` is an importable host
+library over the session host, independent of Next's UI. Next owns its lifetime
+and exposes only its own sessions. It stops on app quit or when Mobile is off.
+
+`crates/relay` authenticates devices, stores explicit phone–Mac links in
+Postgres, and routes sealed packets. The default is `https://relay.termy.sh`
+on Unkey; `crates/relay/deploy` supplies a Docker Compose VPS stack. The relay
+URL is configured in Next and carried to iPhone by the QR. See
+`crates/relay/README.md` and `remote/README.md`.
+
+## Repository support
+
+`docs/` contains contributor documentation; `website/` contains public docs.
+`assets/` holds application assets; `assets/schemas/theme.schema.json` defines the theme JSON schema. `scripts/` owns packaging and platform checks.
+Benchmark examples live in `crates/cli/examples/`.
+
+## Boundaries and validation
+
+Core and CLI must remain free of GPUI and desktop dependencies. The terminal
+engine and command catalog remain independent modules; design-system components
+must not reach into application state. `scripts/check-boundaries.sh` checks these
+rules along with packaging, generated docs, and dependency policy.
+
+```sh
+cargo check --workspace --all-targets
+cargo test --workspace
+just check-boundaries
+```
+
+See [Release Packaging](release-packaging.md) and
+[Testing](../engineering/testing.md) for platform-specific validation.

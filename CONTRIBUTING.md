@@ -24,7 +24,7 @@ See [Project Layout](docs/architecture/project-layout.md) for ownership boundari
 
 ## Local setup
 
-Requirements:
+Requirements on every platform:
 
 - Rust stable toolchain
 - Platform build dependencies for GPUI and native packaging where relevant
@@ -40,6 +40,17 @@ Clone and verify the workspace:
 ```sh
 cargo check --workspace
 ```
+
+### Windows prerequisites
+
+- [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) (2022 or newer) with the **Desktop development with C++** workload: the MSVC toolset and a Windows 10/11 SDK. Release builds compile GPUI's shaders with the SDK's `fxc.exe`. Add the **MSVC ARM64 build tools** component, plus [LLVM](https://github.com/llvm/llvm-project/releases) (`clang` on `PATH`, needed by `ring`), to build for `aarch64-pc-windows-msvc`.
+- Rust through [rustup](https://rustup.rs) with the MSVC host toolchain (`stable-x86_64-pc-windows-msvc`, or `stable-aarch64-pc-windows-msvc` on ARM64). Releases and the installer are built with MSVC only.
+- [Git for Windows](https://gitforwindows.org). Run `just` and the `scripts/*.sh` scripts from **Git Bash**: on Windows the justfile runs recipes with `sh`, which Git Bash provides, and a bare `bash` elsewhere can resolve to the WSL launcher in `System32`.
+- [`just`](https://github.com/casey/just) (`winget install Casey.Just`, `scoop install just`, or `cargo install just`).
+- [Bun](https://bun.sh) if you run the plugin runtime tests (`cargo test -p termy_core`).
+- [Inno Setup 6](https://jrsoftware.org/isinfo.php) only to package the installer (`just build-setup`, see [Release Packaging](docs/architecture/release-packaging.md)).
+
+See [docs/development.md](docs/development.md#windows) for Windows-specific notes.
 
 ## Common commands
 
@@ -88,7 +99,7 @@ Common options:
 
 ```sh
 cargo check -p termy
-cargo test -p termy_config_core
+cargo test -p termy_core
 just test-workspace          # all workspace tests (release)
 just check-boundaries
 just validate                # check + fmt + tests + boundaries + clippy (before large PRs)
@@ -102,20 +113,19 @@ just test-tmux-integration
 
 Roadmaps:
 
-- Product + milestones: [ROADMAP.md](ROADMAP.md)
 - Engineering quality (CI, modularity, scorecard): [docs/engineering/roadmap.md](docs/engineering/roadmap.md)
 
 ## Config and command changes
 
 If you change config keys:
 
-- update the config schema in `crates/config_core`
+- update the config schema in `crates/core/src/config_core`
 - keep parsing, defaults, and rendering in sync
 - regenerate config docs
 
 If you change commands or keybind-facing actions:
 
-- update the command catalog in `crates/command_core`
+- update the command catalog in `crates/core/src/command_core`
 - wire the action through the app in `crates/desktop_app/src/`
 - regenerate keybinding docs if defaults or public command names changed
 

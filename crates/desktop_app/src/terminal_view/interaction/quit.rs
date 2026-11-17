@@ -1,5 +1,5 @@
 use super::*;
-use gpui::PromptLevel;
+use gpui_kit::PromptLevel;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CloseRequestTarget {
@@ -71,13 +71,6 @@ impl TerminalView {
             target,
             CloseRequestTarget::Application | CloseRequestTarget::WindowClose
         ) && warn_on_quit
-    }
-
-    fn should_force_close_when_prompt_in_flight(target: CloseRequestTarget) -> bool {
-        matches!(
-            target,
-            CloseRequestTarget::Application | CloseRequestTarget::WindowClose
-        )
     }
 
     fn tab_close_request_target(tab_count: usize, tab_id: TabId) -> CloseRequestTarget {
@@ -176,20 +169,30 @@ impl TerminalView {
         }
     }
 
+    fn busy_tab_titles_in_window(&self) -> Vec<String> {
+        let fallback_title = self.fallback_title();
+        let mut titles = self
+            .session
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| Self::tab_is_busy(tab))
+            .map(|(index, tab)| self.tab_title_for_warning(index, tab, fallback_title))
+            .collect::<Vec<_>>();
+        titles.extend(self.stashed_busy_workspace_tab_titles());
+        titles
+    }
+
     fn busy_tab_titles_for_close_target(&self, target: CloseRequestTarget) -> Vec<String> {
         let fallback_title = self.fallback_title();
         match target {
             CloseRequestTarget::Application | CloseRequestTarget::WindowClose => {
-                let mut titles = self
-                    .session
-                    .tabs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, tab)| Self::tab_is_busy(tab))
-                    .map(|(index, tab)| self.tab_title_for_warning(index, tab, fallback_title))
-                    .collect::<Vec<_>>();
-                titles.extend(self.stashed_busy_workspace_tab_titles());
-                titles
+                // Quitting or closing the last window leaves the terminals
+                // running in the session host; the next start restores them.
+                if self.multiplexer.is_some() {
+                    return Vec::new();
+                }
+                self.busy_tab_titles_in_window()
             }
             CloseRequestTarget::TabClose { tab_id } => self
                 .session
@@ -197,8 +200,9 @@ impl TerminalView {
                 .iter()
                 .enumerate()
                 .find(|(_, tab)| tab.id == tab_id && Self::tab_is_busy(tab))
-                .map(|(index, tab)| vec![self.tab_title_for_warning(index, tab, fallback_title)])
-                .unwrap_or_default(),
+                .map_or_default(|(index, tab)| {
+                    vec![self.tab_title_for_warning(index, tab, fallback_title)]
+                }),
             CloseRequestTarget::WorkspaceDelete { workspace_id } => {
                 let Some(workspace_index) = self
                     .session
@@ -224,7 +228,8 @@ impl TerminalView {
 
     fn close_warning_title(target: CloseRequestTarget) -> &'static str {
         match target {
-            CloseRequestTarget::Application | CloseRequestTarget::WindowClose => "Quit Termy?",
+            CloseRequestTarget::Application => "Quit Termy?",
+            CloseRequestTarget::WindowClose => "Close Window?",
             CloseRequestTarget::TabClose { .. } => "Close Tab?",
             CloseRequestTarget::WorkspaceDelete { .. } => "Delete Workspace?",
         }
@@ -232,9 +237,8 @@ impl TerminalView {
 
     fn close_warning_buttons(target: CloseRequestTarget) -> &'static [&'static str] {
         match target {
-            CloseRequestTarget::Application | CloseRequestTarget::WindowClose => {
-                &["Quit", "Cancel"]
-            }
+            CloseRequestTarget::Application => &["Quit", "Cancel"],
+            CloseRequestTarget::WindowClose => &["Close Window", "Cancel"],
             CloseRequestTarget::TabClose { .. } => &["Close Tab", "Cancel"],
             CloseRequestTarget::WorkspaceDelete { .. } => &["Delete Workspace", "Cancel"],
         }
@@ -242,7 +246,8 @@ impl TerminalView {
 
     fn close_warning_final_prompt(target: CloseRequestTarget) -> &'static str {
         match target {
-            CloseRequestTarget::Application | CloseRequestTarget::WindowClose => "Quit anyway?",
+            CloseRequestTarget::Application => "Quit anyway?",
+            CloseRequestTarget::WindowClose => "Close this window anyway?",
             CloseRequestTarget::TabClose { .. } => "Close it anyway?",
             CloseRequestTarget::WorkspaceDelete { .. } => "Delete this workspace anyway?",
         }
@@ -286,6 +291,45 @@ impl TerminalView {
         Some(detail)
     }
 
+    /// Closing a multiplexer window while other windows stay open detaches
+    /// its terminals: they keep running out of sight. When the close warning
+    /// settings ask for a prompt, it offers to end them instead.
+    fn multiplexer_close_choice_applies(&self, target: CloseRequestTarget, cx: &App) -> bool {
+        target == CloseRequestTarget::WindowClose
+            && self.multiplexer.is_some()
+            && cx
+                .windows()
+                .into_iter()
+                .any(|handle| handle != self.window_handle && handle.downcast::<Self>().is_some())
+    }
+
+    fn detach_warning_buttons(process_count: usize) -> [String; 3] {
+        [
+            "Detach".to_string(),
+            format!(
+                "Terminate {process_count} Process{}",
+                if process_count == 1 { "" } else { "es" }
+            ),
+            "Cancel".to_string(),
+        ]
+    }
+
+    fn detach_warning_detail(busy_titles: &[String], process_count: usize) -> String {
+        let mut detail = Self::close_warning_detail(CloseRequestTarget::WindowClose, busy_titles)
+            .map_or_default(|detail| {
+                // Replace the "anyway?" question with the choice below.
+                let list_end = detail.rfind("\n\n").unwrap_or(detail.len());
+                format!("{}\n\n", &detail[..list_end])
+            });
+        detail.push_str(&format!(
+            "Detach keeps this window's {process_count} process{} running in the background; \
+             run Reopen Detached Window to bring the window back. Terminate ends {}.",
+            if process_count == 1 { "" } else { "es" },
+            if process_count == 1 { "it" } else { "them" },
+        ));
+        detail
+    }
+
     fn close_tab_by_id(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
         if let Some(index) = self.tab_index_by_id(tab_id) {
             self.close_tab(index, cx);
@@ -300,11 +344,21 @@ impl TerminalView {
         match target {
             CloseRequestTarget::Application => {
                 self.sync_persisted_native_workspace();
+                for handle in cx.windows() {
+                    if handle != self.window_handle
+                        && let Some(handle) = handle.downcast::<Self>()
+                    {
+                        let _ = handle.update(cx, |view, _, _| {
+                            view.sync_persisted_native_workspace();
+                        });
+                    }
+                }
                 self.allow_quit_without_prompt = true;
                 cx.quit();
                 false
             }
             CloseRequestTarget::WindowClose => {
+                self.prepare_multiplexer_detach();
                 self.sync_persisted_native_workspace();
                 true
             }
@@ -328,22 +382,7 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.quit_prompt_in_flight {
-            if Self::should_force_close_when_prompt_in_flight(target) {
-                // If the quit confirm prompt is unresponsive, allow a second
-                // close request to follow through.
-                match target {
-                    CloseRequestTarget::Application => {
-                        self.allow_quit_without_prompt = true;
-                        cx.quit();
-                    }
-                    CloseRequestTarget::WindowClose => {
-                        self.allow_quit_without_prompt = true;
-                        return true;
-                    }
-                    CloseRequestTarget::TabClose { .. }
-                    | CloseRequestTarget::WorkspaceDelete { .. } => {}
-                }
-            }
+            // A repeated close request must not bypass an unanswered confirmation.
             return false;
         }
 
@@ -351,7 +390,24 @@ impl TerminalView {
             return false;
         }
 
-        let busy_titles = self.busy_tab_titles_for_close_target(target);
+        let detach_choice = self.multiplexer_close_choice_applies(target, cx);
+        let mut busy_titles = if detach_choice {
+            self.busy_tab_titles_in_window()
+        } else {
+            self.busy_tab_titles_for_close_target(target)
+        };
+        if target == CloseRequestTarget::Application {
+            for handle in cx.windows() {
+                if handle != self.window_handle
+                    && let Some(handle) = handle.downcast::<Self>()
+                    && let Ok(titles) = handle.update(cx, |view, _, _| {
+                        view.busy_tab_titles_for_close_target(target)
+                    })
+                {
+                    busy_titles.extend(titles);
+                }
+            }
+        }
         if !Self::should_prompt_for_close_target(
             target,
             self.warn_on_quit,
@@ -362,19 +418,34 @@ impl TerminalView {
         }
 
         self.quit_prompt_in_flight = true;
-        let detail = Self::close_warning_detail(target, &busy_titles);
-        let prompt = window.prompt(
-            PromptLevel::Warning,
-            Self::close_warning_title(target),
-            detail.as_deref(),
-            Self::close_warning_buttons(target),
-            cx,
-        );
+        let prompt = if detach_choice {
+            let process_count = self.multiplexer_window_session_ids().len();
+            let buttons = Self::detach_warning_buttons(process_count);
+            window.prompt(
+                PromptLevel::Warning,
+                Self::close_warning_title(target),
+                Some(&Self::detach_warning_detail(&busy_titles, process_count)),
+                &buttons.each_ref().map(String::as_str),
+                cx,
+            )
+        } else {
+            let detail = Self::close_warning_detail(target, &busy_titles);
+            window.prompt(
+                PromptLevel::Warning,
+                Self::close_warning_title(target),
+                detail.as_deref(),
+                Self::close_warning_buttons(target),
+                cx,
+            )
+        };
         let window_handle = window.window_handle();
 
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let confirmed = matches!(prompt.await, Ok(0));
-            let _ = cx.update(|cx| {
+            let answer = prompt.await.ok();
+            // With the detach choice, 0 detaches and 1 terminates.
+            let terminate = detach_choice && answer == Some(1);
+            let confirmed = answer == Some(0) || terminate;
+            cx.update(|cx| {
                 let mut follow_through = false;
                 if this
                     .update(cx, |view, _| {
@@ -406,7 +477,12 @@ impl TerminalView {
                     }
                     CloseRequestTarget::WindowClose => {
                         let should_close = this
-                            .update(cx, |view, cx| view.follow_through_close_request(target, cx))
+                            .update(cx, |view, cx| {
+                                if terminate {
+                                    view.prepare_multiplexer_terminate();
+                                }
+                                view.follow_through_close_request(target, cx)
+                            })
                             .unwrap_or(false);
                         if should_close {
                             let _ = window_handle.update(cx, |_, window, _| window.remove_window());
@@ -442,7 +518,38 @@ impl TerminalView {
             return true;
         }
 
+        // Closing a native tab (its tab bar ✕) closes its window. With the
+        // multiplexer that would detach its terminals and bring the tab back
+        // on the next launch, so close it as a tab instead; `close_tab`
+        // removes the window. A window with no sibling tabs still detaches.
+        if let Some(tab_id) = self.native_tab_window_closing_as_tab(window) {
+            let target = CloseRequestTarget::TabClose { tab_id };
+            let _ = self.request_close(target, window, cx);
+            return false;
+        }
+
         self.request_close(CloseRequestTarget::WindowClose, window, cx)
+    }
+
+    /// The tab to close when this window closes as one native tab among
+    /// others, with the multiplexer keeping its terminals.
+    fn native_tab_window_closing_as_tab(&self, window: &Window) -> Option<TabId> {
+        if !self.native_window_tabs
+            || self.multiplexer.is_none()
+            || self.has_other_workspaces()
+            || self.session.tabs.len() != 1
+        {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        let has_sibling_tabs =
+            crate::macos_native_tabs::tab_position(window).is_some_and(|(_, count)| count > 1);
+        #[cfg(not(target_os = "macos"))]
+        let has_sibling_tabs = {
+            let _ = window;
+            false
+        };
+        has_sibling_tabs.then(|| self.session.tabs[0].id)
     }
 
     pub(in super::super) fn request_application_quit(
@@ -463,14 +570,14 @@ impl TerminalView {
         }
         let tab_id = self.session.tabs[self.session.active_tab].id;
         let target = Self::tab_close_request_target(self.effective_tab_count_for_close(), tab_id);
-        let _ = self.request_close(target, window, cx);
+        self.request_close_and_follow_through(target, window, cx);
     }
 
     /// Tab count used to pick a close target: stashed workspaces keep the
     /// window alive, so closing the visible strip's last tab is still a tab
     /// close (the workspace folds) rather than a window close.
     fn effective_tab_count_for_close(&self) -> usize {
-        if self.has_other_workspaces() {
+        if self.has_other_workspaces() || self.multiplexer.is_some() {
             self.session.tabs.len().saturating_add(1)
         } else {
             self.session.tabs.len()
@@ -488,7 +595,21 @@ impl TerminalView {
         }
         let tab_id = self.session.tabs[index].id;
         let target = Self::tab_close_request_target(self.effective_tab_count_for_close(), tab_id);
-        let _ = self.request_close(target, window, cx);
+        self.request_close_and_follow_through(target, window, cx);
+    }
+
+    /// Closing the last tab closes the window. `request_close` only answers
+    /// whether a window may close, so this removes it when the answer is yes
+    /// (a confirmation prompt removes it itself).
+    fn request_close_and_follow_through(
+        &mut self,
+        target: CloseRequestTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.request_close(target, window, cx) && target == CloseRequestTarget::WindowClose {
+            window.remove_window();
+        }
     }
 
     pub(in super::super) fn request_workspace_delete_by_id(
@@ -509,20 +630,46 @@ impl TerminalView {
 mod tests {
     use super::{CloseRequestTarget, TerminalView};
 
-    #[test]
-    fn prompt_in_flight_force_close_policy_allows_app_and_window_targets() {
-        assert!(TerminalView::should_force_close_when_prompt_in_flight(
-            CloseRequestTarget::Application
-        ));
-        assert!(TerminalView::should_force_close_when_prompt_in_flight(
-            CloseRequestTarget::WindowClose
-        ));
-        assert!(!TerminalView::should_force_close_when_prompt_in_flight(
-            CloseRequestTarget::TabClose { tab_id: 1 }
-        ));
-        assert!(!TerminalView::should_force_close_when_prompt_in_flight(
-            CloseRequestTarget::WorkspaceDelete { workspace_id: 1 }
-        ));
+    #[gpui_kit::test]
+    fn close_confirmation_handles_repeated_close_cancel_retry_and_confirm(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_prompt_builder(crate::linux_prompt::render_prompt));
+        let config = crate::config::AppConfig {
+            warn_on_quit: true,
+            tmux_enabled: false,
+            ..Default::default()
+        };
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TerminalView::new_for_window(window, cx, config, true);
+            // This test window must not overwrite the user's persisted session.
+            view.owns_persisted_session = false;
+            view
+        });
+        for _ in 0..2 {
+            view.update_in(cx, |view, window, cx| {
+                for target in [
+                    CloseRequestTarget::WindowClose,
+                    CloseRequestTarget::Application,
+                ] {
+                    assert!(!view.request_close(target, window, cx));
+                    assert!(view.quit_prompt_in_flight);
+                    assert!(!view.allow_quit_without_prompt);
+                }
+            });
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(!view.quit_prompt_in_flight);
+                assert!(!view.allow_quit_without_prompt);
+            });
+        }
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.request_close(CloseRequestTarget::WindowClose, window, cx));
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(cx.windows().is_empty());
     }
 
     #[test]
@@ -609,6 +756,41 @@ mod tests {
         assert_eq!(
             TerminalView::close_warning_final_prompt(target),
             "Delete this workspace anyway?"
+        );
+    }
+
+    #[test]
+    fn detach_warning_names_both_choices_and_the_busy_tabs() {
+        assert_eq!(
+            TerminalView::detach_warning_buttons(1),
+            ["Detach", "Terminate 1 Process", "Cancel"]
+        );
+        assert_eq!(
+            TerminalView::detach_warning_buttons(3)[1],
+            "Terminate 3 Processes"
+        );
+        let detail = TerminalView::detach_warning_detail(&["build".into()], 3);
+        assert!(detail.contains("- build\n"), "{detail}");
+        assert!(!detail.contains("anyway?"), "{detail}");
+        assert!(detail.contains("Reopen Detached Window"), "{detail}");
+        let idle = TerminalView::detach_warning_detail(&[], 1);
+        assert!(
+            idle.starts_with("Detach keeps this window's 1 process"),
+            "{idle}"
+        );
+    }
+
+    #[test]
+    fn window_close_warning_describes_only_the_current_window() {
+        let target = CloseRequestTarget::WindowClose;
+        assert_eq!(TerminalView::close_warning_title(target), "Close Window?");
+        assert_eq!(
+            TerminalView::close_warning_buttons(target),
+            &["Close Window", "Cancel"]
+        );
+        assert_eq!(
+            TerminalView::close_warning_final_prompt(target),
+            "Close this window anyway?"
         );
     }
 }

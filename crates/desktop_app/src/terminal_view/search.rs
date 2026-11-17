@@ -1,5 +1,7 @@
 use super::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use std::ops::Range;
+use termy_core::search_engine::SearchLineMapping;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SearchKeyAction {
@@ -11,19 +13,81 @@ enum SearchKeyAction {
 fn search_key_action(key: &str, shift_pressed: bool) -> Option<SearchKeyAction> {
     match key {
         "escape" => Some(SearchKeyAction::Close),
+        "up" => Some(SearchKeyAction::Next),
+        "down" => Some(SearchKeyAction::Previous),
         "enter" if shift_pressed => Some(SearchKeyAction::Previous),
         "enter" => Some(SearchKeyAction::Next),
         _ => None,
     }
 }
 
-fn search_counter_label(current: usize, total: usize, query_is_empty: bool) -> Option<String> {
-    if total > 0 {
-        Some(format!("{current}/{total}"))
-    } else if query_is_empty {
-        None
+fn search_counter_label(
+    current: usize,
+    total: usize,
+    query_is_empty: bool,
+    invalid_pattern: bool,
+    scan_incomplete: bool,
+) -> Option<String> {
+    if query_is_empty {
+        return None;
+    }
+    if invalid_pattern {
+        return Some("Invalid pattern".to_string());
+    }
+    if total == 0 {
+        return Some(if scan_incomplete {
+            "Searching…".to_string()
+        } else {
+            "No matches".to_string()
+        });
+    }
+    if scan_incomplete {
+        Some(format!("{current} of {total}+"))
     } else {
-        Some("0/0".to_string())
+        Some(format!("{current} of {total}"))
+    }
+}
+
+fn visible_search_line_range(display_offset: usize, rows: u16) -> (i32, i32) {
+    let first = -(i32::try_from(display_offset).unwrap_or(i32::MAX));
+    let last = first.saturating_add(i32::from(rows.max(1)).saturating_sub(1));
+    (first, last)
+}
+
+/// Edits that GPUI shortcuts make to the search query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SearchEditCommand {
+    Copy,
+    Cut,
+    Undo,
+    Redo,
+    Paste,
+    SelectAll,
+    DeleteBackward,
+    DeleteForward,
+    MoveLeft,
+    MoveRight,
+    SelectLeft,
+    SelectRight,
+    MoveToStart,
+    MoveToEnd,
+    DeleteWordBackward,
+    DeleteWordForward,
+    DeleteToStart,
+    DeleteToEnd,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchScanKind {
+    Viewport,
+    Full,
+}
+
+fn search_line_span(first: i32, last: i32) -> i32 {
+    if first > last {
+        0
+    } else {
+        last.saturating_sub(first).saturating_add(1)
     }
 }
 
@@ -66,23 +130,37 @@ impl TerminalView {
                 true
             }
             CommandAction::SearchNext => {
-                self.search_next(cx);
+                if self.search_open {
+                    self.search_next(cx);
+                } else {
+                    self.open_search(cx);
+                }
                 true
             }
             CommandAction::SearchPrevious => {
-                self.search_previous(cx);
+                if self.search_open {
+                    self.search_previous(cx);
+                } else {
+                    self.open_search(cx);
+                }
                 true
             }
             CommandAction::ToggleSearchCaseSensitive => {
                 self.search_state.toggle_case_sensitive();
-                self.perform_search();
-                cx.notify();
+                if self.search_open {
+                    self.perform_search();
+                    self.scroll_to_current_match(cx);
+                }
+                self.notify_search_ui(cx);
                 true
             }
             CommandAction::ToggleSearchRegex => {
                 self.search_state.toggle_regex_mode();
-                self.perform_search();
-                cx.notify();
+                if self.search_open {
+                    self.perform_search();
+                    self.scroll_to_current_match(cx);
+                }
+                self.notify_search_ui(cx);
                 true
             }
             _ => false,
@@ -90,14 +168,24 @@ impl TerminalView {
     }
 
     pub(super) fn open_search(&mut self, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            self.search_focus_request = self.search_focus_request.wrapping_add(1);
+        }
         let prefill = Self::search_prefill_from_selection(self.selected_text());
 
         if self.search_open {
             if let Some(prefill) = prefill {
                 self.search_input.set_text(prefill);
+                self.search_input.select_all();
                 self.perform_search();
+                self.scroll_to_current_match(cx);
                 self.reset_cursor_blink_phase();
-                cx.notify();
+                self.notify_search_ui(cx);
+            } else {
+                self.search_input.select_all();
+                self.reset_cursor_blink_phase();
+                self.notify_search_ui(cx);
             }
             return;
         }
@@ -120,12 +208,16 @@ impl TerminalView {
         if let Some(prefill) = prefill {
             self.search_input.set_text(prefill);
             self.perform_search();
+            self.scroll_to_current_match(cx);
+        } else if !self.search_input.text().is_empty() {
+            self.perform_search();
+            self.scroll_to_current_match(cx);
         } else {
-            self.search_input.clear();
             self.clear_terminal_scrollbar_marker_cache();
         }
+        self.search_input.select_all();
         self.reset_cursor_blink_phase();
-        cx.notify();
+        self.notify_search_ui(cx);
     }
 
     pub(super) fn close_search(&mut self, cx: &mut Context<Self>) {
@@ -134,10 +226,32 @@ impl TerminalView {
         }
 
         self.search_open = false;
-        self.search_state.close();
-        self.search_input.clear();
+        self.search_state.hide();
+        self.search_scan_incomplete = false;
+        self.search_options_open = false;
+        self.search_debounce_token = self.search_debounce_token.wrapping_add(1);
         self.clear_terminal_scrollbar_marker_cache();
+        self.notify_search_ui(cx);
+    }
+
+    pub(super) fn refresh_search_if_open(&mut self, cx: &mut Context<Self>) {
+        if !self.search_open {
+            return;
+        }
+        self.perform_search();
+        self.scroll_to_current_match(cx);
+        self.notify_search_ui(cx);
+    }
+
+    fn notify_search_ui(&mut self, cx: &mut Context<Self>) {
+        self.sync_native_search_bar();
+        self.notify_overlay(cx);
         cx.notify();
+    }
+
+    fn toggle_search_options(&mut self, cx: &mut Context<Self>) {
+        self.search_options_open = !self.search_options_open;
+        self.notify_search_ui(cx);
     }
 
     /// Navigate to the next match in the result list. Since results are ordered
@@ -149,7 +263,7 @@ impl TerminalView {
 
         self.search_state.next_match();
         self.scroll_to_current_match(cx);
-        cx.notify();
+        self.notify_search_ui(cx);
     }
 
     /// Navigate to the previous match in the result list. Since results are ordered
@@ -161,7 +275,7 @@ impl TerminalView {
 
         self.search_state.previous_match();
         self.scroll_to_current_match(cx);
-        cx.notify();
+        self.notify_search_ui(cx);
     }
 
     fn scroll_to_current_match(&mut self, cx: &mut Context<Self>) {
@@ -177,7 +291,7 @@ impl TerminalView {
 
         let (display_offset, history_size) = terminal.scroll_state();
 
-        // `current.line` uses Alacritty coordinates: negative values are scrollback.
+        // `current.line` uses terminal coordinates: negative values are scrollback.
         let viewport_row = current.line + display_offset as i32;
 
         if viewport_row >= 0 && viewport_row < rows {
@@ -201,29 +315,66 @@ impl TerminalView {
     }
 
     pub(super) fn perform_search(&mut self) {
+        self.search_scan_incomplete = false;
+        self.apply_search_scan(SearchScanKind::Full, false);
+    }
+
+    fn perform_viewport_search(&mut self) {
+        self.apply_search_scan(SearchScanKind::Viewport, true);
+    }
+
+    fn apply_search_scan(&mut self, kind: SearchScanKind, preserve_cursor: bool) {
         self.search_state.set_query(self.search_input.text());
 
         if !self.search_state.has_valid_pattern() {
             self.search_state.clear_results_preserving_query();
+            self.search_scan_incomplete = false;
             self.clear_terminal_scrollbar_marker_cache();
             return;
         }
 
         let Some(terminal) = self.active_terminal() else {
             self.search_state.clear_results_preserving_query();
+            self.search_scan_incomplete = false;
             self.clear_terminal_scrollbar_marker_cache();
             return;
         };
-        let line_texts = collect_search_line_texts(terminal, i32::MIN, i32::MAX);
+
+        let previous = preserve_cursor.then(|| {
+            self.search_state
+                .results()
+                .current()
+                .map(|search_match| (search_match.line, search_match.start_col))
+        });
+        let size = terminal.size();
+        let (display_offset, _) = terminal.scroll_state();
+        let (viewport_first, viewport_last) = visible_search_line_range(display_offset, size.rows);
+        let full_bounds = terminal
+            .line_bounds()
+            .unwrap_or((viewport_first, viewport_last));
+        let (first, last) = match kind {
+            SearchScanKind::Viewport => (viewport_first, viewport_last),
+            SearchScanKind::Full => full_bounds,
+        };
+
+        let line_texts = collect_search_line_texts(terminal, first, last);
         let start_line = line_texts.first_line;
         let end_line = line_texts.last_line();
+        self.search_state
+            .search_mapped(start_line, end_line, |line_idx| {
+                line_texts.mapped_line(line_idx)
+            });
+        self.search_scan_incomplete = matches!(kind, SearchScanKind::Viewport)
+            && search_line_span(full_bounds.0, full_bounds.1) > search_line_span(first, last);
 
-        let search_state = &mut self.search_state;
-        search_state.search(start_line, end_line, |line_idx| line_texts.line(line_idx));
-
-        // Start from the bottommost (newest) match, which is now index 0.
-        self.search_state.jump_to_first();
-        if self.search_state.results().is_empty() {
+        if let Some(Some((line, start_col))) = previous {
+            if !self.search_state.restore_current_match(line, start_col) {
+                self.search_state.jump_to_nearest(viewport_first);
+            }
+        } else {
+            self.search_state.jump_to_first();
+        }
+        if self.search_state.results().is_empty() && !self.search_scan_incomplete {
             self.clear_terminal_scrollbar_marker_cache();
         }
     }
@@ -231,9 +382,23 @@ impl TerminalView {
     pub(super) fn handle_search_key_down(
         &mut self,
         key: &str,
-        shift_pressed: bool,
+        modifiers: gpui_kit::Modifiers,
         cx: &mut Context<Self>,
     ) -> bool {
+        let shift_pressed = modifiers.shift;
+        // Cut, Undo and Redo have no binding, so they arrive as plain keys;
+        // the AppKit field handles them while it has focus.
+        if modifiers.platform && !modifiers.control && !modifiers.alt {
+            let command = match (key, shift_pressed) {
+                ("x", false) => Some(SearchEditCommand::Cut),
+                ("z", false) => Some(SearchEditCommand::Undo),
+                ("z", true) => Some(SearchEditCommand::Redo),
+                _ => None,
+            };
+            if command.is_some_and(|command| self.forward_edit_to_native_search(command)) {
+                return true;
+            }
+        }
         match search_key_action(key, shift_pressed) {
             Some(SearchKeyAction::Close) => {
                 self.close_search(cx);
@@ -257,24 +422,52 @@ impl TerminalView {
     pub(super) fn handle_search_input_changed(&mut self, cx: &mut Context<Self>) {
         self.search_state.set_query(self.search_input.text());
         if !self.search_state.has_valid_pattern() {
-            // Cancel pending debounced searches and drop stale highlights immediately.
             self.search_debounce_token = self.search_debounce_token.wrapping_add(1);
+            self.search_scan_incomplete = false;
             self.search_state.clear_results_preserving_query();
             self.clear_terminal_scrollbar_marker_cache();
             self.notify_search_inline_input(cx);
             return;
         }
 
-        // Debounce search
+        let scan_full_now = {
+            let Some(terminal) = self.active_terminal() else {
+                self.search_scan_incomplete = false;
+                self.search_state.clear_results_preserving_query();
+                self.clear_terminal_scrollbar_marker_cache();
+                self.notify_search_inline_input(cx);
+                return;
+            };
+            let size = terminal.size();
+            let (display_offset, _) = terminal.scroll_state();
+            let (viewport_first, viewport_last) =
+                visible_search_line_range(display_offset, size.rows);
+            let full_bounds = terminal
+                .line_bounds()
+                .unwrap_or((viewport_first, viewport_last));
+            search_line_span(full_bounds.0, full_bounds.1) <= SEARCH_SYNC_LINE_LIMIT
+        };
+        if scan_full_now {
+            self.perform_search();
+            self.scroll_to_current_match(cx);
+            self.notify_search_inline_input(cx);
+            return;
+        }
+
+        self.perform_viewport_search();
+        self.scroll_to_current_match(cx);
+        self.notify_search_inline_input(cx);
+
         self.search_debounce_token = self.search_debounce_token.wrapping_add(1);
         let token = self.search_debounce_token;
-
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            smol::Timer::after(Duration::from_millis(SEARCH_DEBOUNCE_MS)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(SEARCH_DEBOUNCE_MS))
+                .await;
             let _ = cx.update(|cx| {
                 this.update(cx, |view, cx| {
                     if view.search_debounce_token == token {
-                        view.perform_search();
+                        view.apply_search_scan(SearchScanKind::Full, true);
                         view.scroll_to_current_match(cx);
                         view.notify_search_inline_input(cx);
                     }
@@ -284,9 +477,172 @@ impl TerminalView {
         .detach();
     }
 
+    /// Whether AppKit draws the search bar (native tab windows on macOS).
+    pub(super) fn uses_native_search_bar(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.native_search_bar.is_some()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn install_native_search_bar(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some((bar, events)) = macos_native_search::NativeSearchBar::new(window) else {
+            log::warn!("No AppKit view for the native search bar; using Termy's own");
+            return;
+        };
+        self.native_search_bar = Some(bar);
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            while let Ok(event) = events.recv_async().await {
+                let updated = cx.update(|cx| {
+                    this.update(cx, |view, cx| view.handle_native_search_event(event, cx))
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_native_search_event(
+        &mut self,
+        event: macos_native_search::NativeSearchEvent,
+        cx: &mut Context<Self>,
+    ) {
+        use macos_native_search::NativeSearchEvent;
+
+        if let NativeSearchEvent::QueryChanged(query) = &event {
+            if let Some(bar) = self.native_search_bar.as_mut() {
+                bar.note_query(query);
+            }
+            // The field reports a change twice (text change and action).
+            if query == self.search_input.text() {
+                return;
+            }
+        }
+        if !self.search_open {
+            // An edit that raced the bar closing still belongs to the query
+            // the bar shows when it opens again.
+            if let NativeSearchEvent::QueryChanged(query) = event {
+                self.search_input.set_text(query);
+            }
+            return;
+        }
+        match event {
+            NativeSearchEvent::QueryChanged(query) => {
+                self.search_input.set_text(query);
+                self.handle_search_input_changed(cx);
+            }
+            NativeSearchEvent::Next => self.search_next(cx),
+            NativeSearchEvent::Previous => self.search_previous(cx),
+            NativeSearchEvent::Close => self.close_search(cx),
+            NativeSearchEvent::Options {
+                case_sensitive,
+                regex,
+            } => {
+                if case_sensitive != self.search_state.is_case_sensitive() {
+                    self.execute_search_command_action(
+                        CommandAction::ToggleSearchCaseSensitive,
+                        cx,
+                    );
+                }
+                let regex_mode = matches!(
+                    self.search_state.mode(),
+                    termy_core::search_engine::SearchMode::Regex
+                );
+                if regex != regex_mode {
+                    self.execute_search_command_action(CommandAction::ToggleSearchRegex, cx);
+                }
+            }
+        }
+    }
+
+    /// Give keyboard focus back to the terminal when the AppKit bar holds it.
+    pub(super) fn release_native_search_focus(&self) {
+        #[cfg(target_os = "macos")]
+        if let Some(bar) = self.native_search_bar.as_ref() {
+            bar.release_focus();
+        }
+    }
+
+    /// Push the search state to the AppKit bar, if this window has one.
+    pub(super) fn sync_native_search_bar(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.native_search_bar.is_none() {
+                return;
+            }
+            let (current, total) = self.search_state.results().position().unwrap_or((0, 0));
+            let invalid_pattern = self.search_state.error().is_some();
+            let state = macos_native_search::NativeSearchBarState {
+                open: self.search_open,
+                query: self.search_input.text().to_string(),
+                status: search_counter_label(
+                    current,
+                    total,
+                    self.search_input.text().is_empty(),
+                    invalid_pattern,
+                    self.search_scan_incomplete,
+                ),
+                invalid_pattern,
+                case_sensitive: self.search_state.is_case_sensitive(),
+                regex: matches!(
+                    self.search_state.mode(),
+                    termy_core::search_engine::SearchMode::Regex
+                ),
+                focus_request: self.search_focus_request,
+            };
+            if let Some(bar) = self.native_search_bar.as_mut() {
+                bar.apply(state);
+            }
+        }
+    }
+
+    /// Copy, Paste and Select All belong to the AppKit field while it has
+    /// keyboard focus.
+    pub(super) fn forward_edit_command_to_native_search(&self, action: CommandAction) -> bool {
+        let command = match action {
+            CommandAction::Copy => SearchEditCommand::Copy,
+            CommandAction::Paste => SearchEditCommand::Paste,
+            CommandAction::SelectAll => SearchEditCommand::SelectAll,
+            _ => return false,
+        };
+        self.forward_edit_to_native_search(command)
+    }
+
+    /// GPUI matches Cmd and Ctrl shortcuts before the AppKit field sees them.
+    /// While the field has keyboard focus, the edit goes to the field instead
+    /// of GPUI's copy of the query.
+    pub(super) fn forward_edit_to_native_search(&self, command: SearchEditCommand) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            // The command palette draws over an open search and takes its
+            // edits even if the field still has focus.
+            self.search_owns_inline_input()
+                && self
+                    .native_search_bar
+                    .as_ref()
+                    .is_some_and(|bar| bar.forward_edit_command(command))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = command;
+            false
+        }
+    }
+
     pub(super) fn render_search_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let overlay_style = self.overlay_style();
-        let bar_bg = overlay_style.chrome_panel_background(SEARCH_BAR_BG_ALPHA);
+        let bar_bg = overlay_style.chrome_panel_background_with_floor(
+            SEARCH_BAR_BG_ALPHA,
+            COMMAND_PALETTE_PANEL_SOLID_ALPHA,
+        );
         let input_bg = overlay_style.chrome_panel_background(SEARCH_INPUT_BG_ALPHA);
         let input_border = overlay_style.panel_foreground(0.10);
         let counter_text = overlay_style.panel_foreground(SEARCH_COUNTER_TEXT_ALPHA);
@@ -294,272 +650,38 @@ impl TerminalView {
         let button_hover_bg = overlay_style.chrome_panel_cursor(SEARCH_BUTTON_HOVER_BG_ALPHA);
         let button_active_bg = overlay_style.chrome_panel_cursor(0.28);
         let button_pressed_bg = overlay_style.chrome_panel_cursor(0.36);
-        let strong_text = overlay_style.panel_foreground(0.92);
-        let divider_color = overlay_style.panel_foreground(0.08);
-        let transparent = gpui::Rgba {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 0.0,
-        };
-
+        let strong_text = overlay_style.panel_foreground(OVERLAY_PRIMARY_TEXT_ALPHA);
+        let muted_text = overlay_style.panel_foreground(OVERLAY_MUTED_TEXT_ALPHA);
+        let query_empty = self.search_input.text().is_empty();
         let (current, total) = self.search_state.results().position().unwrap_or((0, 0));
-        let counter_label =
-            search_counter_label(current, total, self.search_input.text().is_empty());
-
         let has_error = self.search_state.error().is_some();
         let case_sensitive = self.search_state.is_case_sensitive();
-        let regex_mode = matches!(self.search_state.mode(), termy_search::SearchMode::Regex);
-        let error_color = gpui::Rgba {
+        let regex_mode = matches!(
+            self.search_state.mode(),
+            termy_core::search_engine::SearchMode::Regex
+        );
+        let error_color = gpui_kit::Rgba {
             r: 0.98,
             g: 0.48,
             b: 0.48,
             a: 1.0,
         };
+        let status_label = search_counter_label(
+            current,
+            total,
+            query_empty,
+            has_error,
+            self.search_scan_incomplete,
+        );
+        let radius = SEARCH_OVERLAY_GEOMETRY.control_radius;
 
-        div()
-            .id("search-bar")
-            .absolute()
-            .top(px(8.0))
-            .right(px(12.0))
-            .w(px(SEARCH_BAR_WIDTH))
-            .h(px(SEARCH_BAR_HEIGHT))
-            .bg(bar_bg)
-            .rounded(px(SEARCH_OVERLAY_GEOMETRY.panel_radius))
-            .border_1()
-            .border_color(overlay_style.panel_foreground(0.08))
-            .shadow_lg()
-            .flex()
-            .items_center()
-            .px(px(6.0))
-            .gap(px(5.0))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_this, _event, _window, cx| {
-                    cx.stop_propagation();
-                }),
-            )
-            .child(
+        let nav_button =
+            |id: &'static str, icon: &'static str, next: bool, cx: &mut Context<Self>| {
                 div()
-                    .flex_1()
-                    .h(px(28.0))
-                    .min_w(px(0.0))
-                    .relative()
-                    .overflow_hidden()
-                    .rounded(px(SEARCH_OVERLAY_GEOMETRY.input_radius))
-                    .bg(input_bg)
-                    .border_1()
-                    .border_color(if has_error { error_color } else { input_border })
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(10.0))
-                            .top_0()
-                            .bottom_0()
-                            .w(px(14.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                gpui::svg()
-                                    .path(gpui::SharedString::from("icons/settings/search.svg"))
-                                    .size(px(13.0))
-                                    .text_color(button_text),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(32.0))
-                            .right(px(if counter_label.is_some() { 58.0 } else { 10.0 }))
-                            .top_0()
-                            .bottom_0()
-                            .overflow_hidden()
-                            .child(div().relative().size_full().child(
-                                self.render_inline_input_layer(
-                                    Font {
-                                        family: self.ui_font_family.clone(),
-                                        ..gpui::font("")
-                                    },
-                                    px(13.0),
-                                    strong_text.into(),
-                                    {
-                                        overlay_style
-                                            .chrome_panel_cursor(SEARCH_INPUT_SELECTION_ALPHA)
-                                            .into()
-                                    },
-                                    InlineInputAlignment::Left,
-                                    cx,
-                                ),
-                            )),
-                    )
-                    .children(counter_label.map(|label| {
-                        div()
-                            .absolute()
-                            .right(px(6.0))
-                            .top(px(4.0))
-                            .bottom(px(4.0))
-                            .min_w(px(42.0))
-                            .px(px(6.0))
-                            .rounded(px(5.0))
-                            .bg(if has_error {
-                                let mut bg = error_color;
-                                bg.a = 0.14;
-                                bg
-                            } else {
-                                overlay_style.panel_foreground(0.06)
-                            })
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(10.0))
-                            .text_color(if has_error { error_color } else { counter_text })
-                            .child(label)
-                    })),
-            )
-            .child(div().w(px(1.0)).h(px(20.0)).bg(divider_color).flex_none())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(1.0))
-                    .child(
-                        div()
-                            .id("search-prev")
-                            .w(px(26.0))
-                            .h(px(26.0))
-                            .rounded(px(SEARCH_OVERLAY_GEOMETRY.control_radius))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(button_text)
-                            .hover(|style| style.bg(button_hover_bg))
-                            .active(move |style| style.bg(button_pressed_bg))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _event, _window, cx| {
-                                    this.search_next(cx);
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .child(
-                                gpui::svg()
-                                    .path(gpui::SharedString::from("icons/settings/chevron-up.svg"))
-                                    .size(px(13.0))
-                                    .text_color(button_text),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("search-next")
-                            .w(px(26.0))
-                            .h(px(26.0))
-                            .rounded(px(SEARCH_OVERLAY_GEOMETRY.control_radius))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(button_text)
-                            .hover(|style| style.bg(button_hover_bg))
-                            .active(move |style| style.bg(button_pressed_bg))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _event, _window, cx| {
-                                    this.search_previous(cx);
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .child(
-                                gpui::svg()
-                                    .path(gpui::SharedString::from(
-                                        "icons/settings/chevron-down.svg",
-                                    ))
-                                    .size(px(13.0))
-                                    .text_color(button_text),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(1.0))
-                    .child(
-                        div()
-                            .id("search-case-sensitive")
-                            .w(px(30.0))
-                            .h(px(26.0))
-                            .rounded(px(SEARCH_OVERLAY_GEOMETRY.control_radius))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(10.0))
-                            .text_color(if case_sensitive {
-                                strong_text
-                            } else {
-                                button_text
-                            })
-                            .bg(if case_sensitive {
-                                button_active_bg
-                            } else {
-                                transparent
-                            })
-                            .hover(|style| style.bg(button_hover_bg))
-                            .active(move |style| style.bg(button_pressed_bg))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _event, _window, cx| {
-                                    this.execute_search_command_action(
-                                        CommandAction::ToggleSearchCaseSensitive,
-                                        cx,
-                                    );
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .child("Aa"),
-                    )
-                    .child(
-                        div()
-                            .id("search-regex")
-                            .w(px(30.0))
-                            .h(px(26.0))
-                            .rounded(px(SEARCH_OVERLAY_GEOMETRY.control_radius))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(11.0))
-                            .text_color(if regex_mode { strong_text } else { button_text })
-                            .bg(if regex_mode {
-                                button_active_bg
-                            } else {
-                                transparent
-                            })
-                            .hover(|style| style.bg(button_hover_bg))
-                            .active(move |style| style.bg(button_pressed_bg))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _event, _window, cx| {
-                                    this.execute_search_command_action(
-                                        CommandAction::ToggleSearchRegex,
-                                        cx,
-                                    );
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .child(".*"),
-                    ),
-            )
-            .child(
-                div()
-                    .id("search-close")
-                    .w(px(26.0))
+                    .id(id)
+                    .w(px(28.0))
                     .h(px(26.0))
-                    .rounded(px(SEARCH_OVERLAY_GEOMETRY.control_radius))
+                    .rounded(px(radius))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -569,19 +691,347 @@ impl TerminalView {
                     .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _event, _window, cx| {
-                            this.close_search(cx);
+                        cx.listener(move |this, _event, _window, cx| {
+                            if next {
+                                this.search_next(cx);
+                            } else {
+                                this.search_previous(cx);
+                            }
                             cx.stop_propagation();
                         }),
                     )
                     .child(
-                        gpui::svg()
-                            .path(gpui::SharedString::from("icons/tab_strip/x.svg"))
-                            .size(px(11.0))
+                        gpui_kit::svg()
+                            .path(gpui_kit::SharedString::from(icon))
+                            .size(px(13.0))
                             .text_color(button_text),
-                    ),
-            )
-            .into_any()
+                    )
+            };
+
+        let mode_chip = |id: &'static str,
+                         label: &'static str,
+                         active: bool,
+                         action: CommandAction,
+                         cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .h(px(26.0))
+                .px(px(8.0))
+                .rounded(px(radius))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.0))
+                .font_weight(if active {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(if active { strong_text } else { button_text })
+                .bg(if active {
+                    button_active_bg
+                } else {
+                    gpui_kit::Rgba {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.0,
+                    }
+                })
+                .hover(|style| style.bg(button_hover_bg))
+                .active(move |style| style.bg(button_pressed_bg))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, _window, cx| {
+                        this.execute_search_command_action(action, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(label)
+        };
+
+        crate::ui::motion::enter_from_above(
+            div()
+                .id("search-bar-host")
+                .absolute()
+                .top(px(self.terminal_content_top_inset() + SEARCH_BAR_INSET))
+                .right(px(SEARCH_BAR_INSET))
+                .w(px(SEARCH_BAR_WIDTH))
+                .child(
+                    div()
+                        .id("search-bar")
+                        .w(px(SEARCH_BAR_WIDTH))
+                        .min_h(px(SEARCH_BAR_HEIGHT))
+                        .occlude()
+                        .bg(bar_bg)
+                        .rounded(px(SEARCH_OVERLAY_GEOMETRY.panel_radius))
+                        .border_1()
+                        .border_color(overlay_style.panel_foreground(0.10))
+                        .shadow_lg()
+                        .px(px(10.0))
+                        .py(px(8.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _event, _window, cx| {
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .h(px(30.0))
+                                        .relative()
+                                        .overflow_hidden()
+                                        .rounded(px(SEARCH_OVERLAY_GEOMETRY.input_radius))
+                                        .bg(input_bg)
+                                        .border_1()
+                                        .border_color(if has_error {
+                                            error_color
+                                        } else {
+                                            input_border
+                                        })
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .left(px(10.0))
+                                                .top_0()
+                                                .bottom_0()
+                                                .w(px(14.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(
+                                                    gpui_kit::svg()
+                                                        .path(gpui_kit::SharedString::from(
+                                                            "icons/settings/search.svg",
+                                                        ))
+                                                        .size(px(13.0))
+                                                        .text_color(button_text),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .left(px(32.0))
+                                                .right(px(if status_label.is_some() {
+                                                    132.0
+                                                } else {
+                                                    10.0
+                                                }))
+                                                .top_0()
+                                                .bottom_0()
+                                                .overflow_hidden()
+                                                .when(query_empty, |el| {
+                                                    el.child(
+                                                        div()
+                                                            .absolute()
+                                                            .left_0()
+                                                            .top_0()
+                                                            .bottom_0()
+                                                            .flex()
+                                                            .items_center()
+                                                            .text_size(px(13.0))
+                                                            .text_color(muted_text)
+                                                            .child("Find in terminal"),
+                                                    )
+                                                })
+                                                .child(
+                                                    div().relative().size_full().child(
+                                                        self.render_inline_input_layer(
+                                                            Font {
+                                                                family: self.ui_font_family.clone(),
+                                                                ..gpui_kit::font("")
+                                                            },
+                                                            px(13.0),
+                                                            strong_text.into(),
+                                                            overlay_style
+                                                                .chrome_panel_cursor(
+                                                                    SEARCH_INPUT_SELECTION_ALPHA,
+                                                                )
+                                                                .into(),
+                                                            InlineInputAlignment::Left,
+                                                            cx,
+                                                        ),
+                                                    ),
+                                                ),
+                                        )
+                                        .children(status_label.map(|label| {
+                                            div()
+                                                .absolute()
+                                                .right(px(6.0))
+                                                .top(px(4.0))
+                                                .bottom(px(4.0))
+                                                .px(px(8.0))
+                                                .rounded(px(6.0))
+                                                .bg(if has_error {
+                                                    let mut bg = error_color;
+                                                    bg.a = 0.14;
+                                                    bg
+                                                } else {
+                                                    overlay_style.panel_foreground(0.06)
+                                                })
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_size(px(11.0))
+                                                .text_color(if has_error {
+                                                    error_color
+                                                } else {
+                                                    counter_text
+                                                })
+                                                .child(label)
+                                        })),
+                                )
+                                .child(nav_button(
+                                    "search-prev",
+                                    "icons/settings/chevron-up.svg",
+                                    true,
+                                    cx,
+                                ))
+                                .child(nav_button(
+                                    "search-next",
+                                    "icons/settings/chevron-down.svg",
+                                    false,
+                                    cx,
+                                ))
+                                .child(
+                                    div()
+                                        .id("search-options")
+                                        .w(px(26.0))
+                                        .h(px(26.0))
+                                        .rounded(px(radius))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_color(
+                                            if self.search_options_open
+                                                || case_sensitive
+                                                || regex_mode
+                                            {
+                                                strong_text
+                                            } else {
+                                                button_text
+                                            },
+                                        )
+                                        .bg(if self.search_options_open {
+                                            button_active_bg
+                                        } else if case_sensitive || regex_mode {
+                                            overlay_style.panel_foreground(0.08)
+                                        } else {
+                                            gpui_kit::Rgba {
+                                                r: 0.0,
+                                                g: 0.0,
+                                                b: 0.0,
+                                                a: 0.0,
+                                            }
+                                        })
+                                        .hover(|style| style.bg(button_hover_bg))
+                                        .active(move |style| style.bg(button_pressed_bg))
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _event, _window, cx| {
+                                                this.toggle_search_options(cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        .child(
+                                            gpui_kit::svg()
+                                                .path(gpui_kit::SharedString::from(
+                                                    "icons/settings/more.svg",
+                                                ))
+                                                .size(px(14.0))
+                                                .text_color(
+                                                    if self.search_options_open
+                                                        || case_sensitive
+                                                        || regex_mode
+                                                    {
+                                                        strong_text
+                                                    } else {
+                                                        button_text
+                                                    },
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("search-close")
+                                        .w(px(26.0))
+                                        .h(px(26.0))
+                                        .rounded(px(radius))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_color(button_text)
+                                        .hover(|style| style.bg(button_hover_bg))
+                                        .active(move |style| style.bg(button_pressed_bg))
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _event, _window, cx| {
+                                                this.close_search(cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        .child(
+                                            gpui_kit::svg()
+                                                .path(gpui_kit::SharedString::from(
+                                                    "icons/tab_strip/x.svg",
+                                                ))
+                                                .size(px(11.0))
+                                                .text_color(button_text),
+                                        ),
+                                ),
+                        )
+                        .when(self.search_options_open, |bar| {
+                            bar.child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .child(mode_chip(
+                                        "search-case-sensitive",
+                                        "Case",
+                                        case_sensitive,
+                                        CommandAction::ToggleSearchCaseSensitive,
+                                        cx,
+                                    ))
+                                    .child(mode_chip(
+                                        "search-regex",
+                                        "Regex",
+                                        regex_mode,
+                                        CommandAction::ToggleSearchRegex,
+                                        cx,
+                                    ))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_end()
+                                            .pr(px(4.0))
+                                            .text_size(px(10.0))
+                                            .text_color(muted_text)
+                                            .child("↵ next  ·  ⇧↵ prev  ·  esc"),
+                                    ),
+                            )
+                        }),
+                ),
+            "search-bar-enter",
+        )
     }
 }
 
@@ -589,6 +1039,7 @@ struct SearchLineSnapshot {
     first_line: i32,
     text: String,
     ranges: Vec<Range<usize>>,
+    mappings: Vec<SearchLineMapping>,
 }
 
 impl SearchLineSnapshot {
@@ -599,6 +1050,7 @@ impl SearchLineSnapshot {
             first_line,
             text: String::new(),
             ranges: Vec::with_capacity(line_count),
+            mappings: vec![SearchLineMapping::default(); line_count],
         }
     }
 
@@ -616,6 +1068,11 @@ impl SearchLineSnapshot {
             .ok()
             .and_then(|offset| self.first_line.checked_add(offset))
             .unwrap_or(self.first_line)
+    }
+
+    fn mapped_line(&self, line_idx: i32) -> Option<(&str, &SearchLineMapping)> {
+        let offset = usize::try_from(line_idx.checked_sub(self.first_line)?).ok()?;
+        Some((self.line(line_idx)?, self.mappings.get(offset)?))
     }
 
     #[cfg(test)]
@@ -638,8 +1095,9 @@ fn collect_search_line_texts(
     end_line: i32,
 ) -> SearchLineSnapshot {
     let mut line_texts = None;
+    let mut previous_cell_start = 0;
     let captured_range =
-        terminal.for_each_line_cell_range(start_line, end_line, |range, line_idx, _, cell| {
+        terminal.for_each_line_cell_range(start_line, end_line, |range, line_idx, col, cell| {
             let snapshot = line_texts.get_or_insert_with(|| {
                 let first = start_line.max(range.first_line);
                 let last = end_line.min(range.last_line);
@@ -667,12 +1125,34 @@ fn collect_search_line_texts(
                 *cell_range = snapshot.text.len()..snapshot.text.len();
             }
             let character = cell.character();
-            if character == '\0' || cell.is_trailing_wide_spacer() || character.is_control() {
+            if cell.is_trailing_wide_spacer() {
+                if col > 0 {
+                    snapshot.mappings[index].record_cell(
+                        &snapshot.text[cell_range.start..],
+                        previous_cell_start - cell_range.start,
+                        col - 1,
+                        2,
+                    );
+                }
+                return;
+            }
+            previous_cell_start = snapshot.text.len();
+            if cell.is_hidden()
+                || cell.is_wide_spacer()
+                || character == '\0'
+                || character.is_control()
+            {
                 snapshot.text.push(' ');
             } else {
                 snapshot.text.push(character);
                 cell.append_combining_to(&mut snapshot.text);
             }
+            snapshot.mappings[index].record_cell(
+                &snapshot.text[cell_range.start..],
+                previous_cell_start - cell_range.start,
+                col,
+                1,
+            );
             cell_range.end = snapshot.text.len();
         });
 
@@ -731,17 +1211,52 @@ mod tests {
 
     #[test]
     fn search_counter_label_hides_empty_query_without_results() {
-        assert_eq!(search_counter_label(0, 0, true), None);
+        assert_eq!(search_counter_label(0, 0, true, false, false), None);
     }
 
     #[test]
     fn search_counter_label_reports_zero_results_for_non_empty_query() {
-        assert_eq!(search_counter_label(0, 0, false), Some("0/0".to_string()));
+        assert_eq!(
+            search_counter_label(0, 0, false, false, false),
+            Some("No matches".to_string())
+        );
     }
 
     #[test]
     fn search_counter_label_reports_current_result_position() {
-        assert_eq!(search_counter_label(3, 12, false), Some("3/12".to_string()));
+        assert_eq!(
+            search_counter_label(3, 12, false, false, false),
+            Some("3 of 12".to_string())
+        );
+    }
+
+    #[test]
+    fn search_counter_label_marks_incomplete_scans() {
+        assert_eq!(
+            search_counter_label(1, 4, false, false, true),
+            Some("1 of 4+".to_string())
+        );
+        assert_eq!(
+            search_counter_label(0, 0, false, false, true),
+            Some("Searching…".to_string())
+        );
+        assert_eq!(
+            search_counter_label(0, 0, false, true, false),
+            Some("Invalid pattern".to_string())
+        );
+    }
+
+    #[test]
+    fn visible_search_line_range_maps_display_offset_to_buffer_lines() {
+        assert_eq!(visible_search_line_range(0, 24), (0, 23));
+        assert_eq!(visible_search_line_range(10, 24), (-10, 13));
+    }
+
+    #[test]
+    fn search_line_span_counts_inclusive_buffer_lines() {
+        assert_eq!(search_line_span(0, 23), 24);
+        assert_eq!(search_line_span(-10, 13), 24);
+        assert_eq!(search_line_span(4, 3), 0);
     }
 
     fn filled_line_count(lines: &SearchLineSnapshot) -> usize {
@@ -771,7 +1286,7 @@ mod tests {
             "tmux terminal should expose at least one non-empty line"
         );
 
-        let native = Terminal::new_native(size, None, None, None, None, None)
+        let native = Terminal::new_native(size, None, None, None, None, None, None)
             .expect("native terminal should initialize for read adapter test");
         let native_lines = collect_search_line_texts(&native, 0, i32::from(size.rows) - 1);
         assert_eq!(native_lines.len(), usize::from(size.rows));
@@ -797,6 +1312,52 @@ mod tests {
     }
 
     #[test]
+    fn terminal_read_adapter_keeps_adjacent_wide_and_joined_text_searchable() {
+        let terminal = Terminal::new_test_display(TerminalSize::default());
+        terminal.hydrate_output("A日本語 e\u{301} 👩🏽‍💻Z".as_bytes());
+        let lines = collect_search_line_texts(&terminal, 0, 0);
+        assert_eq!(lines.line(0).unwrap().trim_end(), "A日本語 e\u{301} 👩🏽‍💻Z");
+    }
+
+    #[test]
+    fn terminal_search_maps_hidden_and_separate_cells_without_resegmenting() {
+        let terminal = Terminal::new_test_display(TerminalSize::default());
+        terminal.hydrate_output("A\x1b[8m界\x1b[0mZ\r\n👩\x07\u{200d}💻Z".as_bytes());
+        let lines = collect_search_line_texts(&terminal, 0, 1);
+        let mut state = termy_core::search_engine::SearchState::new();
+        state.set_query("Z");
+        state.search_mapped(0, 1, |line| lines.mapped_line(line));
+        let positions: Vec<_> = state
+            .results()
+            .matches()
+            .iter()
+            .map(|found| (found.line, found.start_col, found.end_col))
+            .collect();
+        assert_eq!(positions, [(1, 4, 5), (0, 3, 4)]);
+        state.set_query("界");
+        state.search_mapped(0, 1, |line| lines.mapped_line(line));
+        assert!(state.results().is_empty());
+    }
+
+    #[test]
+    fn terminal_search_maps_wide_clusters_in_one_physical_column() {
+        let terminal = Terminal::new_test_display(TerminalSize {
+            cols: 1,
+            rows: 4,
+            ..Default::default()
+        });
+        terminal.hydrate_output("界\r\n👩🏽‍💻".as_bytes());
+        let lines = collect_search_line_texts(&terminal, 0, 3);
+        let mut state = termy_core::search_engine::SearchState::new();
+        for query in ["界", "💻"] {
+            state.set_query(query);
+            state.search_mapped(0, 3, |line| lines.mapped_line(line));
+            let found = &state.results().matches()[0];
+            assert_eq!((found.start_col, found.end_col), (0, 1));
+        }
+    }
+
+    #[test]
     fn search_key_action_uses_shift_for_enter_navigation() {
         assert_eq!(
             search_key_action("enter", false),
@@ -811,5 +1372,10 @@ mod tests {
             Some(SearchKeyAction::Close)
         );
         assert_eq!(search_key_action("a", true), None);
+        assert_eq!(search_key_action("up", false), Some(SearchKeyAction::Next));
+        assert_eq!(
+            search_key_action("down", false),
+            Some(SearchKeyAction::Previous)
+        );
     }
 }

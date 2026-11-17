@@ -14,8 +14,10 @@ impl TerminalView {
 
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
-                smol::Timer::after(Duration::from_millis(16)).await;
-                let Ok(Ok(keep_animating)) = cx.update(|cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let Ok(keep_animating) = cx.update(|cx| {
                     this.update(cx, |view, cx| {
                         if !view.tab_strip.drag_preview.autoscroll_animating()
                             || view.tab_strip.drag.is_none()
@@ -125,12 +127,13 @@ impl TerminalView {
             TabStripOrientation::Horizontal => {
                 let scroll_offset_x: f32 =
                     self.tab_strip.horizontal_scroll_handle.offset().x.into();
+                let metrics = self.horizontal_tab_metrics();
                 Self::tab_drop_slot_from_pointer_primary_axis_for_extents(
                     self.session.tabs.iter().map(|tab| tab.display_width),
                     pointer_primary_axis,
                     scroll_offset_x,
-                    TAB_HORIZONTAL_PADDING,
-                    TAB_ITEM_GAP,
+                    metrics.leading_padding,
+                    metrics.item_gap,
                 )
             }
             TabStripOrientation::Vertical => {

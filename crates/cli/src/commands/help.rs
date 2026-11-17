@@ -4,9 +4,17 @@ pub fn run() {
     println!("  termy /path/to/project");
     println!("  termy --working-directory /path/to/project");
     println!();
+    println!("  termy --new-window [--working-directory /path/to/project]");
+    println!("  termy --new-tab [--working-directory /path/to/project]");
+    println!();
+    println!("On Linux, launching Termy opens a new window by default.");
+    println!("Use --new-tab to add a tab to the running window.");
+    println!("File managers use the same path via Open new Termy tab here.");
+    println!();
     println!("Available commands:");
     println!();
     println!("  plugin            Install and manage plugins");
+    println!("  mux               Control persistent terminals and layouts (JSON output)");
     println!("  -tui              Interactive TUI for all CLI features");
     println!("  -version          Show version information");
     println!("  -help             Show this help message");
@@ -18,9 +26,6 @@ pub fn run() {
     println!("  -edit-config      Open config file in editor");
     println!("  -show-config      Display current configuration");
     println!("  -validate-config  Validate configuration file");
-    println!("  -prettify-config  Prettify config (removes comments, formats)");
+    println!("  -prettify-config  Prettify config (removes comments, keeps .bak)");
     println!("  -update           Check for updates");
-    println!("  -export-theme     Export current colors to a themes repo checkout");
-    println!("  -validate-theme-repo");
-    println!("                    Validate a themes repo checkout");
 }

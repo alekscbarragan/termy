@@ -1,71 +1,35 @@
 set shell := ["bash", "-cu"]
 
+# On Windows a bare "bash" can resolve to System32's WSL launcher. Git for
+# Windows' sh is bash, and nothing else named sh ships with Windows, so run
+# just from Git Bash (or with Git's usr/bin on PATH). Shebang recipes also
+# need Git Bash: just maps their interpreter paths with cygpath.
+set windows-shell := ["sh", "-cu"]
+
+# Per-checkout instance home, so `just run`/`just dev` never attach to an
+# installed Termy. Computed by just rather than in a shell `${VAR:-...}`
+# default, whose braces broke on literal `{{ }}` text.
+dev_instance_home := env("TERMY_INSTANCE_HOME", justfile_directory() / "target" / "termy-dev-instance")
+
 # Show available recipes
 @default:
     just --list
 
+# Checkout-local instance lock so this does not silently attach to Termy.app.
+# On Windows it goes through `build`, which embeds termy.manifest (the WinUI
+# tab strip needs it; see scripts/windows/embed-manifest.ps1).
 run:
-    cargo run -p termy --release
+    if [ "{{ os() }}" = "windows" ]; then {{ just_executable() }} build && TERMY_INSTANCE_HOME={{ quote(dev_instance_home) }} ./target/release/termy.exe; else TERMY_INSTANCE_HOME={{ quote(dev_instance_home) }} cargo run -p termy --release; fi
 
-# Compare the terminal engines, enforce Tmon's snapshot baseline, and write a text report.
-benchmark-tmon:
+# Measure the custom terminal parser/grid and enforce warmed allocation bounds.
+benchmark-terminal-engine mib="32":
     #!/usr/bin/env bash
     set -euo pipefail
-    report="${TMON_BENCH_OUTPUT:-tmon-alacritty-benchmark.txt}"
+    report="${TERMY_ENGINE_BENCH_OUTPUT:-target/benchmarks/terminal-engine-benchmark.txt}"
+    mkdir -p "$(dirname "$report")"
     {
       rustc --version
-      echo
-      TERMY_CORE_TEST_BACKEND=alacritty cargo run --locked --quiet -p xtask --release --example engine_compare
-    } 2>&1 | tee "$report"
-    gate_status=0
-    set +e
-    {
-      echo
-      cargo run --locked --quiet --release --manifest-path tools/tmon-revision-gate/Cargo.toml
-    } 2>&1 | tee -a "$report"
-    gate_status=$?
-    set -e
-    {
-      echo
-      TERMY_CORE_TEST_BACKEND=alacritty TMON_BENCH_ALLOCATIONS_ONLY=1 cargo run --locked --quiet -p xtask --release --example engine_compare --features benchmark-allocations
-    } 2>&1 | tee -a "$report"
-    exit "$gate_status"
-
-# Compare Tmon and a pinned local libghostty-vt build for memory and feed throughput.
-benchmark-tmon-ghostty-memory:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    root="$PWD"
-    ghostty_dir="$(cd "${GHOSTTY_DIR:?set GHOSTTY_DIR to a Ghostty source checkout}" && pwd)"
-    prefix="${GHOSTTY_VT_PREFIX:-$root/target/ghostty-vt-benchmark}"
-    report="${TMON_GHOSTTY_MEMORY_OUTPUT:-tmon-ghostty-memory-benchmark.txt}"
-    expected_ghostty_revision="9e30f70f23418fecbdca1088673000417527c4e4"
-    ghostty_revision="$(git -C "$ghostty_dir" rev-parse HEAD)"
-    if [[ "$ghostty_revision" != "$expected_ghostty_revision" ]]; then
-      echo "Ghostty checkout must be at $expected_ghostty_revision, got $ghostty_revision" >&2
-      exit 1
-    fi
-    (
-      cd "$ghostty_dir"
-      zig build \
-        -Dapp-runtime=none \
-        -Demit-lib-vt=true \
-        -Demit-xcframework=false \
-        -Doptimize=ReleaseFast \
-        -Dcpu=baseline \
-        --prefix "$prefix"
-    )
-    {
-      rustc --version
-      zig version
-      echo "Termy commit: $(git rev-parse HEAD)"
-      echo "Ghostty commit: $ghostty_revision"
-      echo
-      GHOSTTY_VT_PREFIX="$prefix" cargo run --locked --quiet --release \
-        --manifest-path tools/tmon-ghostty-memory/Cargo.toml
-      echo
-      GHOSTTY_VT_PREFIX="$prefix" cargo run --locked --quiet --release \
-        --manifest-path tools/tmon-ghostty-memory/Cargo.toml -- --throughput
+      cargo run --locked --quiet -p termy_core --release --example terminal_engine_bench -- {{ quote(mib) }}
     } 2>&1 | tee "$report"
 
 run-cli *args:
@@ -91,10 +55,11 @@ validate: check fmt-check test-workspace check-boundaries
     cargo clippy --workspace --all-targets -- -D warnings
 
 dev:
-    cargo watch -x "run -p termy --release"
+    TERMY_INSTANCE_HOME={{ quote(dev_instance_home) }} cargo watch -x "run -p termy --release"
 
 build:
     cargo build -p termy --release
+    if [ "{{ os() }}" = "windows" ]; then powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/windows/embed-manifest.ps1 -ExePath target/release/termy.exe; fi
 
 check:
     cargo check --workspace
@@ -146,16 +111,16 @@ aur-install version="":
     ./scripts/aur/build-local.sh install "{{ version }}"
 
 generate-keybindings-doc:
-    cargo run -p xtask -- generate-keybindings-doc
+    cargo run -p termy_cli --bin xtask -- generate-keybindings-doc
 
 generate-config-doc:
-    cargo run -p xtask -- generate-config-doc
+    cargo run -p termy_cli --bin xtask -- generate-config-doc
 
 check-keybindings-doc:
-    cargo run -p xtask -- generate-keybindings-doc --check
+    cargo run -p termy_cli --bin xtask -- generate-keybindings-doc --check
 
 check-config-doc:
-    cargo run -p xtask -- generate-config-doc --check
+    cargo run -p termy_cli --bin xtask -- generate-config-doc --check
 
 check-boundaries:
     ./scripts/check-boundaries.sh
@@ -163,23 +128,56 @@ check-boundaries:
 check-file-sizes:
     ./scripts/check-file-sizes.sh
 
+# Build libtermy and run the Swift SDK tests (macOS)
+test-swift-sdk profile="release":
+    ./sdk/swift/scripts/build-libtermy.sh {{ profile }}
+    swift test --package-path sdk/swift
+
+# Run Termy Next, the Swift terminal built on the Swift SDK (macOS)
+next profile="debug":
+    ./sdk/swift/scripts/build-libtermy.sh {{ profile }}
+    swift run -c {{ profile }} --package-path next TermyNext
+
+# Build Termy Next.app into next/build (macOS)
+bundle-next profile="release":
+    ./next/scripts/bundle.sh {{ profile }}
+
+# Run the Termy Next tests (macOS)
+test-next:
+    swift test --package-path next
+
+# Run the relay locally; reads DATABASE_URL from crates/relay/.env
+relay:
+    set -a; . crates/relay/.env; set +a; PORT="${PORT:-8787}" cargo run -p termy_relay
+
+# Generate ios/Termy.xcodeproj and build the iPhone app for the simulator (macOS)
+ios:
+    cd ios && xcodegen generate && xcodebuild -project Termy.xcodeproj -scheme Termy -destination 'generic/platform=iOS Simulator' -derivedDataPath build/DerivedData build
+
+# Test what the iPhone app and Mac host share: the E2E channel and messages
+test-remote:
+    swift test --package-path remote
+
 test-tmux-integration:
     #!/usr/bin/env bash
     set -euo pipefail
     tmux_tests=(
-      "termy_terminal_ui|integration|tmux_split_integration|tmux_split_vertical_then_horizontal_refresh_snapshot_parses_nested_layout"
-      "termy_terminal_ui|integration|tmux_split_integration|tmux_repeated_split_refresh_cycles_remain_parseable"
-      "termy_terminal_ui|integration|tmux_split_integration|tmux_new_window_after_inserts_immediately_after_target_window"
-      "termy_terminal_ui|integration|tmux_split_integration|tmux_working_directory_flags_apply_to_session_window_and_split"
-      "termy_terminal_ui|integration|tmux_split_integration|tmux_capture_full_rejoins_wrapped_input_rows"
-      "termy_terminal_ui|integration|tmux_split_integration|managed_nonpersistent_drop_kills_session"
-      "termy_terminal_ui|integration|tmux_split_integration|managed_persistent_drop_keeps_session_but_removes_client"
-      "termy_terminal_ui|integration|tmux_split_integration|repeated_reconnect_does_not_increase_client_count"
-      "termy_tmux_control_core|lib||session::tests::launches_and_drives_control_mode"
-      "termy_ffi|integration|tmux_control_ffi|ffi_control_open_poll_send_close"
+      "termy|integration|tmux_split_integration|tmux_split_vertical_then_horizontal_refresh_snapshot_parses_nested_layout"
+      "termy|integration|tmux_split_integration|tmux_repeated_split_refresh_cycles_remain_parseable"
+      "termy|integration|tmux_split_integration|tmux_new_window_after_inserts_immediately_after_target_window"
+      "termy|integration|tmux_split_integration|tmux_working_directory_flags_apply_to_session_window_and_split"
+      "termy|integration|tmux_split_integration|tmux_capture_full_rejoins_wrapped_input_rows"
+      "termy|integration|tmux_split_integration|managed_nonpersistent_drop_kills_session"
+      "termy|integration|tmux_split_integration|managed_persistent_drop_keeps_session_but_removes_client"
+      "termy|integration|tmux_split_integration|repeated_reconnect_does_not_increase_client_count"
+      "termy|integration|tmux_split_integration|tmux_snapshot_decodes_escaped_names_once_and_survives_non_utf8_paths"
+      "termy|integration|tmux_split_integration|tmux_pane_queries_get_one_answer"
+      "termy_core|lib||tmux_control_core::session::tests::launches_and_drives_control_mode"
+      "termy_core|integration|tmux_control_ffi|ffi_control_open_poll_send_close"
+      "termy|bin|termy|terminal_view::working_dir_tests::new_tmux_tab_inherits_live_pane_cwd_with_foreground_app"
     )
-    if (( ${#tmux_tests[@]} != 10 )); then
-      echo "Tmux integration configuration error: expected 10 tests, got ${#tmux_tests[@]}" >&2
+    if (( ${#tmux_tests[@]} != 13 )); then
+      echo "Tmux integration configuration error: expected 13 tests, got ${#tmux_tests[@]}" >&2
       exit 1
     fi
     unique_count=$(
@@ -195,6 +193,7 @@ test-tmux-integration:
       cargo_args=(test --locked -p "$package")
       case "$target_kind" in
         lib) cargo_args+=(--lib) ;;
+        bin) cargo_args+=(--bin "$target_name") ;;
         integration) cargo_args+=(--test "$target_name") ;;
       esac
       cargo "${cargo_args[@]}" "$test_name" -- \
@@ -209,6 +208,7 @@ _validate-exact-tmux-test test_spec:
     cargo_args=(test --locked -p "$package")
     case "$target_kind" in
       lib) cargo_args+=(--lib) ;;
+      bin) cargo_args+=(--bin "$target_name") ;;
       integration) cargo_args+=(--test "$target_name") ;;
       *)
         echo "Tmux integration configuration error: invalid target kind '$target_kind'" >&2
@@ -243,13 +243,13 @@ bump kind:
     cargo update --workspace --offline
     echo "Bumped $CURRENT -> $NEW"
 
-# Set exact version in desktop app + cli Cargo.toml (e.g. just set-version 0.2.12)
+# Set exact version in desktop app + cli Cargo.toml (e.g. just set-version 0.2.12 or 1.0.0-rc.1)
 set-version version:
     #!/usr/bin/env bash
     set -euo pipefail
     NEW="{{ version }}"
-    if ! [[ "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      echo "usage: just set-version <major.minor.patch> (got: $NEW)"; exit 1
+    if ! [[ "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
+      echo "usage: just set-version <major.minor.patch[-prerelease]> (got: $NEW)"; exit 1
     fi
     CURRENT=$(grep -m1 '^version = ' crates/desktop_app/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
     export NEW

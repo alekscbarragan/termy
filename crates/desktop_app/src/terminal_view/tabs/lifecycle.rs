@@ -63,10 +63,12 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if let Some(handled) = self.execute_native_window_tab_action(action, window) {
+            return handled;
+        }
         match action {
             CommandAction::RenameTab => {
                 self.begin_rename_tab(self.session.active_tab, cx);
-                crate::ui::toast::info("Rename mode enabled");
                 true
             }
             CommandAction::NewTab => {
@@ -113,6 +115,15 @@ impl TerminalView {
             CommandAction::FocusPaneDown => self.focus_pane_down(cx),
             CommandAction::FocusPaneNext => self.focus_pane_next(cx),
             CommandAction::FocusPanePrevious => self.focus_pane_previous(cx),
+            CommandAction::FocusPane1 => self.focus_pane_position(1, cx),
+            CommandAction::FocusPane2 => self.focus_pane_position(2, cx),
+            CommandAction::FocusPane3 => self.focus_pane_position(3, cx),
+            CommandAction::FocusPane4 => self.focus_pane_position(4, cx),
+            CommandAction::FocusPane5 => self.focus_pane_position(5, cx),
+            CommandAction::FocusPane6 => self.focus_pane_position(6, cx),
+            CommandAction::FocusPane7 => self.focus_pane_position(7, cx),
+            CommandAction::FocusPane8 => self.focus_pane_position(8, cx),
+            CommandAction::FocusPane9 => self.focus_pane_position(9, cx),
             CommandAction::ResizePaneLeft => self.resize_pane_left(cx),
             CommandAction::ResizePaneRight => self.resize_pane_right(cx),
             CommandAction::ResizePaneUp => self.resize_pane_up(cx),
@@ -353,6 +364,30 @@ impl TerminalView {
         }
     }
 
+    /// Whether "+" would open the new-tab menu instead of adding a tab. The
+    /// Windows 11 tab style then shows a separate chevron for the menu.
+    pub(crate) fn new_tab_menu_has_choices(&self) -> bool {
+        should_show_new_tab_menu(
+            self.runtime_kind(),
+            cfg!(target_os = "windows"),
+            !self.saved_ssh_hosts.is_empty(),
+        )
+    }
+
+    /// Chevron next to "+" in the Windows 11 tab style: always the menu.
+    pub(crate) fn handle_new_tab_menu_button(
+        &mut self,
+        anchor: (f32, f32),
+        cx: &mut Context<Self>,
+    ) {
+        self.reload_saved_ssh_hosts();
+        if self.new_tab_menu_has_choices() {
+            self.toggle_new_tab_menu(anchor, cx);
+        } else {
+            self.add_tab(cx);
+        }
+    }
+
     pub(crate) fn toggle_new_tab_menu(&mut self, anchor: (f32, f32), cx: &mut Context<Self>) {
         if self.new_tab_menu_anchor.take().is_none() {
             self.new_tab_menu_anchor = Some(anchor);
@@ -442,8 +477,7 @@ impl TerminalView {
                 // Tab creation should stay robust if active pane state is transiently missing.
                 let size = self
                     .active_terminal()
-                    .map(|terminal| terminal.size())
-                    .unwrap_or_default();
+                    .map_or_default(|terminal| terminal.size());
                 let preferred_working_dir =
                     self.preferred_working_dir_for_new_session(working_dir, cx);
                 let terminal_runtime = windows_shell
@@ -456,6 +490,7 @@ impl TerminalView {
                     Some(&self.tab_shell_integration),
                     Some(terminal_runtime),
                     launch,
+                    self.multiplexer_client(),
                 ) {
                     Ok(terminal) => terminal,
                     Err(error) => {
@@ -496,7 +531,7 @@ impl TerminalView {
             crate::ui::toast::error("That saved SSH host no longer exists");
             return false;
         };
-        let process = match termy_ssh_core::openssh_launch(&host) {
+        let process = match termy_core::ssh_core::openssh_launch(&host) {
             Ok(process) => process,
             Err(error) => {
                 crate::ui::toast::error(format!(
@@ -524,7 +559,11 @@ impl TerminalView {
             let askpass = std::env::current_exe()
                 .map_err(|error| format!("Unable to locate the Termy executable: {error}"))
                 .and_then(|executable| {
-                    termy_ssh_core::askpass_environment(&executable, std::process::id(), &host)
+                    termy_core::ssh_core::askpass_environment(
+                        &executable,
+                        std::process::id(),
+                        &host,
+                    )
                 });
             match askpass {
                 Ok(environment) => runtime_config.environment.extend(environment),
@@ -539,8 +578,7 @@ impl TerminalView {
 
         let size = self
             .active_terminal()
-            .map(|terminal| terminal.size())
-            .unwrap_or_default();
+            .map_or_default(|terminal| terminal.size());
         let launch = TerminalLaunch::Program {
             program: process.program,
             args: process.args,
@@ -552,6 +590,7 @@ impl TerminalView {
             Some(&self.tab_shell_integration),
             Some(&runtime_config),
             Some(&launch),
+            self.multiplexer_client(),
         ) {
             Ok(terminal) => terminal,
             Err(error) => {
@@ -608,20 +647,7 @@ impl TerminalView {
         let pane_id = self.session.tabs[new_tab_index].active_pane_id.clone();
         self.refresh_tab_title(new_tab_index);
         self.session.active_tab = new_tab_index;
-        if let Some(inactive_scrollback) = self.inactive_tab_scrollback {
-            let active_options = self.terminal_runtime.term_options();
-            let inactive_options = active_options.with_scrollback_history(inactive_scrollback);
-            if let Some(tab) = self.session.tabs.get(old_active_tab) {
-                for pane in &tab.panes {
-                    pane.terminal().set_term_options(inactive_options);
-                }
-            }
-            if let Some(tab) = self.session.tabs.get(new_tab_index) {
-                for pane in &tab.panes {
-                    pane.terminal().set_term_options(active_options);
-                }
-            }
-        }
+        self.sync_active_tab_scrollback(Some(old_active_tab));
         self.mark_tab_strip_layout_dirty();
         self.reset_tab_interaction_state();
         self.sync_tab_strip_for_active_tab();
@@ -630,6 +656,7 @@ impl TerminalView {
             self.schedule_persist_native_workspace(cx);
         }
         self.start_new_tab_animation(tab_id, cx);
+        self.schedule_native_window_tab_split(cx);
         cx.notify();
         pane_id
     }
@@ -659,6 +686,16 @@ impl TerminalView {
             return;
         }
 
+        self.push_closing_tab_overlay(
+            index,
+            self.session.tabs[index].title.clone(),
+            Self::stable_tab_render_width(
+                self.session.tabs[index].display_width,
+                self.horizontal_tab_metrics().min_width,
+            ),
+            index == self.session.active_tab,
+            cx,
+        );
         self.session.tabs.remove(index);
         self.session
             .native_pane_zoom_snapshots
@@ -675,6 +712,8 @@ impl TerminalView {
         } else if self.session.active_tab >= self.session.tabs.len() {
             self.session.active_tab = self.session.tabs.len() - 1;
         }
+        // The closed tab may have been the active one.
+        self.sync_active_tab_scrollback(None);
 
         match self.renaming_tab {
             Some(editing) if editing == index => {
@@ -703,6 +742,139 @@ impl TerminalView {
         self.sync_plugin_lifecycle_state(false, cx);
         self.schedule_persist_native_workspace(cx);
         cx.notify();
+        if self.multiplexer.is_some()
+            && self.session.tabs.is_empty()
+            && !self.has_other_workspaces()
+        {
+            if !self.discard_multiplexer_window() {
+                self.sync_persisted_native_workspace();
+            }
+            // This runs inside an update of this window, which GPUI cannot
+            // update again (removing it would silently fail and leave an
+            // empty window), so close it once the update finishes.
+            let window_handle = self.window_handle;
+            App::defer(cx, move |cx| {
+                crate::app_actions::close_terminal_window::<Self>(window_handle, cx);
+            });
+        }
+    }
+
+    /// Visit every pane with a live terminal: the visible strip, tabs stashed
+    /// on inactive workspaces, and split panes parked by a zoom. Settings that
+    /// every terminal must follow (theme colors, runtime options) go through
+    /// here so hidden panes do not keep stale values until they reattach.
+    /// The callback gets the id of the tab that owns the pane.
+    pub(in crate::terminal_view) fn for_each_live_pane(
+        &self,
+        mut f: impl FnMut(TabId, &TerminalPane),
+    ) {
+        let tabs = self.session.tabs.iter().chain(
+            self.session
+                .workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.tabs),
+        );
+        for tab in tabs {
+            for pane in &tab.panes {
+                f(tab.id, pane);
+            }
+        }
+        for (tab_id, zoom) in &self.session.native_pane_zoom_snapshots {
+            for pane in &zoom.other_panes {
+                f(*tab_id, pane);
+            }
+        }
+    }
+
+    /// The single policy for `inactive_tab_scrollback`. A local pane in an
+    /// inactive tab drops to the cap to save memory. A session-host pane keeps
+    /// the full limit: its history lives in the shared host, where a cap
+    /// would trim it permanently for every client, also after Termy quits.
+    pub(in crate::terminal_view) fn scrollback_options_for_pane(
+        &self,
+        terminal: &Terminal,
+        active_tab: bool,
+    ) -> TerminalOptions {
+        let active_options = self.terminal_runtime.term_options();
+        match self.inactive_tab_scrollback {
+            Some(cap) if !active_tab && !terminal.is_session_host_pane() => {
+                active_options.with_scrollback_history(cap)
+            }
+            _ => active_options,
+        }
+    }
+
+    fn for_each_pane_in_tab(&self, tab_id: TabId, mut f: impl FnMut(&TerminalPane)) {
+        if let Some(tab) = self.session.tabs.iter().find(|tab| tab.id == tab_id) {
+            tab.panes.iter().for_each(&mut f);
+        }
+        if let Some(zoom) = self.session.native_pane_zoom_snapshots.get(&tab_id) {
+            zoom.other_panes.iter().for_each(f);
+        }
+    }
+
+    /// Apply `inactive_tab_scrollback`: the tab at `tab_index` gets the full
+    /// scrollback when `active`, else the inactive cap. Session-host panes are
+    /// left alone (see `scrollback_options_for_pane`).
+    pub(in crate::terminal_view) fn set_tab_scrollback_options(
+        &self,
+        tab_index: usize,
+        active: bool,
+    ) {
+        if self.inactive_tab_scrollback.is_none() {
+            return;
+        }
+        let Some(tab_id) = self.session.tabs.get(tab_index).map(|tab| tab.id) else {
+            return;
+        };
+        self.for_each_pane_in_tab(tab_id, |pane| {
+            let terminal = pane.terminal();
+            if terminal.is_session_host_pane() {
+                return;
+            }
+            terminal.set_term_options(self.scrollback_options_for_pane(terminal, active));
+        });
+    }
+
+    /// Re-apply `inactive_tab_scrollback` to the whole visible strip, after a
+    /// workspace was restored or switched in with freshly started tabs.
+    pub(in crate::terminal_view) fn sync_all_tab_scrollback(&self) {
+        for index in 0..self.session.tabs.len() {
+            self.set_tab_scrollback_options(index, index == self.session.active_tab);
+        }
+    }
+
+    /// Push the current query colors and terminal options to every live pane,
+    /// including stashed workspaces and zoom-parked splits.
+    pub(in crate::terminal_view) fn push_runtime_options_to_live_panes(&self) {
+        let active_tab_id = self
+            .session
+            .tabs
+            .get(self.session.active_tab)
+            .map(|tab| tab.id);
+        let query_colors = self.terminal_runtime.query_colors;
+        self.for_each_live_pane(|tab_id, pane| {
+            let terminal = pane.terminal();
+            terminal.set_term_options(
+                self.scrollback_options_for_pane(terminal, Some(tab_id) == active_tab_id),
+            );
+            terminal.set_query_colors(query_colors);
+        });
+    }
+
+    /// Every path that changes `session.active_tab` calls this afterwards:
+    /// the tab active before (if it is still in the strip, at index
+    /// `previous_active`) drops to the inactive scrollback cap, and the newly
+    /// active tab gets its full scrollback back.
+    pub(in crate::terminal_view) fn sync_active_tab_scrollback(
+        &self,
+        previous_active: Option<usize>,
+    ) {
+        let active = self.session.active_tab;
+        if let Some(previous) = previous_active.filter(|previous| *previous != active) {
+            self.set_tab_scrollback_options(previous, false);
+        }
+        self.set_tab_scrollback_options(active, true);
     }
 
     pub(crate) fn tab_index_by_id(&self, tab_id: TabId) -> Option<usize> {
@@ -764,6 +936,13 @@ impl TerminalView {
         self.renaming_tab = Some(index);
         self.rename_input
             .set_text(self.session.tabs[index].title.clone());
+        // The WinUI strip edits the title in its own tab instead, and reports
+        // the result as a rename event.
+        #[cfg(target_os = "windows")]
+        if self.begin_winui_tab_rename(index) {
+            self.renaming_tab = None;
+            return;
+        }
         self.reset_cursor_blink_phase();
         self.inline_input_selecting = false;
         // Recompute tab widths so the renamed tab expands to its editing width.
@@ -791,21 +970,12 @@ impl TerminalView {
                     self.mark_tab_strip_layout_dirty();
                 }
 
-                if let Some(inactive_scrollback) = self.inactive_tab_scrollback {
-                    let active_options = self.terminal_runtime.term_options();
-                    let inactive_options =
-                        active_options.with_scrollback_history(inactive_scrollback);
-                    for pane in &self.session.tabs[old_active].panes {
-                        pane.terminal().set_term_options(inactive_options);
-                    }
-                    for pane in &self.session.tabs[index].panes {
-                        pane.terminal().set_term_options(active_options);
-                    }
-                }
+                self.sync_active_tab_scrollback(Some(old_active));
 
                 self.reset_tab_rename_state();
                 self.reset_tab_drag_state();
                 self.clear_selection();
+                self.refresh_search_if_open(cx);
                 self.sync_tab_strip_for_active_tab();
                 self.sync_plugin_lifecycle_state(false, cx);
                 self.schedule_persist_native_workspace(cx);
@@ -817,9 +987,9 @@ impl TerminalView {
     pub(crate) fn focus_terminal_after_tab_activation(
         &mut self,
         window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         self.reset_cursor_blink_phase();
     }
 
@@ -951,6 +1121,16 @@ impl TerminalView {
         let Some(tab_index) = self.tab_index_by_id(tab_id) else {
             return false;
         };
+        // A zoomed tab holds only its zoomed pane; put the parked ones back
+        // first, so closing (say, an exited zoomed pane) keeps them running.
+        if let Some(mut zoom) = self.session.native_pane_zoom_snapshots.remove(&tab_id) {
+            if let Some(layout_tree) = zoom.layout_tree.take() {
+                self.session
+                    .native_pane_layout_trees
+                    .insert(tab_id, layout_tree);
+            }
+            Self::unzoom_panes(&mut self.session.tabs[tab_index], zoom);
+        }
         let Some(tab) = self.session.tabs.get(tab_index) else {
             return false;
         };
@@ -964,16 +1144,18 @@ impl TerminalView {
         let pane_id = pane_id.to_string();
         let _ = self.release_forwarded_mouse_presses_for_panes(std::slice::from_ref(&pane_id));
         self.clear_native_zoom_snapshot_for_tab_id(tab_id);
+        self.invalidate_native_split_generation();
 
         if self.ensure_native_layout_tree_for_tab_id(tab_id)
             && let Some(tree) = self.session.native_pane_layout_trees.remove(&tab_id)
         {
             let (next_root, next_focus_id, removed) =
-                Self::native_remove_leaf_from_tree(tree.root, pane_id.as_str());
+                NativeLayout::native_remove_leaf_from_tree(tree.root, pane_id.as_str());
             if removed && let Some(next_root) = next_root {
                 self.session
                     .native_pane_layout_trees
                     .insert(tab_id, NativePaneLayoutTree { root: next_root });
+                let mut disposed = Vec::new();
                 let (cols, rows) = if let Some(tab) = self.session.tabs.get_mut(tab_index) {
                     let prev_cols = tab
                         .panes
@@ -989,7 +1171,7 @@ impl TerminalView {
                         .max()
                         .unwrap_or(1)
                         .max(1);
-                    tab.panes.retain(|pane| pane.id != pane_id);
+                    disposed = Self::take_pane_terminals_by_id(tab, pane_id.as_str());
                     if tab.active_pane_id == pane_id || !tab.has_active_pane() {
                         tab.active_pane_id = next_focus_id
                             .or_else(|| tab.panes.first().map(|pane| pane.id.clone()))
@@ -1003,6 +1185,7 @@ impl TerminalView {
                     tab.assert_active_pane_invariant();
                     (prev_cols, prev_rows)
                 } else {
+                    Self::dispose_native_terminals(disposed, cx);
                     return false;
                 };
 
@@ -1012,7 +1195,10 @@ impl TerminalView {
                     self.clear_hovered_link();
                     self.clear_terminal_scrollbar_marker_cache();
                 }
+                self.last_terminal_resize_signature = None;
+                self.last_resize_applied_at = None;
                 self.schedule_persist_native_workspace(cx);
+                Self::dispose_native_terminals(disposed, cx);
                 cx.notify();
                 return true;
             }
@@ -1045,7 +1231,10 @@ impl TerminalView {
             self.clear_hovered_link();
             self.clear_terminal_scrollbar_marker_cache();
         }
+        self.last_terminal_resize_signature = None;
+        self.last_resize_applied_at = None;
         self.schedule_persist_native_workspace(cx);
+        Self::dispose_native_terminals(vec![removed.terminal], cx);
         cx.notify();
         true
     }
@@ -1124,6 +1313,25 @@ impl TerminalView {
 
     pub(crate) fn focus_pane_previous(&mut self, cx: &mut Context<Self>) -> bool {
         self.focus_pane_cycle(-1, cx)
+    }
+
+    fn pane_id_at_position(panes: &[TerminalPane], position: usize) -> Option<&str> {
+        panes
+            .get(position.checked_sub(1)?)
+            .map(|pane| pane.id.as_str())
+    }
+
+    fn focus_pane_position(&mut self, position: usize, cx: &mut Context<Self>) -> bool {
+        let Some(tab) = self.session.tabs.get(self.session.active_tab) else {
+            return false;
+        };
+        // Use the same ordering as focus_pane_cycle for both native and tmux panes.
+        let Some(target_pane_id) =
+            Self::pane_id_at_position(&tab.panes, position).map(str::to_owned)
+        else {
+            return false;
+        };
+        self.focus_pane_target(&target_pane_id, cx)
     }
 
     pub(crate) fn resize_pane_left(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1331,30 +1539,58 @@ impl TerminalView {
         }
     }
 
-    fn native_make_terminal(
-        &mut self,
-        cols: u16,
-        rows: u16,
-        cell_size: Size<Pixels>,
-        working_dir: Option<&str>,
-        launch: Option<&TerminalLaunch>,
-        cx: &mut Context<Self>,
+    fn native_spawn_terminal_blocking(
+        size: TerminalSize,
+        working_dir: Option<String>,
+        wakeup_router: NativeTerminalWakeupRouter,
+        tab_shell_integration: TabTitleShellIntegration,
+        terminal_runtime: TerminalRuntimeConfig,
+        launch: Option<TerminalLaunch>,
+        multiplexer: Option<termy_core::multiplexer::SessionClient>,
     ) -> Result<Terminal, String> {
-        let preferred_working_dir = self.preferred_working_dir_for_new_session(working_dir, cx);
         Terminal::new_native_with_launch(
-            TerminalSize {
-                cols: cols.max(1),
-                rows: rows.max(1),
-                cell_width: cell_size.width.into(),
-                cell_height: cell_size.height.into(),
-            },
-            preferred_working_dir.as_deref(),
-            Some(&self.native_terminal_wakeup_router),
-            Some(&self.tab_shell_integration),
-            Some(&self.terminal_runtime),
-            launch,
+            size,
+            working_dir.as_deref(),
+            Some(&wakeup_router),
+            Some(&tab_shell_integration),
+            Some(&terminal_runtime),
+            launch.as_ref(),
+            multiplexer.as_ref(),
         )
         .map_err(|error| format!("Failed to split pane: {error}"))
+    }
+
+    pub(in crate::terminal_view) fn dispose_native_terminals(
+        terminals: Vec<Terminal>,
+        cx: &mut Context<Self>,
+    ) {
+        if terminals.is_empty() {
+            return;
+        }
+        cx.spawn(async move |_this, cx| {
+            cx.background_executor()
+                .spawn(async move { drop(terminals) })
+                .await;
+        })
+        .detach();
+    }
+
+    fn take_pane_terminals_by_id(tab: &mut TerminalTab, pane_id: &str) -> Vec<Terminal> {
+        let mut terminals = Vec::new();
+        let mut index = 0;
+        while index < tab.panes.len() {
+            if tab.panes[index].id == pane_id {
+                let pane = tab.panes.remove(index);
+                terminals.push(pane.terminal);
+            } else {
+                index += 1;
+            }
+        }
+        terminals
+    }
+
+    pub(in crate::terminal_view) fn invalidate_native_split_generation(&mut self) {
+        self.native_split_generation = self.native_split_generation.saturating_add(1);
     }
 
     fn native_focus_pane_target(&mut self, pane_id: &str, cx: &mut Context<Self>) -> bool {
@@ -1372,9 +1608,73 @@ impl TerminalView {
         tab.assert_active_pane_invariant();
         self.clear_selection();
         self.clear_hovered_link();
+        self.refresh_search_if_open(cx);
         self.schedule_persist_native_workspace(cx);
         cx.notify();
         true
+    }
+
+    fn native_split_sizes_for_pane(
+        axis: NativeSplitAxis,
+        left: u16,
+        top: u16,
+        width: u16,
+        height: u16,
+    ) -> Result<(NativePaneRect, NativePaneRect), String> {
+        match axis {
+            NativeSplitAxis::Vertical => {
+                let min_width =
+                    NativeLayout::native_pane_min_extent_for_axis(PaneResizeAxis::Horizontal);
+                if width < min_width.saturating_mul(2) {
+                    return Err(format!(
+                        "Pane needs at least {} columns to split vertically",
+                        min_width.saturating_mul(2)
+                    ));
+                }
+                let current_width = (width / 2).max(min_width);
+                let split_width = width.saturating_sub(current_width).max(min_width);
+                Ok((
+                    NativePaneRect {
+                        left,
+                        top,
+                        width: current_width,
+                        height,
+                    },
+                    NativePaneRect {
+                        left: left.saturating_add(current_width),
+                        top,
+                        width: split_width,
+                        height,
+                    },
+                ))
+            }
+            NativeSplitAxis::Horizontal => {
+                let min_height =
+                    NativeLayout::native_pane_min_extent_for_axis(PaneResizeAxis::Vertical);
+                if height < min_height.saturating_mul(2) {
+                    return Err(format!(
+                        "Pane needs at least {} rows to split horizontally",
+                        min_height.saturating_mul(2)
+                    ));
+                }
+                let current_height = (height / 2).max(min_height);
+                let split_height = height.saturating_sub(current_height).max(min_height);
+                Ok((
+                    NativePaneRect {
+                        left,
+                        top,
+                        width,
+                        height: current_height,
+                    },
+                    NativePaneRect {
+                        left,
+                        top: top.saturating_add(current_height),
+                        width,
+                        height: split_height,
+                    },
+                ))
+            }
+        }
     }
 
     fn native_split_active_pane(
@@ -1384,128 +1684,178 @@ impl TerminalView {
         launch: Option<&TerminalLaunch>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some((active_pane_id, left, top, width, height, pane_zoom_steps, is_herdr_agent)) =
-            self.session
-                .tabs
-                .get(self.session.active_tab)
-                .and_then(|tab| {
-                    let index = tab.active_pane_index()?;
-                    let pane = tab.panes.get(index)?;
-                    Some((
-                        pane.id.clone(),
-                        pane.left,
-                        pane.top,
-                        pane.width,
-                        pane.height,
-                        pane.pane_zoom_steps,
-                        matches!(pane.terminal(), Terminal::HerdrAgent(_)),
-                    ))
-                })
-        else {
-            return false;
-        };
-        if is_herdr_agent {
+        let active_is_herdr_agent = self
+            .session
+            .tabs
+            .get(self.session.active_tab)
+            .and_then(|tab| tab.panes.get(tab.active_pane_index()?))
+            .is_some_and(|pane| matches!(pane.terminal(), Terminal::HerdrAgent(_)));
+        if active_is_herdr_agent {
             crate::ui::toast::info("Herdr Agent tabs cannot be split");
             self.notify_overlay(cx);
             return false;
         }
         self.clear_native_zoom_snapshot_for_active_tab();
-
-        let (current_size, split_size) = match axis {
-            NativeSplitAxis::Vertical => {
-                let min_width = Self::native_pane_min_extent_for_axis(PaneResizeAxis::Horizontal);
-                if width < min_width.saturating_mul(2) {
-                    crate::ui::toast::info(format!(
-                        "Pane needs at least {} columns to split vertically",
-                        min_width.saturating_mul(2)
-                    ));
-                    self.notify_overlay(cx);
-                    return false;
-                }
-                let current_width = (width / 2).max(min_width);
-                let split_width = width.saturating_sub(current_width).max(min_width);
-                (
-                    (left, top, current_width, height),
-                    (left.saturating_add(current_width), top, split_width, height),
-                )
-            }
-            NativeSplitAxis::Horizontal => {
-                let min_height = Self::native_pane_min_extent_for_axis(PaneResizeAxis::Vertical);
-                if height < min_height.saturating_mul(2) {
-                    crate::ui::toast::info(format!(
-                        "Pane needs at least {} rows to split horizontally",
-                        min_height.saturating_mul(2)
-                    ));
-                    self.notify_overlay(cx);
-                    return false;
-                }
-                let current_height = (height / 2).max(min_height);
-                let split_height = height.saturating_sub(current_height).max(min_height);
-                (
-                    (left, top, width, current_height),
-                    (
-                        left,
-                        top.saturating_add(current_height),
-                        width,
-                        split_height,
-                    ),
-                )
-            }
+        let Some((active_pane_id, left, top, width, height)) = self
+            .session
+            .tabs
+            .get(self.session.active_tab)
+            .and_then(|tab| {
+                let index = tab.active_pane_index()?;
+                let pane = tab.panes.get(index)?;
+                Some((
+                    pane.id.clone(),
+                    pane.left,
+                    pane.top,
+                    pane.width,
+                    pane.height,
+                ))
+            })
+        else {
+            return false;
         };
 
+        if let Err(message) = Self::native_split_sizes_for_pane(axis, left, top, width, height) {
+            crate::ui::toast::info(message);
+            self.notify_overlay(cx);
+            return false;
+        }
+
+        let preferred_working_dir = self.preferred_working_dir_for_new_session(working_dir, cx);
         let cell_size = self.layout_cell_size();
-        let terminal = match self.native_make_terminal(
-            split_size.2,
-            split_size.3,
-            cell_size,
-            working_dir,
-            launch,
-            cx,
-        ) {
-            Ok(terminal) => terminal,
-            Err(error) => {
-                crate::ui::toast::error(error);
-                return false;
-            }
+        let split_cols = match axis {
+            NativeSplitAxis::Vertical => (width / 2).max(1),
+            NativeSplitAxis::Horizontal => width.max(1),
         };
+        let split_rows = match axis {
+            NativeSplitAxis::Vertical => height.max(1),
+            NativeSplitAxis::Horizontal => (height / 2).max(1),
+        };
+        let size = TerminalSize {
+            cols: split_cols,
+            rows: split_rows,
+            cell_width: cell_size.width.into(),
+            cell_height: cell_size.height.into(),
+        };
+        let wakeup_router = self.native_terminal_wakeup_router.clone();
+        let tab_shell_integration = self.tab_shell_integration.clone();
+        let terminal_runtime = self.terminal_runtime.clone();
+        let multiplexer = self.multiplexer_client().cloned();
+        let launch = launch.cloned();
+        self.invalidate_native_split_generation();
+        let generation = self.native_split_generation;
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    Self::native_spawn_terminal_blocking(
+                        size,
+                        preferred_working_dir,
+                        wakeup_router,
+                        tab_shell_integration,
+                        terminal_runtime,
+                        launch,
+                        multiplexer,
+                    )
+                })
+                .await;
+            let _ = cx.update(|cx| {
+                this.update(cx, |view, cx| {
+                    if view.native_split_generation != generation {
+                        if let Ok(terminal) = result {
+                            Self::dispose_native_terminals(vec![terminal], cx);
+                        }
+                        return;
+                    }
+                    match result {
+                        Ok(terminal) => {
+                            let _ = view.commit_native_split(
+                                axis,
+                                active_pane_id.as_str(),
+                                terminal,
+                                cx,
+                            );
+                        }
+                        Err(error) => {
+                            crate::ui::toast::error(error);
+                            view.notify_overlay(cx);
+                        }
+                    }
+                })
+            });
+        })
+        .detach();
+        true
+    }
+
+    fn commit_native_split(
+        &mut self,
+        axis: NativeSplitAxis,
+        active_pane_id: &str,
+        terminal: Terminal,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((left, top, width, height, pane_zoom_steps)) = self
+            .session
+            .tabs
+            .get(self.session.active_tab)
+            .and_then(|tab| {
+                tab.panes
+                    .iter()
+                    .find(|pane| pane.id == active_pane_id)
+                    .map(|pane| {
+                        (
+                            pane.left,
+                            pane.top,
+                            pane.width,
+                            pane.height,
+                            pane.pane_zoom_steps,
+                        )
+                    })
+            })
+        else {
+            Self::dispose_native_terminals(vec![terminal], cx);
+            return false;
+        };
+
+        let (current_size, split_size) =
+            match Self::native_split_sizes_for_pane(axis, left, top, width, height) {
+                Ok(sizes) => sizes,
+                Err(message) => {
+                    crate::ui::toast::info(message);
+                    self.notify_overlay(cx);
+                    Self::dispose_native_terminals(vec![terminal], cx);
+                    return false;
+                }
+            };
+
         let pane_id = self.native_allocate_pane_id();
         let Some(tab) = self.session.tabs.get_mut(self.session.active_tab) else {
+            Self::dispose_native_terminals(vec![terminal], cx);
             return false;
         };
         let Some(active_index) = tab.panes.iter().position(|pane| pane.id == active_pane_id) else {
+            Self::dispose_native_terminals(vec![terminal], cx);
             return false;
         };
 
         if let Some(active_pane) = tab.panes.get_mut(active_index) {
-            active_pane.left = current_size.0;
-            active_pane.top = current_size.1;
-            active_pane.width = current_size.2;
-            active_pane.height = current_size.3;
-            // Resize terminal before the first render so pane geometry and grid size match.
-            active_pane.terminal_mut().resize(TerminalSize {
-                cols: current_size.2,
-                rows: current_size.3,
-                cell_width: cell_size.width.into(),
-                cell_height: cell_size.height.into(),
-            });
+            active_pane.left = current_size.left;
+            active_pane.top = current_size.top;
+            active_pane.width = current_size.width;
+            active_pane.height = current_size.height;
         }
 
-        let cached_element_ids = PaneCachedElementIds::new(&pane_id);
-        let split_pane = TerminalPane {
-            id: pane_id.clone(),
-            left: split_size.0,
-            top: split_size.1,
-            width: split_size.2,
-            height: split_size.3,
-            pane_zoom_steps,
-            degraded: false,
-            tmux_mouse_mode: None,
-            progress_state: ProgressState::default(),
+        let mut split_pane = TerminalPane::new_native(
+            pane_id.clone(),
+            split_size.left,
+            split_size.top,
+            split_size.width,
+            split_size.height,
             terminal,
-            render_cache: RefCell::new(TerminalPaneRenderCache::default()),
-            last_alternate_screen: Cell::new(false),
-            cached_element_ids,
-        };
+        );
+        split_pane.pane_zoom_steps = pane_zoom_steps;
 
         tab.panes.insert(active_index + 1, split_pane);
         tab.active_pane_id = pane_id.clone();
@@ -1516,14 +1866,14 @@ impl TerminalView {
             .iter()
             .map(|pane| pane.left.saturating_add(pane.width))
             .max()
-            .unwrap_or(split_size.2)
+            .unwrap_or(split_size.width)
             .max(1);
         let max_rows = tab
             .panes
             .iter()
             .map(|pane| pane.top.saturating_add(pane.height))
             .max()
-            .unwrap_or(split_size.3)
+            .unwrap_or(split_size.height)
             .max(1);
         if self.ensure_native_layout_tree_for_tab_id(tab_id)
             && let Some(tree) = self.session.native_pane_layout_trees.get_mut(&tab_id)
@@ -1532,13 +1882,13 @@ impl TerminalView {
                 NativeSplitAxis::Vertical => PaneResizeAxis::Horizontal,
                 NativeSplitAxis::Horizontal => PaneResizeAxis::Vertical,
             };
-            if Self::native_replace_leaf_with_split(
+            if NativeLayout::native_replace_leaf_with_split(
                 &mut tree.root,
-                active_pane_id.as_str(),
+                active_pane_id,
                 layout_axis,
                 pane_id.as_str(),
             ) {
-                Self::native_balance_split_group_containing_leaf(
+                NativeLayout::native_balance_split_group_containing_leaf(
                     &mut tree.root,
                     layout_axis,
                     pane_id.as_str(),
@@ -1546,6 +1896,8 @@ impl TerminalView {
             }
             self.apply_native_layout_tree_to_tab(tab_id, max_cols, max_rows);
         }
+        self.last_terminal_resize_signature = None;
+        self.last_resize_applied_at = None;
         self.clear_selection();
         self.clear_hovered_link();
         self.schedule_persist_native_workspace(cx);
@@ -1849,18 +2201,19 @@ impl TerminalView {
             return false;
         };
         let active_pane_id = tab.active_pane_id.clone();
+        self.invalidate_native_split_generation();
 
         if self.ensure_native_layout_tree_for_tab_id(tab_id)
             && let Some(tree) = self.session.native_pane_layout_trees.remove(&tab_id)
         {
             let (next_root, next_focus_id, removed) =
-                Self::native_remove_leaf_from_tree(tree.root, active_pane_id.as_str());
+                NativeLayout::native_remove_leaf_from_tree(tree.root, active_pane_id.as_str());
             if removed && let Some(next_root) = next_root {
                 self.session
                     .native_pane_layout_trees
                     .insert(tab_id, NativePaneLayoutTree { root: next_root });
                 if let Some(tab) = self.session.tabs.get_mut(self.session.active_tab) {
-                    tab.panes.retain(|pane| pane.id != active_pane_id);
+                    let disposed = Self::take_pane_terminals_by_id(tab, active_pane_id.as_str());
                     let cols = tab
                         .panes
                         .iter()
@@ -1888,10 +2241,13 @@ impl TerminalView {
                         }
                         tab.assert_active_pane_invariant();
                     }
+                    self.last_terminal_resize_signature = None;
+                    self.last_resize_applied_at = None;
                     self.clear_selection();
                     self.clear_hovered_link();
                     self.clear_terminal_scrollbar_marker_cache();
                     self.schedule_persist_native_workspace(cx);
+                    Self::dispose_native_terminals(disposed, cx);
                     cx.notify();
                     return true;
                 }
@@ -1915,10 +2271,13 @@ impl TerminalView {
         }
         tab.assert_active_pane_invariant();
 
+        self.last_terminal_resize_signature = None;
+        self.last_resize_applied_at = None;
         self.clear_selection();
         self.clear_hovered_link();
         self.clear_terminal_scrollbar_marker_cache();
         self.schedule_persist_native_workspace(cx);
+        Self::dispose_native_terminals(vec![removed.terminal], cx);
         cx.notify();
         true
     }
@@ -2040,6 +2399,7 @@ mod tests {
             degraded: false,
             tmux_mouse_mode: None,
             progress_state: ProgressState::default(),
+            program_status: Vec::new(),
             terminal: test_terminal(),
             render_cache: RefCell::new(TerminalPaneRenderCache::default()),
             last_alternate_screen: Cell::new(false),
@@ -2091,6 +2451,21 @@ mod tests {
         assert_eq!(TerminalView::adjacent_pane_index(0, 1, 1), None);
         assert_eq!(TerminalView::adjacent_pane_index(2, 2, 1), None);
         assert_eq!(TerminalView::adjacent_pane_index(0, 2, 0), None);
+    }
+
+    #[test]
+    fn numbered_pane_focus_uses_cycle_order_and_ignores_missing_positions() {
+        let panes = [
+            test_pane("first", 0, 0, 40, 20),
+            test_pane("third", 40, 0, 40, 20),
+            test_pane("second", 80, 0, 40, 20),
+        ];
+        assert_eq!(TerminalView::pane_id_at_position(&panes, 1), Some("first"));
+        assert_eq!(TerminalView::pane_id_at_position(&panes, 2), Some("third"));
+        assert_eq!(TerminalView::pane_id_at_position(&panes, 3), Some("second"));
+        assert_eq!(TerminalView::pane_id_at_position(&panes, 0), None);
+        assert_eq!(TerminalView::pane_id_at_position(&panes, 4), None);
+        assert_eq!(TerminalView::pane_id_at_position(&[], 1), None);
     }
 
     #[test]
@@ -2192,5 +2567,97 @@ mod tests {
             TerminalView::native_pane_rect_from_pane(&panes[0]),
             TerminalView::native_pane_rect_from_pane(&panes[1]),
         ));
+    }
+
+    #[test]
+    fn native_split_sizes_halve_the_source_pane() {
+        let (current, split) =
+            TerminalView::native_split_sizes_for_pane(NativeSplitAxis::Vertical, 0, 0, 80, 24)
+                .expect("wide enough");
+        assert_eq!(
+            current,
+            NativePaneRect {
+                left: 0,
+                top: 0,
+                width: 40,
+                height: 24,
+            }
+        );
+        assert_eq!(
+            split,
+            NativePaneRect {
+                left: 40,
+                top: 0,
+                width: 40,
+                height: 24,
+            }
+        );
+
+        let (current, split) =
+            TerminalView::native_split_sizes_for_pane(NativeSplitAxis::Horizontal, 10, 4, 60, 20)
+                .expect("tall enough");
+        assert_eq!(
+            current,
+            NativePaneRect {
+                left: 10,
+                top: 4,
+                width: 60,
+                height: 10,
+            }
+        );
+        assert_eq!(
+            split,
+            NativePaneRect {
+                left: 10,
+                top: 14,
+                width: 60,
+                height: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn native_split_sizes_reject_panes_below_minimum() {
+        assert!(
+            TerminalView::native_split_sizes_for_pane(NativeSplitAxis::Vertical, 0, 0, 24, 24)
+                .is_err()
+        );
+        assert!(
+            TerminalView::native_split_sizes_for_pane(NativeSplitAxis::Horizontal, 0, 0, 80, 8)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn take_pane_terminals_by_id_removes_only_the_matching_pane() {
+        let mut tab = TerminalTab {
+            id: 1,
+            window_id: String::new(),
+            window_index: 0,
+            panes: vec![
+                test_pane("%native-1", 0, 0, 40, 20),
+                test_pane("%native-2", 40, 0, 40, 20),
+            ],
+            active_pane_id: "%native-1".to_string(),
+            pinned: false,
+            manual_title: None,
+            explicit_title: None,
+            explicit_title_is_prediction: false,
+            shell_title: None,
+            current_command: None,
+            pending_command_title: None,
+            pending_command_token: 0,
+            last_prompt_cwd: None,
+            title: String::new(),
+            title_text_width: 0.0,
+            sticky_title_width: 0.0,
+            display_width: 0.0,
+            running_process: false,
+            command_lifecycle: CommandLifecycle::default(),
+        };
+        let taken = TerminalView::take_pane_terminals_by_id(&mut tab, "%native-2");
+        assert_eq!(taken.len(), 1);
+        assert_eq!(tab.panes.len(), 1);
+        assert_eq!(tab.panes[0].id, "%native-1");
     }
 }

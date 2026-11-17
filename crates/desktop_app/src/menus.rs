@@ -1,8 +1,10 @@
 use crate::commands::{CommandAction, CommandMenuEntry, MenuRoot};
 #[cfg(target_os = "macos")]
-use gpui::SystemMenuType;
-use gpui::{Menu, MenuItem};
-use termy_command_core::{CommandAvailability, CommandCapabilities, CommandUnavailableReason};
+use gpui_kit::SystemMenuType;
+use gpui_kit::{Menu, MenuItem};
+use termy_core::command_core::{
+    CommandAvailability, CommandCapabilities, CommandUnavailableReason,
+};
 
 const INSTALL_CLI_TITLE: &str = "Install CLI";
 const INSTALL_CLI_INSTALLED_TITLE: &str = "Install CLI (Installed)";
@@ -25,7 +27,8 @@ pub(crate) fn app_menus(
 }
 
 fn build_menu(root: MenuRoot, capabilities: CommandCapabilities, simple_mode: bool) -> Menu {
-    let entries = CommandAction::menu_entries_for_root(root);
+    let entries =
+        CommandAction::menu_entries_for_root_for_runtime(root, capabilities.tmux_runtime_active);
     let mut items = Vec::new();
 
     #[cfg(target_os = "macos")]
@@ -40,6 +43,7 @@ fn build_menu(root: MenuRoot, capabilities: CommandCapabilities, simple_mode: bo
 
     Menu {
         name: root.title().into(),
+        disabled: false,
         items,
     }
 }
@@ -97,8 +101,8 @@ fn menu_item_title(
 mod tests {
     use super::{INSTALL_CLI_INSTALLED_TITLE, INSTALL_CLI_TITLE, app_menus};
     use crate::commands::CommandAction;
-    use gpui::{MenuItem, OsAction};
-    use termy_command_core::{CommandCapabilities, CommandUnavailableReason};
+    use gpui_kit::{MenuItem, OsAction};
+    use termy_core::command_core::{CommandCapabilities, CommandUnavailableReason};
 
     #[test]
     fn top_level_menu_order_is_stable() {
@@ -189,7 +193,7 @@ mod tests {
             .find(|menu| menu.name.as_ref() == "Help")
             .expect("missing Help menu");
 
-        let install_cli_titles = |menu: &gpui::Menu| {
+        let install_cli_titles = |menu: &gpui_kit::Menu| {
             menu.items
                 .iter()
                 .filter_map(|item| {
@@ -290,6 +294,7 @@ mod tests {
             labels,
             vec![
                 "New Tab",
+                "New Window",
                 "Rename Tab",
                 "<separator>",
                 "Close Pane or Tab",
@@ -305,10 +310,16 @@ mod tests {
         #[cfg(target_os = "windows")]
         assert_eq!(
             labels,
-            vec!["New Tab", "Rename Tab", "<separator>", "Close Pane or Tab"]
-                .into_iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
+            vec![
+                "New Tab",
+                "New Window",
+                "Rename Tab",
+                "<separator>",
+                "Close Pane or Tab",
+            ]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
         );
     }
 

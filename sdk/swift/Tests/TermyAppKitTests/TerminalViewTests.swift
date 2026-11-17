@@ -1,0 +1,543 @@
+import AppKit
+import CoreText
+import Testing
+import Termy
+@testable import TermyAppKit
+
+@Suite("Terminal view (CoreGraphics)")
+@MainActor
+struct TerminalViewTests {
+    private func makeView(feeding output: String = "", cols: UInt16 = 20) throws -> TerminalView {
+        let config = try TermyConfig(contents: "padding_x = 4\npadding_y = 4\ncursor_blink = false\n")
+        let render = try config.renderConfig(for: .dark)
+        let session = try TerminalSession.display(
+            size: TerminalSize(cols: cols, rows: 5, cellWidth: render.cellWidth, cellHeight: render.cellHeight))
+        let view = TerminalView(session: session, renderConfig: render, backend: .coreGraphics)
+        view.frame = NSRect(origin: .zero, size: view.size(cols: Int(cols), rows: 5))
+        if !output.isEmpty { try session.feed(Data(output.utf8)) }
+        return view
+    }
+
+    private func privatePasteboard() -> NSPasteboard {
+        NSPasteboard(name: NSPasteboard.Name("dev.termy.tests.\(UUID().uuidString)"))
+    }
+
+    @MainActor
+    private final class Delegate: TerminalViewDelegate {
+        var allowsClipboardWrites = false
+        var allowsLinks = true
+        var clipboardRequests: [String] = []
+
+        func terminalView(_ view: TerminalView, shouldWriteClipboard text: String) -> Bool {
+            clipboardRequests.append(text)
+            return allowsClipboardWrites
+        }
+
+        func terminalView(_ view: TerminalView, shouldOpen url: URL) -> Bool { allowsLinks }
+    }
+
+    private func render(_ view: TerminalView) throws -> NSBitmapImageRep {
+        let bitmap = try #require(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: bitmap)
+        return bitmap
+    }
+
+    private func color(in bitmap: NSBitmapImageRep, view: TerminalView, row: Int, col: Int) throws -> NSColor {
+        let rect = view.renderer.cellRect(row: row, col: col)
+        let scale = CGFloat(bitmap.pixelsWide) / view.bounds.width
+        let color = try #require(bitmap.colorAt(x: Int(rect.midX * scale), y: Int(rect.midY * scale)))
+        return try #require(color.usingColorSpace(.sRGB))
+    }
+
+    @Test func sizesTheGridToTheView() throws {
+        let view = try makeView()
+        #expect(view.session.size.cols == 20)
+        #expect(view.session.size.rows == 5)
+
+        // Without a visible window the program keeps its size.
+        view.setFrameSize(view.size(cols: 30, rows: 8))
+        #expect(view.session.size.cols == 20)
+
+        _ = NSApplication.shared
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: view.size(cols: 40, rows: 10)),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = NSView(frame: NSRect(origin: .zero, size: view.size(cols: 40, rows: 10)))
+        window.contentView?.addSubview(view)
+        window.orderFrontRegardless()
+        defer {
+            view.removeFromSuperview()
+            window.orderOut(nil)
+        }
+        try #require(window.isVisible)
+
+        view.setFrameSize(view.size(cols: 30, rows: 8))
+        #expect(view.session.size.cols == 30)
+        #expect(view.session.size.rows == 8)
+        #expect(view.session.frame.cols == 30)
+    }
+
+    @MainActor
+    private final class MenuDelegate: TerminalViewDelegate {
+        var shownMenus = 0
+
+        func terminalView(_ view: TerminalView, willShowMenu menu: NSMenu) {
+            shownMenus += 1
+            menu.addItem(NSMenuItem(title: "Host Item", action: nil, keyEquivalent: ""))
+        }
+    }
+
+    private func rightClick(_ view: TerminalView, row: Int, col: Int) throws -> NSEvent {
+        let rect = view.renderer.cellRect(row: row, col: col)
+        return try #require(NSEvent.mouseEvent(
+            with: .rightMouseDown, location: view.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil), modifierFlags: [],
+            timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+    }
+
+    @Test func rightClickShowsEditItemsAndTheHostsOwn() throws {
+        let view = try makeView(feeding: "hello")
+        let delegate = MenuDelegate()
+        view.delegate = delegate
+        view.pasteboard = privatePasteboard()
+        let menu = try #require(view.menu(for: rightClick(view, row: 0, col: 0)))
+        #expect(menu.items.map(\.title) == ["Copy", "Paste", "Select All", "Host Item"])
+        #expect(delegate.shownMenus == 1)
+
+        let copy = menu.items[0]
+        #expect(!view.validateMenuItem(copy))
+        view.selectAll(nil)
+        #expect(view.validateMenuItem(copy))
+        #expect(!view.validateMenuItem(menu.items[1]))
+        view.pasteboard.clearContents()
+        view.pasteboard.setString("pasted", forType: .string)
+        #expect(view.validateMenuItem(menu.items[1]))
+    }
+
+    @Test func controlReturnGoesToTheProgramNotTheMenu() throws {
+        let view = try makeView()
+        _ = NSApplication.shared
+        let window = NSWindow(
+            contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = NSView(frame: view.frame)
+        window.contentView?.addSubview(view)
+        window.makeFirstResponder(view)
+        defer {
+            view.removeFromSuperview()
+            window.close()
+        }
+        var sent = Data()
+        view.session.terminal.onInput = { sent.append($0) }
+        let event = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: .control, timestamp: 0,
+            windowNumber: window.windowNumber, context: nil, characters: "\r",
+            charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
+        #expect(view.performKeyEquivalent(with: event))
+        #expect(!sent.isEmpty)
+    }
+
+    @Test func onlyKeysWhosePressWasSentReportARelease() throws {
+        let view = try makeView()
+        var sent: [Data] = []
+        view.session.terminal.onInput = { sent.append($0) }
+        // Kitty keyboard flags 1 | 2: disambiguate, and report releases.
+        try view.session.feed(Data("\u{1b}[>3u".utf8))
+        func key(_ type: NSEvent.EventType, _ code: UInt16, _ flags: NSEvent.ModifierFlags = [], _ text: String) throws -> NSEvent {
+            try #require(NSEvent.keyEvent(
+                with: type, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: 0,
+                context: nil, characters: text, charactersIgnoringModifiers: text, isARepeat: false, keyCode: code))
+        }
+        // A release whose press went elsewhere, such as ⌘C's, says nothing.
+        view.keyUp(with: try key(.keyUp, 8, .command, "c"))
+        #expect(sent.isEmpty)
+        view.keyDown(with: try key(.keyDown, 53, [], "\u{1b}"))
+        view.keyUp(with: try key(.keyUp, 53, [], "\u{1b}"))
+        #expect(sent.count == 2)
+        // Only once.
+        view.keyUp(with: try key(.keyUp, 53, [], "\u{1b}"))
+        #expect(sent.count == 2)
+    }
+
+    @Test func rightClickOnALinkOffersToOpenAndCopyIt() throws {
+        let view = try makeView(feeding: "\u{1b}]8;;https://termy.sh/\u{1b}\\link\u{1b}]8;;\u{1b}\\")
+        view.pasteboard = privatePasteboard()
+        let menu = try #require(view.menu(for: rightClick(view, row: 0, col: 1)))
+        #expect(Array(menu.items.prefix(2).map(\.title)) == ["Open Link", "Copy Link"])
+        let copyLink = menu.items[1]
+        _ = (copyLink.target as AnyObject?)?.perform(copyLink.action, with: copyLink)
+        #expect(view.pasteboard.string(forType: .string) == "https://termy.sh/")
+    }
+
+    @Test func rendersCellBackgrounds() throws {
+        let view = try makeView(feeding: "\u{1b}[41m  \u{1b}[0m")
+        let bitmap = try render(view)
+        let red = try color(in: bitmap, view: view, row: 0, col: 0)
+        #expect(red.redComponent > 0.5)
+        #expect(red.greenComponent < 0.4)
+
+        let background = try color(in: bitmap, view: view, row: 3, col: 10)
+        let expected = view.renderConfig.background
+        #expect(abs(background.redComponent - CGFloat(expected.r) / 255) < 0.05)
+        #expect(abs(background.blueComponent - CGFloat(expected.b) / 255) < 0.05)
+    }
+
+    @Test func rendersGlyphsInsideTheirCells() throws {
+        let view = try makeView(feeding: "\u{1b}[37mHH")
+        let bitmap = try render(view)
+        let rect = view.renderer.cellRect(row: 0, col: 0, width: 2)
+        let scale = CGFloat(bitmap.pixelsWide) / view.bounds.width
+        var brightest: CGFloat = 0
+        for y in Int(rect.minY * scale)..<Int(rect.maxY * scale) {
+            for x in Int(rect.minX * scale)..<Int(rect.maxX * scale) {
+                guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                brightest = max(brightest, color.greenComponent)
+            }
+        }
+        #expect(brightest > 0.5)
+    }
+
+    @Test func unicodePlaceholderCellsShowTheirTileOfTheImage() throws {
+        // A 2x1 image (red, then green) shown through two placeholder cells.
+        let view = try makeView(feeding:
+            "\u{1b}_Ga=T,f=32,s=2,v=1,i=7,U=1,c=2,r=1,q=2;/wAA/wD/AP8=\u{1b}\\"
+            + "\u{1b}[38;5;7m\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}\u{1b}[39m")
+        let bitmap = try render(view)
+        let left = try color(in: bitmap, view: view, row: 0, col: 0)
+        let right = try color(in: bitmap, view: view, row: 0, col: 1)
+        #expect(left.redComponent > 0.8 && left.greenComponent < 0.25)
+        #expect(right.greenComponent > 0.8 && right.redComponent < 0.25)
+    }
+
+    @Test func viewsThatAreNotFocusedOrVisibleDoNotBlink() throws {
+        let config = try TermyConfig(contents: "cursor_blink = true\n")
+        let render = try config.renderConfig(for: .dark)
+        let session = try TerminalSession.display(
+            size: TerminalSize(cols: 20, rows: 5, cellWidth: render.cellWidth, cellHeight: render.cellHeight))
+        let view = TerminalView(session: session, renderConfig: render, backend: .coreGraphics)
+        _ = NSApplication.shared
+        // A window that is neither key nor on screen, like a background tab.
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: view.size(cols: 20, rows: 5)),
+            styleMask: [.borderless], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        #expect(!view.isOnScreen)
+        #expect(!view.isBlinking)
+        _ = view.becomeFirstResponder()
+        #expect(!view.isBlinking)
+        try session.feed(Data("moved".utf8))
+        #expect(!view.isBlinking)
+        _ = view.resignFirstResponder()
+        #expect(!view.isBlinking)
+        window.contentView = nil
+    }
+
+    @Test func viewsNobodyCanSeePauseTheirTerminalsWakeups() throws {
+        let view = try makeView()
+        _ = NSApplication.shared
+        // Not in a window yet: nothing has asked it to pause.
+        #expect(!view.wakeupsPaused)
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: view.frame.size),
+            styleMask: [.borderless], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        // A window that isn't on screen, like a background tab's.
+        window.contentView = view
+        #expect(view.wakeupsPaused)
+        window.contentView = nil
+        #expect(view.wakeupsPaused)
+        // Output is still read on demand while paused.
+        try view.session.feed(Data("still here".utf8))
+        #expect(view.session.frame.text(row: 0) == "still here")
+    }
+
+    @Test func selectionCopiesText() throws {
+        let view = try makeView(feeding: "hello world\r\nsecond")
+        view.selection = TerminalSelection(
+            anchor: GridPosition(row: 0, col: 6), head: GridPosition(row: 1, col: 2))
+        #expect(view.selection?.text(in: view.session.frame) == "world\nsec")
+
+        view.selection = TerminalSelection(anchor: GridPosition(row: 0, col: 2), granularity: .word)
+        #expect(view.selection?.text(in: view.session.frame) == "hello")
+
+        view.selection = TerminalSelection(anchor: GridPosition(row: 1, col: 0), granularity: .line)
+        #expect(view.selection?.text(in: view.session.frame) == "second")
+    }
+
+    @Test func selectionFollowsScrolledTextAndGoesWithIt() throws {
+        let view = try makeView(feeding: "zero\r\nhello\r\ntwo")
+        view.selection = TerminalSelection(anchor: GridPosition(row: 1, col: 0), head: GridPosition(row: 1, col: 4))
+        #expect(view.selection?.text(in: view.session.frame) == "hello")
+        // Output scrolls it up a row.
+        try view.session.feed(Data("\r\nthree\r\nfour\r\nfive".utf8))
+        #expect(view.selection?.start.row == 0)
+        #expect(view.selection?.text(in: view.session.frame) == "hello")
+        // Into history, and back into view by scrolling.
+        try view.session.feed(Data("\r\nsix\r\nseven".utf8))
+        #expect(view.selection?.start.row == -2)
+        view.session.scroll(lines: 3)
+        #expect(view.selection?.start.row == 1)
+        #expect(view.selection?.text(in: view.session.frame) == "hello")
+        view.session.scrollToBottom()
+        // Erasing the text it covered ends it.
+        view.session.scroll(lines: 2)
+        #expect(view.selection?.text(in: view.session.frame) == "hello")
+        view.session.scrollToBottom()
+        try view.session.feed(Data("\u{1b}[3J\u{1b}[2J".utf8))
+        #expect(view.selection == nil)
+
+        // So does a screen switch.
+        try view.session.feed(Data("\u{1b}[Hkeep".utf8))
+        view.selection = TerminalSelection(anchor: GridPosition(row: 0, col: 0), head: GridPosition(row: 0, col: 3))
+        #expect(view.selection?.text(in: view.session.frame) == "keep")
+        try view.session.feed(Data("\u{1b}[?1049h\u{1b}[Hother".utf8))
+        #expect(view.selection == nil)
+    }
+
+    @Test func copyReportsTextAndSelectionRects() throws {
+        final class Recorder: TerminalViewDelegate {
+            var copied: [String] = []
+            func terminalView(_ view: TerminalView, didCopy text: String) { copied.append(text) }
+        }
+        let view = try makeView(feeding: "hello world\r\nsecond")
+        let pasteboard = privatePasteboard()
+        defer { pasteboard.releaseGlobally() }
+        view.pasteboard = pasteboard
+        let recorder = Recorder()
+        view.delegate = recorder
+
+        #expect(view.selectionRects.isEmpty)
+        view.copy(nil)
+        #expect(recorder.copied.isEmpty)
+
+        view.selection = TerminalSelection(
+            anchor: GridPosition(row: 0, col: 6), head: GridPosition(row: 1, col: 2))
+        view.copy(nil)
+        #expect(recorder.copied == ["world\nsec"])
+        #expect(pasteboard.string(forType: .string) == "world\nsec")
+
+        let rects = view.selectionRects
+        let cell = CGSize(width: CGFloat(view.renderConfig.cellWidth), height: CGFloat(view.renderConfig.cellHeight))
+        #expect(rects.count == 2)
+        #expect(rects[0].width == cell.width * CGFloat(view.session.frame.cols - 6))
+        #expect(rects[1].minX == CGFloat(view.renderConfig.paddingX))
+        #expect(rects[1].width == cell.width * 3)
+        #expect(rects[1].minY == rects[0].maxY)
+    }
+
+    @Test func searchMatchesMapToRectsAndScrollIntoView() throws {
+        let lines = (0..<60).map { "line \($0)" }.joined(separator: "\r\n") + "\r\nneedle here"
+        let view = try makeView(feeding: lines)
+        let matches = try view.session.terminal.search("needle")
+        let needle = try #require(matches.first)
+        let rect = try #require(view.rect(for: needle))
+        let cellWidth = CGFloat(view.renderConfig.cellWidth)
+        #expect(rect.width == cellWidth * 6)
+        #expect(rect.minX == CGFloat(view.renderConfig.paddingX))
+
+        let old = try #require(try view.session.terminal.search("line 3").first)
+        #expect(view.rect(for: old) == nil)
+        view.reveal(old)
+        #expect(view.session.frame.displayOffset > 0)
+        #expect(view.rect(for: old) != nil)
+    }
+
+    @Test func dropsTypeQuotedPathsAndSaveImages() throws {
+        let pasteboard = privatePasteboard()
+        defer { pasteboard.releaseGlobally() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("termy-drop-test-\(UUID().uuidString.prefix(6))")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        pasteboard.clearContents()
+        pasteboard.writeObjects([URL(fileURLWithPath: "/tmp/plain.txt") as NSURL, URL(fileURLWithPath: "/tmp/with space.png") as NSURL])
+        #expect(TerminalView.dropText(from: pasteboard, savingImagesIn: directory) == "/tmp/plain.txt '/tmp/with space.png' ")
+
+        // An image without a file is saved as PNG and its path typed.
+        let image = NSImage(size: NSSize(width: 4, height: 4))
+        image.lockFocus(); NSColor.red.setFill(); NSRect(x: 0, y: 0, width: 4, height: 4).fill(); image.unlockFocus()
+        pasteboard.clearContents()
+        pasteboard.setData(image.tiffRepresentation, forType: .tiff)
+        let text = try #require(TerminalView.dropText(from: pasteboard, savingImagesIn: directory))
+        let path = String(text.dropFirst().dropLast(2))  // strip the quotes and trailing space
+        #expect(text.hasSuffix("' "))
+        let saved = try Data(contentsOf: URL(fileURLWithPath: path))
+        #expect(saved.starts(with: [0x89, 0x50, 0x4E, 0x47]))
+
+        pasteboard.clearContents()
+        pasteboard.setString("just text", forType: .string)
+        #expect(TerminalView.dropText(from: pasteboard, savingImagesIn: directory) == "just text")
+        #expect(TerminalView.canDrop(pasteboard))
+    }
+
+    /// Nerd Font icons (here the octicons git branch, U+F418) come from an
+    /// installed Nerd Font, not the system's LastResort box. Skipped when no
+    /// Nerd Font is installed.
+    @Test func iconGlyphsComeFromAnInstalledNerdFont() throws {
+        guard !TerminalFonts.symbolFonts(size: 13).isEmpty,
+              NSFontManager.shared.availableFontFamilies.contains(where: { $0.lowercased().contains("nerd font") }) else { return }
+        let fonts = TerminalFonts(fontFamily: "Menlo", fontSize: 13)
+        let glyph = try #require(fonts.glyph(for: 0xF418, style: .regular))
+        let name = CTFontCopyPostScriptName(fonts.font(at: glyph.fontIndex)) as String
+        #expect(!name.hasPrefix("LastResort"))
+        let symbolNames = TerminalFonts.symbolFonts(size: 13).map { CTFontCopyPostScriptName($0) as String }
+        #expect(symbolNames.contains(name))
+    }
+
+    @Test func boxDrawingUsesGlyphGeometry() throws {
+        let view = try makeView(feeding: "┌─┐")
+        #expect(Set(view.glyphPlan.keys) == [0, 1, 2])
+        try view.session.feed(Data("\r\u{1b}[Kabc".utf8))
+        #expect(view.glyphPlan.isEmpty)
+    }
+
+    @Test func programsCannotWriteTheClipboardUnlessTheHostAllows() throws {
+        let view = try makeView()
+        let pasteboard = privatePasteboard()
+        defer { pasteboard.releaseGlobally() }
+        view.pasteboard = pasteboard
+        pasteboard.clearContents()
+        pasteboard.setString("mine", forType: .string)
+        let store = Data("\u{1b}]52;c;c3RvcmVkIHRleHQ=\u{7}".utf8)
+
+        try view.session.feed(store)
+        #expect(pasteboard.string(forType: .string) == "mine")
+
+        let delegate = Delegate()
+        view.delegate = delegate
+        try view.session.feed(store)
+        #expect(delegate.clipboardRequests == ["stored text"])
+        #expect(pasteboard.string(forType: .string) == "mine")
+
+        delegate.allowsClipboardWrites = true
+        try view.session.feed(store)
+        #expect(pasteboard.string(forType: .string) == "stored text")
+    }
+
+    @Test func linksOpenOnlySafeTargets() throws {
+        func action(for uri: String, schemes: Set<String>? = nil, delegate: Delegate? = nil) throws -> TerminalView.LinkAction? {
+            let view = try makeView(feeding: "\u{1b}]8;;\(uri)\u{1b}\\L\u{1b}]8;;\u{1b}\\")
+            if let schemes { view.allowedLinkSchemes = schemes }
+            view.delegate = delegate
+            return view.linkAction(at: GridPosition(row: 0, col: 0))
+        }
+        let web = try #require(URL(string: "https://example.com/docs"))
+        #expect(try action(for: web.absoluteString) == .open(web))
+        #expect(try action(for: "HTTPS://example.com") != nil)
+        // Link text is chosen by the program, so file and ftp targets are opt-in.
+        #expect(try action(for: "file:///tmp/notes.txt") == nil)
+        #expect(try action(for: "ftp://example.com/x.app") == nil)
+
+        let files: Set<String> = ["FILE"]
+        let notes = try #require(URL(string: "file:///tmp/notes.txt"))
+        #expect(try action(for: notes.absoluteString, schemes: files) == .open(notes))
+        let app = try #require(URL(string: "file:///Applications/Calculator.app"))
+        #expect(try action(for: app.absoluteString, schemes: files) == .reveal(app))
+
+        let veto = Delegate()
+        veto.allowsLinks = false
+        #expect(try action(for: web.absoluteString, delegate: veto) == nil)
+    }
+
+    @Test func urlsAndPathsInTextOpen() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("termy-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let notes = directory.appendingPathComponent("notes.txt")
+        let tool = directory.appendingPathComponent("tool")
+        FileManager.default.createFile(atPath: notes.path, contents: Data())
+        FileManager.default.createFile(atPath: tool.path, contents: Data("#!/bin/sh\n".utf8), attributes: [.posixPermissions: 0o755])
+
+        let view = try makeView(feeding: "https://example.com/docs \(notes.path) \(tool.path)", cols: 300)
+        let urlEnd = "https://example.com/docs".count
+        #expect(view.linkAction(at: GridPosition(row: 0, col: 3)) == .open(try #require(URL(string: "https://example.com/docs"))))
+        #expect(view.linkAction(at: GridPosition(row: 0, col: urlEnd)) == nil)
+
+        let notesAction = try #require(view.linkAction(at: GridPosition(row: 0, col: urlEnd + 3)))
+        guard case .open(let notesURL) = notesAction else { Issue.record("\(notesAction)"); return }
+        #expect(notesURL.isFileURL)
+        #expect(notesURL.resolvingSymlinksInPath().path == notes.resolvingSymlinksInPath().path)
+        // Executables are shown in Finder, not run.
+        let toolCol = urlEnd + 1 + notes.path.count + 3
+        guard case .reveal = view.linkAction(at: GridPosition(row: 0, col: toolCol)) else {
+            Issue.record("tool path should be revealed"); return
+        }
+
+        view.opensFilePaths = false
+        #expect(view.linkAction(at: GridPosition(row: 0, col: urlEnd + 3)) == nil)
+    }
+
+    @Test func commandHoverUnderlinesTheLink() throws {
+        let view = try makeView(feeding: "go https://example.com now", cols: 40)
+        let onLink = GridPosition(row: 0, col: 6)
+        view.updateHoveredLink(at: onLink, modifiers: [])
+        #expect(view.hoveredLink == nil)
+
+        view.updateHoveredLink(at: onLink, modifiers: .command)
+        let hovered = try #require(view.hoveredLink)
+        #expect(hovered.link.start == GridPosition(row: 0, col: 3))
+        #expect(hovered.link.end == GridPosition(row: 0, col: 21))
+        let underline = try #require(view.linkUnderline)
+        #expect(underline.superview === view)
+        #expect(underline.rects.count == 1)
+        #expect(underline.hitTest(NSPoint(x: 10, y: 10)) == nil)
+
+        view.updateHoveredLink(at: GridPosition(row: 0, col: 0), modifiers: .command)
+        #expect(view.hoveredLink == nil)
+        #expect(view.linkUnderline == nil)
+
+        view.updateHoveredLink(at: onLink, modifiers: .command)
+        view.updateHoveredLink(at: onLink, modifiers: [])
+        #expect(view.hoveredLink == nil)
+    }
+
+    @Test func launchableFilesAreRecognized() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("termy-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let tool = directory.appendingPathComponent("tool")
+        let notes = directory.appendingPathComponent("notes.txt")
+        FileManager.default.createFile(atPath: tool.path, contents: Data("#!/bin/sh\n".utf8), attributes: [.posixPermissions: 0o755])
+        FileManager.default.createFile(atPath: notes.path, contents: Data(), attributes: [.posixPermissions: 0o644])
+
+        #expect(TerminalView.isLaunchable(tool))
+        #expect(!TerminalView.isLaunchable(notes))
+        #expect(!TerminalView.isLaunchable(directory))
+        #expect(TerminalView.isLaunchable(directory.appendingPathComponent("Run.command")))
+        #expect(TerminalView.isLaunchable(directory.appendingPathComponent("Thing.APP")))
+    }
+
+    @Test func pastedFilesBecomeQuotedPaths() throws {
+        let view = try makeView()
+        let pasteboard = privatePasteboard()
+        defer { pasteboard.releaseGlobally() }
+        view.pasteboard = pasteboard
+        var sent = Data()
+        view.session.terminal.onInput = { sent.append($0) }
+
+        pasteboard.clearContents()
+        pasteboard.writeObjects([
+            URL(fileURLWithPath: "/tmp/my dir/it's $(id)") as NSURL,
+            URL(fileURLWithPath: "/tmp/plain-1.txt") as NSURL,
+        ])
+        view.paste(nil)
+        #expect(String(decoding: sent, as: UTF8.self) == "'/tmp/my dir/it'\\''s $(id)' /tmp/plain-1.txt")
+
+        sent.removeAll()
+        pasteboard.clearContents()
+        pasteboard.setString("echo hi", forType: .string)
+        view.paste(nil)
+        #expect(String(decoding: sent, as: UTF8.self) == "echo hi")
+
+        #expect(TerminalView.shellQuoted("") == "''")
+        #expect(TerminalView.shellQuoted("a/b_c.d") == "a/b_c.d")
+    }
+
+    @Test func pasteWritesThroughTheSession() throws {
+        let view = try makeView()
+        var sent = Data()
+        view.session.terminal.onInput = { sent.append($0) }
+        try view.session.paste("echo hi")
+        #expect(String(decoding: sent, as: UTF8.self) == "echo hi")
+    }
+}

@@ -1,8 +1,8 @@
 use super::*;
-use termy_plugin_runtime::{PluginInventory, PluginSetting};
+use termy_core::plugin_runtime::{PLUGIN_FULL_ACCESS_WARNING, PluginInventory, PluginSetting};
 
-const PLUGIN_SETTING_CONTROL_WIDTH: f32 = 228.0;
-const PLUGIN_SETTING_CONTROL_HEIGHT: f32 = 28.0;
+const PLUGIN_SETTING_CONTROL_WIDTH: f32 = SETTINGS_CONTROL_WIDTH;
+const PLUGIN_SETTING_CONTROL_HEIGHT: f32 = SETTINGS_CONTROL_HEIGHT;
 
 #[derive(Clone, Debug)]
 pub(super) struct ActivePluginSettingInput {
@@ -34,7 +34,17 @@ impl SettingsWindow {
         let settings = runtime.plugin_settings_snapshot();
         runtime.suspend_if_eventless();
         let mut inventory_errors = inventory_errors;
-        inventory_errors.extend(refresh.errors);
+        // The refresh reports plugins it skipped with the same message the
+        // inventory already shows, in this list or on the plugin's row.
+        for error in refresh.errors {
+            if !inventory_errors.contains(&error)
+                && !plugins
+                    .iter()
+                    .any(|plugin| plugin.error.as_ref() == Some(&error))
+            {
+                inventory_errors.push(error);
+            }
+        }
         inventory_errors.extend(settings.errors);
         PluginSettingsSnapshot {
             plugins,
@@ -62,8 +72,10 @@ impl SettingsWindow {
         cx.notify();
         let runtime = self.plugin_runtime.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let snapshot =
-                smol::unblock(move || Self::load_plugin_settings_snapshot(&runtime)).await;
+            let snapshot = cx
+                .background_executor()
+                .spawn(async move { Self::load_plugin_settings_snapshot(&runtime) })
+                .await;
             let _ = cx.update(|cx| {
                 this.update(cx, |view, cx| {
                     view.apply_plugin_settings_snapshot(snapshot);
@@ -89,18 +101,19 @@ impl SettingsWindow {
         cx.notify();
         let runtime = self.plugin_runtime.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let (result, snapshot) = smol::unblock(move || {
-                let result = runtime.set_plugin_setting(&plugin_id, &key, value);
-                let snapshot = Self::load_plugin_settings_snapshot(&runtime);
-                (result, snapshot)
-            })
-            .await;
+            let (result, snapshot) = cx
+                .background_executor()
+                .spawn(async move {
+                    let result = runtime.set_plugin_setting(&plugin_id, &key, value);
+                    let snapshot = Self::load_plugin_settings_snapshot(&runtime);
+                    (result, snapshot)
+                })
+                .await;
             let _ = cx.update(|cx| {
                 this.update(cx, |view, cx| {
                     view.apply_plugin_settings_snapshot(snapshot);
-                    match result {
-                        Ok(()) => crate::ui::toast::success("Plugin setting saved"),
-                        Err(error) => crate::ui::toast::error(error),
+                    if let Err(error) = result {
+                        crate::ui::toast::error(error);
                     }
                     cx.notify();
                 })
@@ -124,18 +137,19 @@ impl SettingsWindow {
         cx.notify();
         let runtime = self.plugin_runtime.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let (result, snapshot) = smol::unblock(move || {
-                let result = runtime.reset_plugin_setting(&plugin_id, &key);
-                let snapshot = Self::load_plugin_settings_snapshot(&runtime);
-                (result, snapshot)
-            })
-            .await;
+            let (result, snapshot) = cx
+                .background_executor()
+                .spawn(async move {
+                    let result = runtime.reset_plugin_setting(&plugin_id, &key);
+                    let snapshot = Self::load_plugin_settings_snapshot(&runtime);
+                    (result, snapshot)
+                })
+                .await;
             let _ = cx.update(|cx| {
                 this.update(cx, |view, cx| {
                     view.apply_plugin_settings_snapshot(snapshot);
-                    match result {
-                        Ok(()) => crate::ui::toast::success("Plugin setting reset"),
-                        Err(error) => crate::ui::toast::error(error),
+                    if let Err(error) = result {
+                        crate::ui::toast::error(error);
                     }
                     cx.notify();
                 })
@@ -164,7 +178,7 @@ impl SettingsWindow {
             state: TextInputState::new(value),
             selecting: false,
         });
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -189,7 +203,7 @@ impl SettingsWindow {
             input.state.set_cursor_utf16(index);
         }
         input.selecting = event.click_count == 1;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -306,6 +320,7 @@ impl SettingsWindow {
         }
         self.plugin_operation_in_flight = true;
         cx.notify();
+        let runtime = self.plugin_runtime.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let folder = rfd::AsyncFileDialog::new()
                 .set_title("Install Termy Plugin")
@@ -325,30 +340,26 @@ impl SettingsWindow {
             let folder_name = path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or("this plugin")
-                .to_string();
-            let _ = cx.update(|cx| {
-                this.update(cx, |view, cx| {
-                    view.pending_confirmation = Some(PendingSettingsConfirmation::InstallPlugin {
-                        path,
-                        name: folder_name,
-                    });
-                    cx.notify();
-                })
-            });
-        })
-        .detach();
-    }
+                .unwrap_or("this plugin");
+            let message = format!("Install \"{folder_name}\"?\n\n{PLUGIN_FULL_ACCESS_WARNING}");
+            if !crate::native_sdk::confirm("Install Plugin", &message) {
+                let _ = cx.update(|cx| {
+                    this.update(cx, |view, cx| {
+                        view.plugin_operation_in_flight = false;
+                        cx.notify();
+                    })
+                });
+                return;
+            }
 
-    pub(super) fn install_plugin_from_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let runtime = self.plugin_runtime.clone();
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let (result, snapshot) = smol::unblock(move || {
-                let result = runtime.install_from_directory(&path);
-                let snapshot = Self::load_plugin_settings_snapshot(&runtime);
-                (result, snapshot)
-            })
-            .await;
+            let (result, snapshot) = cx
+                .background_executor()
+                .spawn(async move {
+                    let result = runtime.install_from_directory(&path);
+                    let snapshot = Self::load_plugin_settings_snapshot(&runtime);
+                    (result, snapshot)
+                })
+                .await;
             let _ = cx.update(|cx| {
                 this.update(cx, |view, cx| {
                     view.apply_plugin_settings_snapshot(snapshot);
@@ -359,7 +370,6 @@ impl SettingsWindow {
                         )),
                         Err(error) => crate::ui::toast::error(error),
                     }
-                    view.plugin_operation_in_flight = false;
                     cx.notify();
                 })
             });
@@ -380,12 +390,14 @@ impl SettingsWindow {
         cx.notify();
         let runtime = self.plugin_runtime.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let (result, snapshot) = smol::unblock(move || {
-                let result = runtime.set_plugin_enabled(&id, enabled);
-                let snapshot = Self::load_plugin_settings_snapshot(&runtime);
-                (result, snapshot)
-            })
-            .await;
+            let (result, snapshot) = cx
+                .background_executor()
+                .spawn(async move {
+                    let result = runtime.set_plugin_enabled(&id, enabled);
+                    let snapshot = Self::load_plugin_settings_snapshot(&runtime);
+                    (result, snapshot)
+                })
+                .await;
             let _ = cx.update(|cx| {
                 this.update(cx, |view, cx| {
                     view.apply_plugin_settings_snapshot(snapshot);
@@ -405,24 +417,31 @@ impl SettingsWindow {
         if self.plugin_operation_in_flight {
             return;
         }
-        self.pending_confirmation = Some(PendingSettingsConfirmation::UninstallPlugin { id, name });
-        cx.notify();
-    }
-
-    pub(super) fn uninstall_plugin(&mut self, id: String, cx: &mut Context<Self>) {
-        if self.plugin_operation_in_flight {
-            return;
-        }
         self.plugin_operation_in_flight = true;
         cx.notify();
         let runtime = self.plugin_runtime.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let (result, snapshot) = smol::unblock(move || {
-                let result = runtime.uninstall_plugin(&id);
-                let snapshot = Self::load_plugin_settings_snapshot(&runtime);
-                (result, snapshot)
-            })
-            .await;
+            let message = format!(
+                "Uninstall \"{name}\"? Its copied plugin directory will be permanently removed."
+            );
+            if !crate::native_sdk::confirm("Uninstall Plugin", &message) {
+                let _ = cx.update(|cx| {
+                    this.update(cx, |view, cx| {
+                        view.plugin_operation_in_flight = false;
+                        cx.notify();
+                    })
+                });
+                return;
+            }
+
+            let (result, snapshot) = cx
+                .background_executor()
+                .spawn(async move {
+                    let result = runtime.uninstall_plugin(&id);
+                    let snapshot = Self::load_plugin_settings_snapshot(&runtime);
+                    (result, snapshot)
+                })
+                .await;
             let _ = cx.update(|cx| {
                 this.update(cx, |view, cx| {
                     view.apply_plugin_settings_snapshot(snapshot);
@@ -484,18 +503,17 @@ impl SettingsWindow {
         visible: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let view = cx.entity();
-        termy_ui::Button::new(format!("plugin-setting-reset-{plugin_id}-{key}"), "Reset")
-            .variant(termy_ui::ButtonVariant::Ghost)
-            .size(termy_ui::ButtonSize::Small)
-            .disabled(!visible)
-            .when(!visible, |button| button.opacity(0.0))
-            .on_click(move |_, _, cx| {
-                view.update(cx, |view, cx| {
-                    view.reset_plugin_setting_from_settings(plugin_id.clone(), key.clone(), cx);
-                });
-            })
-            .into_any_element()
+        self.render_setting_action_button(
+            SharedString::from(format!("plugin-setting-reset-{plugin_id}-{key}")),
+            "icons/settings/reset.svg",
+            "Reset to default",
+            visible,
+            cx,
+            move |view, _, cx| {
+                view.reset_plugin_setting_from_settings(plugin_id.clone(), key.clone(), cx);
+            },
+        )
+        .into_any_element()
     }
 
     fn render_plugin_text_setting_control(
@@ -518,7 +536,7 @@ impl SettingsWindow {
         let input_bg = self.bg_input();
         let font = Font {
             family: self.config.ui_font_family.clone().into(),
-            ..gpui::font("")
+            ..gpui_kit::font("")
         };
         let display = if secret {
             if configured {
@@ -612,6 +630,9 @@ impl SettingsWindow {
             .bg(input_bg)
             .border_1()
             .border_color(if active { accent } else { idle_border })
+            .when(active, |s| {
+                s.shadow(vec![Self::focus_ring_shadow(self.input_focus_ring())])
+            })
             .overflow_hidden()
             .cursor_text()
             .on_mouse_down(
@@ -652,7 +673,7 @@ impl SettingsWindow {
         plugin_id: String,
         key: String,
         value: String,
-        options: Vec<termy_plugin_runtime::PluginSettingOption>,
+        options: Vec<termy_core::plugin_runtime::PluginSettingOption>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self
@@ -800,6 +821,7 @@ impl SettingsWindow {
                 let toggle_key = key.clone();
                 self.render_switch(
                     SharedString::from(format!("plugin-setting-toggle-{plugin_id}-{key}")),
+                    title.clone(),
                     checked,
                     cx,
                     move |view, _, cx| {
@@ -867,7 +889,7 @@ impl SettingsWindow {
                     .child(
                         div()
                             .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
                             .text_color(self.text_primary())
                             .child(title),
                     )
@@ -882,6 +904,7 @@ impl SettingsWindow {
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
                     .gap_2()
                     .child(control)
@@ -918,6 +941,7 @@ impl SettingsWindow {
                     self.render_plugin_actions_row(cx),
                 ],
             ))
+            .child(self.render_plugin_trust_notice())
             .child(self.render_settings_group("Installed plugins", installed_rows));
 
         for (plugin_id, settings) in self.plugin_settings.clone() {
@@ -943,7 +967,7 @@ impl SettingsWindow {
             section = section.child(self.render_plugin_errors());
         }
 
-        section.child(self.render_plugin_trust_notice())
+        section
     }
 
     fn render_plugin_runtime_row(&self) -> AnyElement {
@@ -975,7 +999,7 @@ impl SettingsWindow {
                     .child(
                         div()
                             .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
                             .text_color(self.text_primary())
                             .child("Bun runtime"),
                     )
@@ -984,7 +1008,7 @@ impl SettingsWindow {
             .child(
                 div()
                     .text_xs()
-                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
                     .text_color(status_color)
                     .child(status),
             )
@@ -993,36 +1017,81 @@ impl SettingsWindow {
 
     fn render_plugin_actions_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let busy = self.plugin_operation_in_flight;
+        let border = self.border_color();
+        let hover = self.bg_hover();
+        let text_primary = self.text_primary();
+        let text_secondary = self.text_secondary();
         let muted = self.text_muted();
-        let ui = termy_ui::tokens(cx);
-        let install_view = cx.entity();
-        let install_button = termy_ui::Button::new("plugin-install-folder", "Install from folder")
-            .size(termy_ui::ButtonSize::Small)
-            .bg(ui.accent)
-            .border_color(ui.accent)
-            .text_color(ui.text_on_accent)
-            .loading(busy)
-            .disabled(busy)
-            .on_click(move |_, _, cx| {
-                install_view.update(cx, |view, cx| view.install_plugin_from_folder(cx));
+        let button_bg = self.bg_input();
+        let accent = self.accent();
+        let accent_hover = self.accent_with_alpha(0.85);
+        let button_text = self.contrasting_text_for_fill(accent, self.bg_card());
+
+        let install_button = div()
+            .id("plugin-install-folder")
+            .h(px(28.0))
+            .px_3()
+            .rounded(px(SETTINGS_BUTTON_RADIUS))
+            .bg(accent)
+            .text_xs()
+            .font_weight(gpui_kit::FontWeight::MEDIUM)
+            .text_color(button_text)
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(busy, |button| button.opacity(0.55))
+            .when(!busy, |button| {
+                button
+                    .hover(move |style| style.bg(accent_hover))
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.install_plugin_from_folder(cx);
+                    }))
+            })
+            .child(if busy {
+                "Working..."
+            } else {
+                "Install from folder"
             });
 
-        let open_view = cx.entity();
-        let open_button = termy_ui::Button::new("plugin-open-folder", "Open folder")
-            .variant(termy_ui::ButtonVariant::Secondary)
-            .size(termy_ui::ButtonSize::Small)
-            .on_click(move |_, _, cx| {
-                open_view.update(cx, |view, _| view.open_plugins_directory());
-            });
+        let open_button = div()
+            .id("plugin-open-folder")
+            .h(px(28.0))
+            .px_3()
+            .rounded(px(SETTINGS_BUTTON_RADIUS))
+            .border_1()
+            .border_color(border)
+            .bg(button_bg)
+            .text_xs()
+            .font_weight(gpui_kit::FontWeight::MEDIUM)
+            .text_color(text_secondary)
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .hover(move |style| style.bg(hover).text_color(text_primary))
+            .child("Open folder")
+            .on_click(cx.listener(|view, _, _, _| view.open_plugins_directory()));
 
-        let refresh_view = cx.entity();
-        let refresh_button = termy_ui::Button::new("plugin-refresh", "Refresh")
-            .variant(termy_ui::ButtonVariant::Ghost)
-            .size(termy_ui::ButtonSize::Small)
-            .disabled(busy)
-            .on_click(move |_, _, cx| {
-                refresh_view.update(cx, |view, cx| view.refresh_plugin_settings(cx));
-            });
+        let refresh_button = div()
+            .id("plugin-refresh")
+            .h(px(28.0))
+            .px_3()
+            .rounded(px(SETTINGS_BUTTON_RADIUS))
+            .text_xs()
+            .font_weight(gpui_kit::FontWeight::MEDIUM)
+            .text_color(muted)
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(busy, |button| button.opacity(0.55))
+            .when(!busy, |button| {
+                button
+                    .hover(move |style| style.bg(hover).text_color(text_primary))
+                    .on_click(cx.listener(|view, _, _, cx| view.refresh_plugin_settings(cx)))
+            })
+            .child("Refresh");
 
         div()
             .w_full()
@@ -1040,7 +1109,7 @@ impl SettingsWindow {
                     .child(
                         div()
                             .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
                             .text_color(self.text_primary())
                             .child("Local plugins"),
                     )
@@ -1075,7 +1144,7 @@ impl SettingsWindow {
             .child(
                 div()
                     .text_sm()
-                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
                     .text_color(self.text_primary())
                     .child("No plugins installed"),
             )
@@ -1094,7 +1163,11 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let busy = self.plugin_operation_in_flight;
+        let border = self.border_color();
+        let button_bg = self.bg_input();
+        let hover = self.bg_hover();
         let text_primary = self.text_primary();
+        let text_secondary = self.text_secondary();
         let muted = self.text_muted();
         let has_error = plugin.error.is_some();
         let enabled = plugin.enabled && !has_error;
@@ -1122,36 +1195,63 @@ impl SettingsWindow {
         let uninstall_id = plugin.id.clone();
         let uninstall_name = plugin.name.clone();
 
-        let enabled = plugin.enabled;
-        let toggle_view = cx.entity();
-        let toggle_button = termy_ui::Button::new(
-            format!("plugin-toggle-{}", plugin.id),
-            if enabled { "Disable" } else { "Enable" },
-        )
-        .variant(termy_ui::ButtonVariant::Secondary)
-        .size(termy_ui::ButtonSize::Small)
-        .disabled(busy || has_error)
-        .on_click(move |_, _, cx| {
-            toggle_view.update(cx, |view, cx| {
-                view.set_plugin_enabled_from_settings(toggle_id.clone(), !enabled, cx);
-            });
-        });
+        let toggle_button = div()
+            .id(SharedString::from(format!("plugin-toggle-{}", plugin.id)))
+            .h(px(27.0))
+            .px_3()
+            .rounded(px(SETTINGS_BUTTON_RADIUS))
+            .border_1()
+            .border_color(border)
+            .bg(button_bg)
+            .text_xs()
+            .font_weight(gpui_kit::FontWeight::MEDIUM)
+            .text_color(text_secondary)
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(busy || has_error, |button| button.opacity(0.55))
+            .when(!busy && !has_error, |button| {
+                button
+                    .hover(move |style| style.bg(hover).text_color(text_primary))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.set_plugin_enabled_from_settings(
+                            toggle_id.clone(),
+                            !plugin.enabled,
+                            cx,
+                        );
+                    }))
+            })
+            .child(if plugin.enabled { "Disable" } else { "Enable" });
 
-        let uninstall_view = cx.entity();
-        let uninstall_button =
-            termy_ui::Button::new(format!("plugin-uninstall-{}", plugin.id), "Uninstall")
-                .variant(termy_ui::ButtonVariant::Ghost)
-                .size(termy_ui::ButtonSize::Small)
-                .disabled(busy)
-                .on_click(move |_, _, cx| {
-                    uninstall_view.update(cx, |view, cx| {
+        let uninstall_button = div()
+            .id(SharedString::from(format!(
+                "plugin-uninstall-{}",
+                plugin.id
+            )))
+            .h(px(27.0))
+            .px_3()
+            .rounded(px(SETTINGS_BUTTON_RADIUS))
+            .text_xs()
+            .font_weight(gpui_kit::FontWeight::MEDIUM)
+            .text_color(muted)
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(busy, |button| button.opacity(0.55))
+            .when(!busy, |button| {
+                button
+                    .hover(move |style| style.bg(hover).text_color(text_primary))
+                    .on_click(cx.listener(move |view, _, _, cx| {
                         view.confirm_uninstall_plugin(
                             uninstall_id.clone(),
                             uninstall_name.clone(),
                             cx,
                         );
-                    });
-                });
+                    }))
+            })
+            .child("Uninstall");
 
         div()
             .w_full()
@@ -1171,7 +1271,7 @@ impl SettingsWindow {
                     .child(
                         div()
                             .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
                             .text_color(text_primary)
                             .child(plugin.name),
                     )
@@ -1192,7 +1292,7 @@ impl SettingsWindow {
                     .child(
                         div()
                             .text_xs()
-                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
                             .text_color(status_color)
                             .child(status),
                     )
@@ -1222,7 +1322,7 @@ impl SettingsWindow {
             .child(
                 div()
                     .text_sm()
-                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
                     .text_color(error_color)
                     .child("Plugin runtime needs attention"),
             );
@@ -1247,13 +1347,16 @@ impl SettingsWindow {
             .child(
                 div()
                     .text_sm()
-                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
                     .text_color(self.text_primary())
-                    .child("Trusted local code"),
+                    .child("Plugins have full access"),
             )
-            .child(div().text_xs().text_color(self.text_muted()).child(
-                "Plugins run through Bun with your user permissions. Install only code you trust.",
-            ))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(self.text_muted())
+                    .child(PLUGIN_FULL_ACCESS_WARNING),
+            )
             .into_any_element()
     }
 }

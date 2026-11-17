@@ -10,33 +10,52 @@ mod commands;
 mod config;
 mod crash_log;
 mod deeplink;
+#[cfg(target_os = "macos")]
+mod default_terminal;
 mod font_families;
+mod instance;
 mod keybindings;
 mod launch_probe;
+#[cfg(any(target_os = "linux", test))]
+mod linux_prompt;
+#[cfg(target_os = "macos")]
+mod macos_native_tabs;
 #[cfg(target_os = "macos")]
 mod macos_titlebar_drag;
 mod menus;
+mod multiplexer;
+#[cfg(target_os = "macos")]
+// Tests keep Termy's own Settings window, so the bridge's entry points go unused there.
+#[cfg_attr(test, allow(dead_code))]
+mod native_settings;
+mod native_titlebar;
+mod native_window_tabs;
 mod settings_view;
 mod ssh;
 mod startup;
 mod terminal_view;
 mod text_editing;
 mod text_input;
-mod theme_store;
+mod theme_library;
 mod ui;
+mod window_state;
 mod workspace_store;
 
-use commands::{OpenConfig, OpenSettings};
+use crate::terminal_ui::TmuxClient;
+use commands::{NewWindow, OpenConfig, OpenSettings};
 use deeplink::{DeepLinkArgument, DeepLinkRoute};
 use flume::Receiver;
-use gpui::{
-    App, Application, AsyncApp, Bounds, Pixels, WindowBounds, WindowHandle, WindowKind,
-    WindowOptions, prelude::*, px, size,
+use gpui_kit::{
+    App, AsyncApp, Bounds, Pixels, WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    prelude::*, px, size,
+};
+pub(crate) use native_window_tabs::{
+    TerminalWindowPlacement, native_window_tabs_enabled, windows_native_tab_style,
 };
 use startup::StartupBlocker;
 use terminal_view::{TerminalView, initial_window_background_appearance};
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-use termy_terminal_ui::TmuxClient;
+use termy::{auto_update, design_system, native_sdk, terminal_ui};
 
 pub(crate) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const APP_ID: &str = "termy";
@@ -53,9 +72,18 @@ const WINDOWS_DEFAULT_WINDOW_WIDTH: f32 = 1280.0;
 const WINDOWS_DEFAULT_WINDOW_HEIGHT: f32 = 820.0;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct StartupArguments {
+pub(crate) struct StartupArguments {
     working_dir: Option<String>,
     deeplinks: Vec<String>,
+    launch_target: LaunchTarget,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaunchTarget {
+    #[default]
+    Default,
+    Window,
+    Tab,
 }
 
 fn parse_startup_arguments<I, S>(args: I) -> StartupArguments
@@ -64,31 +92,134 @@ where
     S: Into<String>,
 {
     let mut startup = StartupArguments::default();
-    let mut args = args.into_iter().map(Into::into).peekable();
+    let mut args = args.into_iter().map(Into::into);
 
     while let Some(arg) = args.next() {
         if arg.starts_with("termy://") {
             startup.deeplinks.push(arg);
+        } else if arg == "--new-window" {
+            startup.launch_target = LaunchTarget::Window;
+        } else if arg == "--new-tab" {
+            startup.launch_target = LaunchTarget::Tab;
+        } else if arg == WINDOWS_DOCK_ACTION_FLAG {
+            // Jump List tasks relaunch Termy with their index.
+            if args.next().as_deref() == Some(WINDOWS_DOCK_NEW_WINDOW_INDEX) {
+                startup.launch_target = LaunchTarget::Window;
+            }
         } else if let Some(value) = arg.strip_prefix("--working-directory=") {
-            startup.working_dir = non_empty_arg_value(value);
+            startup.working_dir = working_dir_arg_value(value);
         } else if arg == "--working-directory" {
-            startup.working_dir = args.next().and_then(|value| non_empty_arg_value(&value));
+            startup.working_dir = args.next().and_then(|value| working_dir_arg_value(&value));
         } else if arg == "--" {
             if let Some(value) = args.next() {
-                startup.working_dir = non_empty_arg_value(&value);
+                startup.working_dir = working_dir_arg_value(&value);
             }
             break;
         } else if !arg.starts_with('-') && startup.working_dir.is_none() {
-            startup.working_dir = non_empty_arg_value(&arg);
+            startup.working_dir = working_dir_arg_value(&arg);
         }
     }
 
     startup
 }
 
+/// GPUI's Windows Jump List launches `termy --dock-action <index>` for each
+/// entry passed to `set_dock_menu`; Termy registers only "New Window".
+const WINDOWS_DOCK_ACTION_FLAG: &str = "--dock-action";
+const WINDOWS_DOCK_NEW_WINDOW_INDEX: &str = "0";
+
+fn working_dir_arg_value(value: &str) -> Option<String> {
+    let value = non_empty_arg_value(value)?;
+    #[cfg(target_os = "windows")]
+    let value = normalize_windows_working_dir(&value);
+    (!value.is_empty()).then_some(value)
+}
+
 fn non_empty_arg_value(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Repairs directories quoted by Explorer and shells. `"C:\"` reaches us as
+/// `C:"` because `\"` is an escaped quote, and the Explorer verb passes
+/// `"%V\."` to avoid that, which leaves a trailing `\.`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn normalize_windows_working_dir(value: &str) -> String {
+    let mut value = value.strip_suffix('"').unwrap_or(value).trim_end();
+    while let Some(stripped) = value
+        .strip_suffix("\\.")
+        .or_else(|| value.strip_suffix("/."))
+    {
+        value = stripped;
+    }
+    let bytes = value.as_bytes();
+    // A bare drive (`C:`) means that drive's current directory; Explorer and
+    // the shell meant its root.
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return format!("{value}\\");
+    }
+    value.to_string()
+}
+
+fn fold_startup_new_tab_into_working_dir(startup: &mut StartupArguments) {
+    if startup.working_dir.is_some() {
+        return;
+    }
+    if startup.deeplinks.len() != 1 {
+        return;
+    }
+    let Ok((DeepLinkRoute::NewTab, argument)) = DeepLinkRoute::parse(&startup.deeplinks[0]) else {
+        return;
+    };
+    let Some(DeepLinkArgument::NewTab(payload)) = argument else {
+        return;
+    };
+    let Some(dir) = payload.dir else {
+        return;
+    };
+    startup.working_dir = Some(dir);
+    startup.deeplinks.clear();
+}
+
+fn absorb_pending_open_urls(startup: &mut StartupArguments, urls: Vec<String>) {
+    for raw_url in urls {
+        if let Some(dir) = deeplink::directory_from_open_target(&raw_url) {
+            if startup.working_dir.is_none() {
+                startup.working_dir = Some(dir);
+            } else {
+                startup
+                    .deeplinks
+                    .push(deeplink::new_tab_deeplink_for_dir(&dir));
+            }
+            continue;
+        }
+        if raw_url.starts_with("termy://") {
+            startup.deeplinks.push(raw_url);
+        }
+    }
+    fold_startup_new_tab_into_working_dir(startup);
+}
+
+fn fold_startup_window_deeplink(startup: &mut StartupArguments) {
+    if startup.deeplinks.len() != 1 {
+        return;
+    }
+    if let Ok((DeepLinkRoute::NewWindow, argument)) = DeepLinkRoute::parse(&startup.deeplinks[0]) {
+        if startup.working_dir.is_none()
+            && let Some(DeepLinkArgument::NewTab(payload)) = argument
+        {
+            startup.working_dir = payload.dir;
+        }
+        startup.deeplinks.clear();
+    }
+}
+
+fn current_executable() -> Option<std::path::PathBuf> {
+    // dunce avoids `\\?\` verbatim paths, which Explorer verbs and icons
+    // registered from this path cannot use.
+    std::env::current_exe()
+        .ok()
+        .map(|path| dunce::canonicalize(&path).unwrap_or(path))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -131,12 +262,15 @@ fn preflight_tmux_runtime(config: &config::AppConfig) -> Result<(), StartupBlock
 }
 
 fn guard_tmux_startup(config: &mut config::AppConfig) -> Option<String> {
+    if config.multiplexer_enabled {
+        return None;
+    }
     let blocker = preflight_tmux_runtime(config).err()?;
     config.tmux_enabled = false;
     Some(blocker.tmux_fallback_message())
 }
 
-fn normalized_startup_window_size(startup_config: &config::AppConfig) -> gpui::Size<Pixels> {
+fn normalized_startup_window_size(startup_config: &config::AppConfig) -> gpui_kit::Size<Pixels> {
     let window_width = startup_config.window_width;
     let window_height = startup_config.window_height;
 
@@ -158,8 +292,8 @@ fn normalized_startup_window_size(startup_config: &config::AppConfig) -> gpui::S
 
 #[cfg(target_os = "windows")]
 fn should_apply_windows_startup_resize(
-    current: gpui::Size<Pixels>,
-    desired: gpui::Size<Pixels>,
+    current: gpui_kit::Size<Pixels>,
+    desired: gpui_kit::Size<Pixels>,
 ) -> bool {
     const WINDOW_SIZE_EPSILON: f32 = 0.5;
 
@@ -171,36 +305,148 @@ fn open_main_window(
     cx: &mut App,
     startup_config: config::AppConfig,
 ) -> Result<WindowHandle<TerminalView>, String> {
+    let first = open_terminal_window(cx, startup_config.clone(), false)?;
+    // Restored multiplexer windows rejoin the first window as native tabs.
+    let restored_placement = if native_window_tabs_enabled(&startup_config) {
+        TerminalWindowPlacement::NativeTab {
+            host: first.into(),
+            after: true,
+        }
+    } else {
+        TerminalWindowPlacement::Standalone
+    };
+    let mut previous: gpui_kit::AnyWindowHandle = first.into();
+    while multiplexer::pending_windows(cx) > 0 {
+        let placement = match restored_placement {
+            TerminalWindowPlacement::NativeTab { after, .. } => {
+                TerminalWindowPlacement::NativeTab {
+                    host: previous,
+                    after,
+                }
+            }
+            TerminalWindowPlacement::Standalone => TerminalWindowPlacement::Standalone,
+        };
+        match open_terminal_window_with_placement(cx, startup_config.clone(), false, placement) {
+            Ok(window) => previous = window.into(),
+            Err(error) => {
+                log::error!("Failed to restore terminal window: {error}");
+                crate::ui::toast::error(error);
+                break;
+            }
+        }
+    }
+    if matches!(
+        restored_placement,
+        TerminalWindowPlacement::NativeTab { .. }
+    ) {
+        let _ = first.update(cx, |_, window, _| window.activate_window());
+    }
+    Ok(first)
+}
+
+pub(crate) fn open_terminal_window(
+    cx: &mut App,
+    startup_config: config::AppConfig,
+    empty: bool,
+) -> Result<WindowHandle<TerminalView>, String> {
+    open_terminal_window_with_placement(
+        cx,
+        startup_config,
+        empty,
+        TerminalWindowPlacement::Standalone,
+    )
+}
+
+pub(crate) fn open_terminal_window_with_placement(
+    cx: &mut App,
+    startup_config: config::AppConfig,
+    empty: bool,
+    placement: TerminalWindowPlacement,
+) -> Result<WindowHandle<TerminalView>, String> {
+    multiplexer::initialize(&startup_config, cx);
+    let native_tabs = native_window_tabs_enabled(&startup_config);
+    #[cfg(target_os = "macos")]
+    if native_tabs {
+        native_window_tabs::install(cx);
+    }
+    // A tab takes its group's frame, so it opens hidden at the host's bounds
+    // and only appears once AppKit has tabbed it. Plain windowed bounds keep a
+    // fullscreen host from sending the hidden window into its own Space.
+    let tab_host = match placement {
+        TerminalWindowPlacement::NativeTab { host, after } if native_tabs => host
+            .update(cx, |_, window, _| WindowBounds::Windowed(window.bounds()))
+            .ok()
+            .map(|bounds| (host, bounds, after)),
+        _ => None,
+    };
     let window_background = initial_window_background_appearance(&startup_config);
     let startup_window_size = normalized_startup_window_size(&startup_config);
-    let bounds = Bounds::centered(None, startup_window_size, cx);
     let benchmark_mode = std::env::var_os("TERMY_BENCHMARK_COMMAND").is_some();
+    // Benchmarks compare fixed-size windows, so they neither restore nor
+    // save geometry. Only the first window gets the saved position back.
+    let restored_geometry = (!benchmark_mode && tab_host.is_none())
+        .then(|| {
+            window_state::restored_window_geometry(
+                cx,
+                size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT)),
+                cx.windows().is_empty(),
+            )
+        })
+        .flatten();
+    #[cfg(target_os = "windows")]
+    let apply_windows_startup_resize = restored_geometry.is_none();
+    let (window_bounds, display_id) = match (tab_host, restored_geometry) {
+        (Some((_, bounds, _)), _) => (bounds, None),
+        (None, Some(geometry)) => (geometry.bounds, geometry.display_id),
+        (None, None) => (
+            WindowBounds::Windowed(Bounds::centered(None, startup_window_size, cx)),
+            None,
+        ),
+    };
 
+    // Native tabs need AppKit's own titlebar: the tab bar sits beneath it and
+    // shows each window's title as the tab label.
     #[cfg(target_os = "macos")]
-    let titlebar = Some(gpui::TitlebarOptions {
+    let titlebar = Some(if native_tabs {
+        gpui_kit::TitlebarOptions {
+            title: Some("Termy".into()),
+            appears_transparent: false,
+            traffic_light_position: None,
+        }
+    } else {
+        gpui_kit::TitlebarOptions {
+            title: Some("Termy".into()),
+            appears_transparent: true,
+            traffic_light_position: Some(gpui_kit::point(px(12.0), px(10.0))),
+        }
+    });
+    // Windows hides the OS caption: the tab strip is the titlebar, with
+    // Termy-drawn caption buttons hit-tested by Windows (drag, snap, snap
+    // layouts, double-click maximize).
+    #[cfg(target_os = "windows")]
+    let titlebar = Some(gpui_kit::TitlebarOptions {
         title: Some("Termy".into()),
         appears_transparent: true,
-        traffic_light_position: Some(gpui::point(px(12.0), px(10.0))),
+        traffic_light_position: None,
     });
-    #[cfg(target_os = "windows")]
-    let titlebar = Some(gpui::TitlebarOptions {
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let titlebar = Some(gpui_kit::TitlebarOptions {
         title: Some("Termy".into()),
         appears_transparent: false,
         traffic_light_position: None,
     });
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let titlebar = Some(gpui::TitlebarOptions {
-        title: None,
-        appears_transparent: true,
-        traffic_light_position: None,
-    });
 
-    cx.open_window(
+    let handle = cx.open_window(
         WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_bounds: Some(window_bounds),
+            display_id,
             titlebar,
             window_background,
             app_id: Some(APP_ID.to_string()),
+            // Let the Linux compositor/window manager own the titlebar,
+            // controls, borders, and resize affordances.
+            #[cfg(target_os = "linux")]
+            window_decorations: Some(gpui_kit::WindowDecorations::Server),
             // Keep both sides of the xctrace comparison visible even when the
             // benchmark is launched from an IDE or another frontmost app.
             // Normal product windows retain the standard level.
@@ -211,14 +457,30 @@ fn open_main_window(
             },
             // Keep the NSWindow movable so macOS preserves normal zoom and
             // Dock-overlay behavior. The macOS content-view bridge below
-            // disables AppKit-owned titlebar dragging without changing the
-            // window's native management semantics.
-            is_movable: cfg!(target_os = "macos"),
+            // disables automatic background dragging; hit-tested titlebar
+            // presses explicitly start a native AppKit drag. Windows needs it
+            // for GPUI to report drag areas of the client-side titlebar.
+            is_movable: cfg!(any(target_os = "macos", target_os = "windows")),
             is_resizable: true,
             window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
+            show: tab_host.is_none(),
+            focus: tab_host.is_none(),
+            // A standalone window joins the tab group only once it is shown
+            // (see `join_tabbing_group_after_open`), so that "Prefer tabs:
+            // Always" doesn't turn New Window into a tab.
+            #[cfg(target_os = "macos")]
+            tabbing_identifier: (native_tabs && tab_host.is_some())
+                .then(|| macos_native_tabs::TABBING_IDENTIFIER.to_string()),
             ..Default::default()
         },
         move |window, cx| {
+            #[cfg(target_os = "linux")]
+            {
+                window.set_window_title("Termy");
+            }
+            // Before the view exists, so its DWM theming finds the handle.
+            #[cfg(target_os = "windows")]
+            native_sdk::win32_window::register_window(window, "Termy");
             if benchmark_mode {
                 #[cfg(target_os = "macos")]
                 if let Err(error) =
@@ -234,8 +496,10 @@ fn open_main_window(
                     window.activate_window();
                 }
             }
+            // A restored size already came from this window's own bounds, so
+            // only the config size needs the post-open correction.
             #[cfg(target_os = "windows")]
-            {
+            if apply_windows_startup_resize {
                 let startup_window_size = startup_window_size;
                 window.defer(cx, move |window, _cx| {
                     if should_apply_windows_startup_resize(
@@ -249,12 +513,24 @@ fn open_main_window(
 
             let view = cx.new({
                 let startup_config = startup_config;
-                |cx| TerminalView::new(window, cx, startup_config)
+                |cx| {
+                    if empty {
+                        TerminalView::new_for_window(window, cx, startup_config, true)
+                    } else {
+                        TerminalView::new(window, cx, startup_config)
+                    }
+                }
             });
             let view_handle = view.downgrade();
 
             #[cfg(target_os = "macos")]
             {
+                if native_tabs {
+                    if tab_host.is_none() {
+                        macos_native_tabs::join_tabbing_group_after_open(window);
+                    }
+                    macos_native_tabs::prepare_titlebar_tabs(window);
+                }
                 if let Err(error) =
                     macos_titlebar_drag::disable_automatic_content_view_window_drag(window)
                 {
@@ -270,7 +546,7 @@ fn open_main_window(
                         let native_drop_view = view.downgrade();
                         cx.spawn(async move |cx: &mut AsyncApp| {
                             while let Ok(result) = native_drop_rx.recv_async().await {
-                                let _ = cx.update(|cx| {
+                                cx.update(|cx| {
                                     let _ = native_drop_view.update(cx, |view, cx| {
                                         view.handle_native_file_drop_result(result, cx);
                                     });
@@ -290,7 +566,19 @@ fn open_main_window(
                 }
             }
 
+            if !benchmark_mode {
+                view.update(cx, |_, cx| {
+                    cx.observe_window_bounds(window, |_, window, cx| {
+                        window_state::schedule_save(window, cx);
+                    })
+                    .detach();
+                });
+            }
+
             window.on_window_should_close(cx, move |window, cx| {
+                if !benchmark_mode {
+                    window_state::save_now(window, cx);
+                }
                 view_handle
                     .update(cx, |view, cx| {
                         view.handle_window_should_close_request(window, cx)
@@ -300,7 +588,12 @@ fn open_main_window(
             view
         },
     )
-    .map_err(|error| format!("Failed to open main window: {error}"))
+    .map_err(|error| format!("Failed to open main window: {error}"))?;
+
+    if let Some((host, _, after)) = tab_host {
+        native_window_tabs::attach(cx, handle.into(), host, after);
+    }
+    Ok(handle)
 }
 
 fn reopen_if_no_windows(cx: &mut App, mut reopen: impl FnMut(&mut App)) -> bool {
@@ -360,63 +653,6 @@ fn focus_or_open_main_window<V: 'static>(
     true
 }
 
-fn start_theme_install_from_deeplink(cx: &mut App, slug: String) {
-    let loading_id = crate::ui::toast::loading(format!("Fetching theme \"{slug}\"..."));
-
-    cx.spawn(async move |cx: &mut AsyncApp| {
-        let fetch_result = cx
-            .background_executor()
-            .spawn(async move { theme_store::fetch_theme_for_deeplink_blocking(&slug) })
-            .await;
-
-        crate::ui::toast::dismiss_toast(loading_id);
-
-        match fetch_result {
-            Ok(theme) => {
-                let title = "Install Theme";
-                let message = format!(
-                    "Install theme \"{}\" into your local theme library?",
-                    theme.name
-                );
-                if !termy_native_sdk::confirm(title, &message) {
-                    return;
-                }
-
-                let install_loading_id =
-                    crate::ui::toast::loading(format!("Installing {}...", theme.name));
-                let install_result = cx
-                    .background_executor()
-                    .spawn(async move { theme_store::install_theme_from_store_blocking(theme) })
-                    .await;
-                crate::ui::toast::dismiss_toast(install_loading_id);
-
-                let _ = cx.update(|cx| match install_result {
-                    Ok(installed_theme) => {
-                        crate::ui::toast::success(installed_theme.message.clone());
-                        app_actions::update_open_settings_windows(cx, |view, settings_cx| {
-                            view.apply_theme_store_install(
-                                &installed_theme.slug,
-                                &installed_theme.version,
-                                settings_cx,
-                            );
-                        });
-                        app_actions::refresh_open_terminal_theme_assets(cx);
-                    }
-                    Err(error) => {
-                        log::error!("Failed to install theme from deeplink: {error}");
-                        crate::ui::toast::error(error);
-                    }
-                });
-            }
-            Err(error) => {
-                log::error!("Failed to fetch theme from deeplink: {error}");
-                crate::ui::toast::error(error);
-            }
-        }
-    })
-    .detach();
-}
-
 fn dispatch_deeplink(
     cx: &mut App,
     route: DeepLinkRoute,
@@ -424,26 +660,22 @@ fn dispatch_deeplink(
 ) -> Result<(), String> {
     match route {
         DeepLinkRoute::Activate => Ok(()),
+        DeepLinkRoute::NewWindow => {
+            let dir = match route_argument {
+                Some(DeepLinkArgument::NewTab(payload)) => payload.dir,
+                _ => None,
+            };
+            open_main_window_with_runtime_config_overrides(cx, dir).map(|_| ())
+        }
         DeepLinkRoute::NewTab => {
             let (command, dir) = match route_argument {
                 Some(DeepLinkArgument::NewTab(payload)) => (payload.command, payload.dir),
-                Some(DeepLinkArgument::Value(_)) | None => (None, None),
+                None => (None, None),
             };
             app_actions::open_new_tab_in_main_window(cx, command, dir)
         }
         DeepLinkRoute::Settings => app_actions::open_settings_or_config_file(cx),
         DeepLinkRoute::OpenConfig => app_actions::open_config_file(),
-        DeepLinkRoute::ThemeInstall => {
-            let slug = route_argument
-                .and_then(|argument| match argument {
-                    DeepLinkArgument::Value(value) => Some(value),
-                    DeepLinkArgument::NewTab(_) => None,
-                })
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| "Theme install deeplink requires a slug".to_string())?;
-            start_theme_install_from_deeplink(cx, slug);
-            Ok(())
-        }
     }
 }
 
@@ -454,10 +686,27 @@ fn handle_open_urls_with_main_window<V: 'static>(
     mut dispatch: impl FnMut(&mut App, DeepLinkRoute, Option<DeepLinkArgument>) -> Result<(), String>,
 ) {
     for raw_url in urls {
+        if let Some(dir) = deeplink::directory_from_open_target(raw_url) {
+            log::info!("Handling folder open: {raw_url}");
+            let argument = Some(DeepLinkArgument::NewTab(deeplink::NewTabDeepLink {
+                command: None,
+                dir: Some(dir),
+            }));
+            let _ = focus_or_open_main_window::<V>(cx, &mut open_window);
+            if let Err(error) = dispatch(cx, DeepLinkRoute::NewTab, argument) {
+                log::error!("Failed to open folder {raw_url}: {error}");
+                crate::ui::toast::error(error);
+            }
+            continue;
+        }
         match DeepLinkRoute::parse(raw_url) {
             Ok((route, route_argument)) => {
                 log::info!("Handling deeplink: {raw_url}");
-                let _ = focus_or_open_main_window::<V>(cx, &mut open_window);
+                // A new-window request creates its own terminal. Opening or
+                // focusing one first would create an extra window on cold start.
+                if route != DeepLinkRoute::NewWindow {
+                    let _ = focus_or_open_main_window::<V>(cx, &mut open_window);
+                }
                 if let Err(error) = dispatch(cx, route, route_argument) {
                     log::error!("Failed to handle deeplink {raw_url}: {error}");
                     crate::ui::toast::error(error);
@@ -483,15 +732,60 @@ fn handle_open_urls(cx: &mut App, urls: &[String]) {
 fn spawn_deeplink_listener(cx: &mut App, deeplink_rx: Receiver<Vec<String>>) {
     cx.spawn(async move |cx: &mut AsyncApp| {
         while let Ok(urls) = deeplink_rx.recv_async().await {
-            let _ = cx.update(|cx| handle_open_urls(cx, &urls));
+            cx.update(|cx| handle_open_urls(cx, &urls));
         }
     })
     .detach();
 }
 
+/// Run by the uninstaller to remove the per-user Explorer verbs.
+#[cfg(target_os = "windows")]
+const UNREGISTER_FILE_MANAGER_FLAG: &str = "--unregister-file-manager-integration";
+
+/// Groups windows, taskbar pins and the Jump List under one identity. The
+/// installer sets the same AppUserModelID on its shortcuts.
+#[cfg(target_os = "windows")]
+fn set_windows_app_user_model_id() {
+    use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+
+    // SAFETY: `w!` yields a static, null-terminated string.
+    if let Err(error) =
+        unsafe { SetCurrentProcessExplicitAppUserModelID(windows::core::w!("lassejlv.Termy")) }
+    {
+        log::warn!("Failed to set the AppUserModelID: {error}");
+    }
+}
+
 fn main() {
-    launch_probe::mark_process_start();
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(target_os = "windows")]
+    if cli_args
+        .first()
+        .is_some_and(|arg| arg == UNREGISTER_FILE_MANAGER_FLAG)
+    {
+        // Never block an uninstall: no window, no instance handoff, and a
+        // missing key is not a failure.
+        let _ = crate::native_sdk::unregister_open_tab_here();
+        std::process::exit(0);
+    }
+    if cli_args
+        .first()
+        .is_some_and(|arg| arg == "--multiplexer-host")
+    {
+        // The host logs to `host.log`; its launcher also appends stderr there.
+        let result = match cli_args.as_slice() {
+            [_, directory] => termy_core::multiplexer::run_host(std::path::Path::new(directory)),
+            _ => Err(anyhow::anyhow!(
+                "multiplexer host requires its private session directory"
+            )),
+        };
+        if let Err(error) = result {
+            eprintln!("Termy session host: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    launch_probe::mark_process_start();
     if let Some(status) = ssh::run_askpass_if_requested(&cli_args) {
         std::process::exit(status);
     }
@@ -499,39 +793,59 @@ fn main() {
         cli_delegate::delegate_to_cli_or_exit(cli_args);
     }
 
-    env_logger::init();
+    crash_log::init_logging();
     crash_log::install_panic_hook();
+    #[cfg(target_os = "windows")]
+    set_windows_app_user_model_id();
+    #[cfg(target_os = "windows")]
+    native_window_tabs::prepare_windows_platform(
+        &config::load_runtime_config(&mut None, "Failed to load config").config,
+    );
 
-    let startup_arguments = parse_startup_arguments(cli_args);
+    let mut startup_arguments = parse_startup_arguments(cli_args);
     let (deeplink_tx, deeplink_rx) = flume::unbounded::<Vec<String>>();
-    let application = Application::new().with_assets(crate::asset_source::EmbeddedAssets);
-
-    if !startup_arguments.deeplinks.is_empty()
-        && let Err(error) = deeplink_tx.send(startup_arguments.deeplinks.clone())
-    {
-        log::error!("Failed to enqueue argv deeplink: {error}");
+    match instance::claim_or_forward(&instance::urls_to_forward(&startup_arguments)) {
+        Ok(instance::InstanceClaim::Forwarded) => {
+            log::info!("Forwarded launch request to the running Termy instance.");
+            std::process::exit(0);
+        }
+        Ok(instance::InstanceClaim::Primary(guard)) => {
+            instance::spawn_listener(guard, deeplink_tx.clone());
+        }
+        Err(error) => log::warn!("Termy instance handoff unavailable: {error}"),
     }
+
+    let application = gpui_kit::application().with_assets(crate::asset_source::EmbeddedAssets);
+    launch_probe::record_stage("platform_created");
 
     application.on_reopen(|cx| {
         let _ = reopen_if_no_windows(cx, reopen_main_window);
     });
-    application.on_open_urls(move |urls| {
-        if let Err(error) = deeplink_tx.send(urls) {
-            log::error!("Failed to enqueue deeplink event: {error}");
+    application.on_open_urls({
+        let deeplink_tx_urls = deeplink_tx.clone();
+        move |urls| {
+            if let Err(error) = deeplink_tx_urls.send(urls) {
+                log::error!("Failed to enqueue deeplink event: {error}");
+            }
         }
     });
 
     application.run(move |cx: &mut App| {
-        termy_ui::init_glassy(cx);
-        if let Err(error) = termy_ui::load_fonts(cx) {
-            log::warn!("Failed to load Glassy UI assets: {error}");
+        gpui_kit::init(cx);
+        launch_probe::record_stage("application_running");
+        #[cfg(target_os = "linux")]
+        cx.set_prompt_builder(linux_prompt::render_prompt);
+
+        // Fold only the initiating launch. Requests received from other
+        // processes during startup must each create their own window.
+        fold_startup_window_deeplink(&mut startup_arguments);
+        let mut pending_urls = Vec::new();
+        while let Ok(urls) = deeplink_rx.try_recv() {
+            pending_urls.extend(urls);
         }
-        spawn_deeplink_listener(cx, deeplink_rx);
-        cx.on_app_quit(|cx| {
-            TerminalView::detach_all_open_herdr_agents(cx);
-            async {}
-        })
-        .detach();
+        absorb_pending_open_urls(&mut startup_arguments, pending_urls);
+        fold_startup_new_tab_into_working_dir(&mut startup_arguments);
+        let leftover_deeplinks = startup_arguments.deeplinks.clone();
 
         cx.on_action(|_: &OpenConfig, _cx| {
             if let Err(error) = app_actions::open_config_file() {
@@ -539,47 +853,101 @@ fn main() {
                 crate::ui::toast::error(error);
             }
         });
+        cx.on_action(|_: &NewWindow, cx| {
+            // Errors are already logged and surfaced as a toast.
+            let _ = open_main_window_with_runtime_config_overrides(cx, None);
+        });
         cx.on_action(|_: &OpenSettings, cx| {
             if let Err(error) = app_actions::open_settings_or_config_file(cx) {
                 log::error!("{error}");
                 crate::ui::toast::error(error);
             }
         });
+        // The taskbar Jump List entry relaunches Termy with `--dock-action
+        // 0`, which the running instance turns into a new window.
+        #[cfg(target_os = "windows")]
+        cx.set_dock_menu(vec![gpui_kit::MenuItem::action("New Window", NewWindow)]);
 
         let mut startup_config_error = None;
         let startup_load =
             config::load_runtime_config(&mut startup_config_error, "Failed to load config");
         let mut app_config = startup_load.config;
+        launch_probe::record_stage("config_loaded");
         if let Some(working_dir) = startup_arguments.working_dir {
             app_config.working_dir = Some(working_dir);
         }
-        app_icon::apply_from_config(&app_config);
+        app_icon::apply_at_startup(&app_config);
+        launch_probe::record_stage("icon_applied");
         if let Some(message) = guard_tmux_startup(&mut app_config) {
             log::warn!("{message}");
             crate::ui::toast::warning(message);
         }
         // Keep startup menus/keybinds aligned with the active runtime capability set.
-        let tmux_runtime_active = if cfg!(target_os = "windows") {
-            false
-        } else {
-            app_config.tmux_enabled
-        };
+        let tmux_runtime_active = terminal_view::tmux_runtime_requested(&app_config);
         keybindings::install_keybindings(cx, &app_config, tmux_runtime_active);
+        launch_probe::record_stage("keybindings_installed");
         let startup_config = app_config;
+        // Quitting right after a move or resize would otherwise drop the
+        // geometry that is still waiting for its delayed save.
+        cx.on_app_quit(|cx| {
+            window_state::flush(cx);
+            TerminalView::detach_all_open_herdr_agents(cx);
+            // The listener thread never returns, so its guard's cleanup does
+            // not run; drop the endpoint here so no later launch reads it.
+            instance::remove_published_endpoint();
+            async {}
+        })
+        .detach();
 
         if let Err(error) = open_main_window(cx, startup_config) {
             log::error!("{error}");
             StartupBlocker::MainWindowOpen(error).present_alert_and_exit();
+        }
+
+        if !leftover_deeplinks.is_empty()
+            && let Err(error) = deeplink_tx.send(leftover_deeplinks)
+        {
+            log::error!("Failed to enqueue leftover startup deeplink: {error}");
+        }
+        spawn_deeplink_listener(cx, deeplink_rx);
+        if let Some(executable) = current_executable() {
+            let open_tab_tx = deeplink_tx.clone();
+            let register = move || {
+                crate::native_sdk::register_open_tab_here(&executable, move |directory| {
+                    let url = deeplink::new_tab_deeplink_for_dir(&directory.to_string_lossy());
+                    if let Err(error) = open_tab_tx.send(vec![url]) {
+                        log::error!("Failed to enqueue Finder/file-manager tab: {error}");
+                    }
+                })
+            };
+            #[cfg(target_os = "windows")]
+            if let Err(error) = std::thread::Builder::new()
+                .name("termy-explorer-integration".to_string())
+                .spawn(move || {
+                    if let Err(error) = register() {
+                        log::warn!("File manager integration was not registered: {error}");
+                    }
+                })
+            {
+                log::warn!("Could not start Explorer integration registration: {error}");
+            }
+            #[cfg(not(target_os = "windows"))]
+            if let Err(error) = register() {
+                log::warn!("File manager integration was not registered: {error}");
+            }
         }
     });
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use super::guard_tmux_startup;
     use super::{
-        DeepLinkArgument, DeepLinkRoute, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
-        focus_or_open_main_window, guard_tmux_startup, handle_open_urls_with_main_window,
-        normalized_startup_window_size, parse_startup_arguments, reopen_if_no_windows,
+        DeepLinkArgument, DeepLinkRoute, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, StartupArguments,
+        absorb_pending_open_urls, focus_or_open_main_window, fold_startup_new_tab_into_working_dir,
+        handle_open_urls_with_main_window, normalized_startup_window_size, parse_startup_arguments,
+        reopen_if_no_windows,
     };
     #[cfg(target_os = "windows")]
     use super::{
@@ -589,7 +957,7 @@ mod tests {
     use crate::app_actions;
     use crate::config::AppConfig;
     use crate::deeplink::NewTabDeepLink;
-    use gpui::{
+    use gpui_kit::{
         App, AppContext, Context, IntoElement, Render, TestAppContext, Window, WindowOptions, div,
         px, size,
     };
@@ -624,10 +992,139 @@ mod tests {
     }
 
     #[test]
+    fn windows_working_directories_from_explorer_are_repaired() {
+        for (raw, expected) in [
+            (r#"C:""#, r"C:\"),
+            (r"C:\\.", r"C:\"),
+            (r"C:\.", r"C:\"),
+            (r"D:", r"D:\"),
+            (r"C:\Users\me\project\.", r"C:\Users\me\project"),
+            (r"C:\Users\me\project", r"C:\Users\me\project"),
+            (r"\\server\share\.", r"\\server\share"),
+            (".", "."),
+        ] {
+            assert_eq!(super::normalize_windows_working_dir(raw), expected, "{raw}");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn startup_arguments_repair_explorer_drive_roots() {
+        let parsed = parse_startup_arguments(["--working-directory", r#"C:""#]);
+        assert_eq!(parsed.working_dir.as_deref(), Some(r"C:\"));
+        let parsed = parse_startup_arguments(["--working-directory", r"E:\\."]);
+        assert_eq!(parsed.working_dir.as_deref(), Some(r"E:\"));
+    }
+
+    #[test]
+    fn jump_list_new_window_task_requests_a_window() {
+        let parsed = parse_startup_arguments(["--dock-action", "0"]);
+        assert_eq!(parsed.launch_target, super::LaunchTarget::Window);
+        assert_eq!(parsed.working_dir, None);
+        let parsed = parse_startup_arguments(["--dock-action", "7"]);
+        assert_eq!(parsed, StartupArguments::default());
+    }
+
+    #[test]
     fn startup_arguments_keep_deeplinks() {
         let parsed = parse_startup_arguments(["termy://new?dir=%2Ftmp%2Fproject"]);
         assert_eq!(parsed.working_dir, None);
         assert_eq!(parsed.deeplinks, vec!["termy://new?dir=%2Ftmp%2Fproject"]);
+    }
+
+    #[test]
+    fn startup_window_deeplink_uses_initial_window_but_pending_requests_are_retained() {
+        let mut startup = parse_startup_arguments(["termy://window?dir=%2Ftmp%2Fproject"]);
+        super::fold_startup_window_deeplink(&mut startup);
+        assert_eq!(startup.working_dir.as_deref(), Some("/tmp/project"));
+        assert!(startup.deeplinks.is_empty());
+        absorb_pending_open_urls(&mut startup, vec!["termy://window".into()]);
+        assert_eq!(startup.deeplinks, vec!["termy://window"]);
+    }
+
+    #[gpui_kit::test]
+    fn linux_launch_handoffs_open_independent_windows(cx: &mut TestAppContext) {
+        let home = tempfile::tempdir().expect("instance home");
+        let super::instance::InstanceClaim::Primary(guard) =
+            super::instance::claim_or_forward_in(home.path(), &[]).expect("primary claim")
+        else {
+            panic!("expected primary instance");
+        };
+        let (tx, rx) = flume::unbounded();
+        super::instance::spawn_listener(guard, tx);
+        cx.update(open_test_window);
+        for args in [vec![], vec!["--working-directory", "/tmp/another project"]] {
+            let startup = parse_startup_arguments(args);
+            let urls = super::instance::urls_to_forward_for_platform(
+                &startup,
+                super::instance::PlainLaunch::NewWindow,
+            );
+            assert!(matches!(
+                super::instance::claim_or_forward_in(home.path(), &urls).unwrap(),
+                super::instance::InstanceClaim::Forwarded
+            ));
+            let forwarded = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            cx.update(|app| {
+                handle_open_urls_with_main_window::<ReopenTestView>(
+                    app,
+                    &forwarded,
+                    |_| panic!("new-window requests must not reuse an existing window"),
+                    |app, route, argument| {
+                        assert_eq!(route, DeepLinkRoute::NewWindow);
+                        if let Some(dir) = &startup.working_dir {
+                            assert_eq!(
+                                argument,
+                                Some(DeepLinkArgument::NewTab(NewTabDeepLink {
+                                    command: None,
+                                    dir: Some(dir.clone()),
+                                }))
+                            );
+                        }
+                        open_test_window(app);
+                        Ok(())
+                    },
+                );
+            });
+        }
+        assert_eq!(cx.windows().len(), 3);
+        let closing = cx.windows()[0];
+        cx.update(|app| app_actions::close_terminal_window::<ReopenTestView>(closing, app));
+        assert_eq!(cx.windows().len(), 2);
+        assert!(!cx.windows().contains(&closing));
+    }
+
+    #[test]
+    fn fold_single_new_tab_deeplink_into_first_window_working_dir() {
+        let mut startup = parse_startup_arguments(["termy://new?dir=%2Ftmp%2Fproject"]);
+        fold_startup_new_tab_into_working_dir(&mut startup);
+        assert_eq!(startup.working_dir.as_deref(), Some("/tmp/project"));
+        assert!(startup.deeplinks.is_empty());
+    }
+
+    #[test]
+    fn fold_leaves_settings_deeplinks_for_later_dispatch() {
+        let mut startup = parse_startup_arguments(["termy://settings"]);
+        fold_startup_new_tab_into_working_dir(&mut startup);
+        assert_eq!(startup.working_dir, None);
+        assert_eq!(startup.deeplinks, vec!["termy://settings"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absorb_open_urls_uses_the_first_folder_as_working_dir() {
+        let mut startup = StartupArguments::default();
+        absorb_pending_open_urls(
+            &mut startup,
+            vec![
+                "file:///tmp/first".to_string(),
+                "file:///tmp/second".to_string(),
+            ],
+        );
+        assert_eq!(startup.working_dir.as_deref(), Some("/tmp/first"));
+        assert_eq!(
+            startup.deeplinks,
+            vec!["termy://new?dir=%2Ftmp%2Fsecond".to_string()]
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -662,7 +1159,7 @@ mod tests {
         assert!(warning.contains("starting in native mode"));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn reopen_if_no_windows_opens_a_window(cx: &mut TestAppContext) {
         assert!(cx.windows().is_empty(), "expected no windows at test start");
 
@@ -675,7 +1172,7 @@ mod tests {
         assert_eq!(cx.windows().len(), 1);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn reopen_if_no_windows_does_not_open_when_window_exists(cx: &mut TestAppContext) {
         cx.update(open_test_window);
         assert_eq!(cx.windows().len(), 1);
@@ -689,7 +1186,7 @@ mod tests {
         assert_eq!(cx.windows().len(), 1);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn focus_or_open_main_window_opens_when_missing(cx: &mut TestAppContext) {
         assert_eq!(cx.windows().len(), 0);
 
@@ -700,7 +1197,7 @@ mod tests {
         assert_eq!(cx.windows().len(), 1);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn focus_or_open_main_window_reuses_existing_window(cx: &mut TestAppContext) {
         cx.update(open_test_window);
         assert_eq!(cx.windows().len(), 1);
@@ -715,7 +1212,7 @@ mod tests {
         assert_eq!(cx.windows().len(), 1);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn handle_open_urls_opens_window_before_dispatch(cx: &mut TestAppContext) {
         let handled = RefCell::new(Vec::new());
 
@@ -735,7 +1232,7 @@ mod tests {
         assert_eq!(*handled.borrow(), vec![(DeepLinkRoute::Settings, None)]);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn bare_deeplink_opens_window_without_error_route(cx: &mut TestAppContext) {
         let handled = RefCell::new(Vec::new());
 
@@ -755,7 +1252,70 @@ mod tests {
         assert_eq!(*handled.borrow(), vec![(DeepLinkRoute::Activate, None)]);
     }
 
-    #[gpui::test]
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    fn folder_open_target_dispatches_a_new_tab(cx: &mut TestAppContext) {
+        let handled = RefCell::new(Vec::new());
+
+        cx.update(|app| {
+            handle_open_urls_with_main_window::<ReopenTestView>(
+                app,
+                &[String::from("file:///tmp/demo")],
+                open_test_window,
+                |_, route, route_argument| {
+                    handled.borrow_mut().push((route, route_argument));
+                    Ok(())
+                },
+            );
+        });
+
+        assert_eq!(cx.windows().len(), 1);
+        assert_eq!(
+            *handled.borrow(),
+            vec![(
+                DeepLinkRoute::NewTab,
+                Some(DeepLinkArgument::NewTab(NewTabDeepLink {
+                    command: None,
+                    dir: Some("/tmp/demo".to_string()),
+                }))
+            )]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui_kit::test]
+    fn finder_service_reuses_open_window_for_selected_folders(cx: &mut TestAppContext) {
+        let handled = RefCell::new(Vec::new());
+        let directory = "/tmp/it's a folder & another";
+        let url = url::Url::from_directory_path(directory)
+            .unwrap()
+            .to_string();
+
+        cx.update(|app| {
+            open_test_window(app);
+            handle_open_urls_with_main_window::<ReopenTestView>(
+                app,
+                &[url.clone(), url],
+                |_| panic!("Finder should reuse the existing main window"),
+                |_, route, argument| {
+                    handled.borrow_mut().push((route, argument));
+                    Ok(())
+                },
+            );
+        });
+
+        assert_eq!(cx.windows().len(), 1);
+        let expected = (
+            DeepLinkRoute::NewTab,
+            Some(DeepLinkArgument::NewTab(NewTabDeepLink {
+                command: None,
+                dir: Some(format!("{directory}/")),
+            })),
+        );
+        assert_eq!(*handled.borrow(), vec![expected.clone(), expected]);
+    }
+
+    #[gpui_kit::test]
     fn new_tab_deeplink_passes_route_without_argument(cx: &mut TestAppContext) {
         let handled = RefCell::new(Vec::new());
 
@@ -802,9 +1362,11 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn normalized_startup_window_size_migrates_legacy_windows_default() {
-        let mut config = AppConfig::default();
-        config.window_width = LEGACY_DEFAULT_WINDOW_WIDTH;
-        config.window_height = LEGACY_DEFAULT_WINDOW_HEIGHT;
+        let config = AppConfig {
+            window_width: LEGACY_DEFAULT_WINDOW_WIDTH,
+            window_height: LEGACY_DEFAULT_WINDOW_HEIGHT,
+            ..AppConfig::default()
+        };
 
         assert_eq!(
             normalized_startup_window_size(&config),
@@ -832,7 +1394,7 @@ mod tests {
         assert!(should_apply_windows_startup_resize(current, target));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn new_tab_deeplink_ignores_optional_command(cx: &mut TestAppContext) {
         let handled = RefCell::new(Vec::new());
 
@@ -852,7 +1414,7 @@ mod tests {
         assert_eq!(*handled.borrow(), vec![(DeepLinkRoute::NewTab, None)]);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn new_tab_deeplink_ignores_optional_command_and_passes_dir(cx: &mut TestAppContext) {
         let handled = RefCell::new(Vec::new());
 
@@ -883,35 +1445,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn theme_install_deeplink_passes_slug_argument(cx: &mut TestAppContext) {
-        let handled = RefCell::new(Vec::new());
-
-        cx.update(|app| {
-            handle_open_urls_with_main_window::<ReopenTestView>(
-                app,
-                &[String::from(
-                    "termy://store/theme-install?slug=catppuccin-mocha",
-                )],
-                open_test_window,
-                |_, route, route_argument| {
-                    handled.borrow_mut().push((route, route_argument));
-                    Ok(())
-                },
-            );
-        });
-
-        assert_eq!(cx.windows().len(), 1);
-        assert_eq!(
-            *handled.borrow(),
-            vec![(
-                DeepLinkRoute::ThemeInstall,
-                Some(DeepLinkArgument::Value("catppuccin-mocha".to_string()))
-            )]
-        );
-    }
-
-    #[gpui::test]
+    #[gpui_kit::test]
     fn settings_deeplink_reuses_existing_settings_window(cx: &mut TestAppContext) {
         cx.update(|app| {
             app_actions::open_settings_window(app).expect("settings window should open");

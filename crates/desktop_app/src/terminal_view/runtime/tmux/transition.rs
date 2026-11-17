@@ -1,5 +1,5 @@
 use super::*;
-use termy_terminal_ui::{TmuxClient, TmuxLaunchTarget, TmuxRuntimeConfig};
+use crate::terminal_ui::{TmuxClient, TmuxLaunchTarget, TmuxRuntimeConfig};
 
 impl TerminalView {
     fn refresh_runtime_capability_surfaces(&mut self, cx: &mut Context<Self>) {
@@ -36,6 +36,7 @@ impl TerminalView {
             Some(&self.tab_shell_integration),
             Some(&self.terminal_runtime),
             None,
+            self.multiplexer_client(),
         )?;
         let predicted_prompt_cwd = Self::predicted_prompt_cwd(
             self.configured_working_dir.as_deref(),
@@ -58,6 +59,12 @@ impl TerminalView {
         launch: TmuxLaunchTarget,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.multiplexer.is_some() {
+            crate::ui::toast::info(
+                "Disable the built-in multiplexer and restart Termy to switch to tmux",
+            );
+            return false;
+        }
         let (binary, command_prefix, show_active_pane_border) = if self.runtime_uses_tmux() {
             (
                 self.tmux_runtime().config.binary.clone(),
@@ -109,8 +116,7 @@ impl TerminalView {
         // to the default grid size rather than panicking on a missing active pane.
         let size = self
             .active_terminal()
-            .map(|terminal| terminal.size())
-            .unwrap_or_default();
+            .map_or_default(|terminal| terminal.size());
         let initial_working_dir = self.preferred_working_dir_for_new_session(None, cx);
         let tmux_client = match TmuxClient::new(
             runtime_config.clone(),
@@ -234,8 +240,7 @@ impl TerminalView {
         // Detach should remain recoverable even if tmux just invalidated panes.
         let size = self
             .active_terminal()
-            .map(|terminal| terminal.size())
-            .unwrap_or_default();
+            .map_or_default(|terminal| terminal.size());
         let native_tab = match self.create_native_runtime_tab_for_size(size) {
             Ok(tab) => tab,
             Err(error) => {
@@ -248,7 +253,6 @@ impl TerminalView {
         match tmux_detach_transition_decision(true, shutdown_result.is_ok()) {
             TmuxDetachTransitionDecision::CommitNativeTransition => {
                 self.commit_tmux_runtime_to_native(native_tab, cx);
-                crate::ui::toast::success("Detached tmux session");
                 true
             }
             TmuxDetachTransitionDecision::AbortTmuxShutdown => {
@@ -290,8 +294,7 @@ impl TerminalView {
                 // Exit recovery uses a deterministic fallback when no active pane remains.
                 let size = self
                     .active_terminal()
-                    .map(|terminal| terminal.size())
-                    .unwrap_or_default();
+                    .map_or_default(|terminal| terminal.size());
                 if let Some(reason) = reason {
                     crate::ui::toast::error(reason);
                 }

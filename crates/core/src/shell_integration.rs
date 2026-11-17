@@ -1,7 +1,7 @@
 //! Shell integration support for OSC 133 command lifecycle tracking
 //! and OSC 9;4 progress indicators.
 
-use std::time::Instant;
+use web_time::Instant;
 
 /// OSC 133 command lifecycle state machine.
 ///
@@ -85,7 +85,7 @@ pub enum CommandPhase {
 /// - 2 = Error state (red)
 /// - 3 = Indeterminate/busy (spinning)
 /// - 4 = Warning state (yellow)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProgressState {
     /// No progress indicator (state 0)
     #[default]

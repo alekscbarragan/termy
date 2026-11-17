@@ -59,6 +59,10 @@ impl TerminalView {
                     &mut fingerprint,
                     pane.pane_zoom_steps as u16 as u64,
                 );
+                Self::mix_terminal_resize_fingerprint(
+                    &mut fingerprint,
+                    u64::from(pane.last_alternate_screen.get()),
+                );
             }
         }
         fingerprint
@@ -94,6 +98,31 @@ impl TerminalView {
         }
     }
 
+    /// The resize pass is skipped while nothing local changed. A session-host
+    /// pane can still change size under it when another client (`termy mux
+    /// resize`, a second window) resizes it; then the pass runs so this view
+    /// re-asserts the size it draws (see `HostSizeClaim` for the limits).
+    fn can_skip_terminal_resize_sync(
+        signature_unchanged: bool,
+        apply_deferred_inactive_resize: bool,
+        host_size_reassert_pending: bool,
+    ) -> bool {
+        signature_unchanged && !apply_deferred_inactive_resize && !host_size_reassert_pending
+    }
+
+    fn active_tab_host_size_reassert_pending(&self) -> bool {
+        self.multiplexer.is_some()
+            && self
+                .session
+                .tabs
+                .get(self.session.active_tab)
+                .is_some_and(|tab| {
+                    tab.panes
+                        .iter()
+                        .any(|pane| pane.terminal().host_size_reassert_pending())
+                })
+    }
+
     fn schedule_deferred_inactive_resize(
         &mut self,
         signature: TerminalResizeSignature,
@@ -108,7 +137,7 @@ impl TerminalView {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut remaining = delay;
             loop {
-                smol::Timer::after(remaining).await;
+                cx.background_executor().timer(remaining).await;
                 let next_delay = cx.update(|cx| {
                     this.update(cx, |view, cx| {
                         let DeferredTerminalResize::Pending {
@@ -128,7 +157,7 @@ impl TerminalView {
                     })
                 });
                 match next_delay {
-                    Ok(Ok(Some(next_delay))) => remaining = next_delay,
+                    Ok(Some(next_delay)) => remaining = next_delay,
                     _ => return,
                 }
             }
@@ -141,12 +170,7 @@ impl TerminalView {
             return;
         };
         for pane in &tab.panes {
-            let terminal = pane.terminal();
-            let alternate_screen = terminal.alternate_screen_mode();
-            let previous = pane.last_alternate_screen.replace(alternate_screen);
-            if alternate_screen && !previous {
-                terminal.nudge_resize();
-            }
+            pane.sync_alternate_screen_state();
         }
     }
 
@@ -269,7 +293,7 @@ impl TerminalView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn terminal_grid_size_for_pane_count(
+    pub(in super::super) fn terminal_grid_size_for_pane_count(
         pane_count: usize,
         viewport_width: f32,
         viewport_height: f32,
@@ -325,7 +349,7 @@ impl TerminalView {
         action: CommandAction,
         cx: &mut Context<Self>,
     ) -> bool {
-        match action {
+        let handled = match action {
             CommandAction::ZoomIn => {
                 if self.active_pane_uses_local_zoom() {
                     self.adjust_active_pane_zoom_steps(1, cx);
@@ -353,7 +377,22 @@ impl TerminalView {
                 true
             }
             _ => false,
+        };
+        // Zoom is part of the multiplexer's live layout so a relaunch reattaches
+        // panes at the size they were last shown.
+        if handled && self.multiplexer.is_some() {
+            self.schedule_persist_native_workspace(cx);
         }
+        handled
+    }
+
+    pub(in super::super) fn font_zoom_steps(&self) -> i16 {
+        let current: f32 = self.font_size.into();
+        ((current - self.base_font_size) / ZOOM_STEP).round() as i16
+    }
+
+    pub(in super::super) fn set_font_zoom_steps(&mut self, steps: i16, cx: &mut Context<Self>) {
+        self.update_zoom(self.base_font_size + steps as f32 * ZOOM_STEP, cx);
     }
 
     pub(in super::super) fn update_zoom(&mut self, next_size: f32, cx: &mut Context<Self>) {
@@ -382,7 +421,7 @@ impl TerminalView {
         let font = Font {
             family: self.font_family.clone(),
             weight: FontWeight::NORMAL,
-            ..gpui::font("")
+            ..gpui_kit::font("")
         };
 
         let text_system = window.text_system();
@@ -430,6 +469,9 @@ impl TerminalView {
             return;
         }
 
+        // Entering/leaving a full-screen TUI changes its available grid even
+        // when the window size is unchanged. Refresh before the resize cache.
+        self.sync_active_alternate_screen_state();
         let sidebar_width = self.effective_sidebar_width();
         let content_top_inset = self.terminal_content_top_inset();
         let backend_mode = self.runtime_kind();
@@ -451,21 +493,33 @@ impl TerminalView {
         );
         let apply_deferred_inactive_resize =
             self.deferred_inactive_resize.is_ready_for(resize_signature);
-        if self.last_terminal_resize_signature == Some(resize_signature)
-            && !apply_deferred_inactive_resize
-        {
-            self.sync_active_alternate_screen_state();
+        let signature_unchanged = self.last_terminal_resize_signature == Some(resize_signature);
+        if Self::can_skip_terminal_resize_sync(
+            signature_unchanged,
+            apply_deferred_inactive_resize,
+            // Only checked when nothing local changed; the pass below
+            // re-checks each pane anyway.
+            signature_unchanged && self.active_tab_host_size_reassert_pending(),
+        ) {
             return;
         }
 
+        // Pane-divider drags already mutate cell geometry. Re-fitting the
+        // layout tree and sending SIGWINCH on every cell step fights the
+        // drag and flickers the grid; apply the PTY resize once on mouse-up.
+        if self.pane_resize_drag.is_some() {
+            return;
+        }
+
+        let (padding_x, padding_y) = self.effective_terminal_padding();
         let (cols, rows) = Self::terminal_grid_size_for_pane_count(
             active_pane_count,
             viewport_width,
             viewport_height,
             total_sidebar_width,
             content_top_inset,
-            self.padding_x,
-            self.padding_y,
+            padding_x,
+            padding_y,
             cell_width,
             cell_height,
         );
@@ -492,11 +546,12 @@ impl TerminalView {
                         tab_index += 1;
                         continue;
                     }
-                    let (tab_id, pane_count, should_sync) = {
+                    let (tab_id, pane_count, alternate_screen, should_sync) = {
                         let tab = &mut self.session.tabs[tab_index];
                         (
                             tab.id,
                             tab.panes.len(),
+                            tab.single_pane_alternate_screen(),
                             Self::repair_native_tab_active_pane_for_resize(tab),
                         )
                     };
@@ -504,14 +559,19 @@ impl TerminalView {
                     if !should_sync {
                         continue;
                     }
+                    let (padding_x, padding_y) = Self::terminal_padding_for_screen_mode(
+                        self.padding_x,
+                        self.padding_y,
+                        alternate_screen,
+                    );
                     let (cols, rows) = Self::terminal_grid_size_for_pane_count(
                         pane_count,
                         viewport_width,
                         viewport_height,
                         total_sidebar_width,
                         content_top_inset,
-                        self.padding_x,
-                        self.padding_y,
+                        padding_x,
+                        padding_y,
                         cell_width,
                         cell_height,
                     );
@@ -573,11 +633,14 @@ impl TerminalView {
                     cell_height: pane_cell_size.height.into(),
                 };
                 let terminal = pane.terminal();
-                let current = terminal.size();
-                let needs_resize = current.cols != next_size.cols
-                    || current.rows != next_size.rows
-                    || current.cell_width != next_size.cell_width
-                    || current.cell_height != next_size.cell_height;
+                // A reattached session-host pane reports its last frame, which
+                // lags queued resizes. Comparing with that stale size can drop
+                // the final resize of a burst (e.g. window setup after restart)
+                // and leave the program at an intermediate size.
+                // When another client resized a session-host pane, this view
+                // re-asserts the size it draws, within `HostSizeClaim` limits.
+                let current = terminal.requested_size();
+                let needs_resize = terminal.needs_resize(current, next_size, now);
 
                 if needs_resize {
                     if can_resize {
@@ -625,7 +688,6 @@ impl TerminalView {
         } else {
             self.last_terminal_resize_signature = Some(final_resize_signature);
         }
-        self.sync_active_alternate_screen_state();
     }
 }
 
@@ -648,6 +710,7 @@ mod tests {
             degraded: false,
             tmux_mouse_mode: None,
             progress_state: ProgressState::default(),
+            program_status: Vec::new(),
             terminal: test_terminal(),
             render_cache: RefCell::new(TerminalPaneRenderCache::default()),
             last_alternate_screen: Cell::new(false),
@@ -669,6 +732,83 @@ mod tests {
             active_tab_id: Some(active_tab_id),
             pane_layout_fingerprint: 1,
         }
+    }
+
+    #[test]
+    fn resize_pass_runs_when_the_host_size_drifted_under_an_unchanged_layout() {
+        assert!(TerminalView::can_skip_terminal_resize_sync(
+            true, false, false
+        ));
+        assert!(!TerminalView::can_skip_terminal_resize_sync(
+            true, false, true
+        ));
+        assert!(!TerminalView::can_skip_terminal_resize_sync(
+            false, false, false
+        ));
+        assert!(!TerminalView::can_skip_terminal_resize_sync(
+            true, true, false
+        ));
+    }
+
+    fn grid(cols: u16, rows: u16) -> TerminalSize {
+        TerminalSize {
+            cols,
+            rows,
+            ..TerminalSize::default()
+        }
+    }
+
+    #[test]
+    fn a_pane_created_at_the_view_size_reasserts_it_after_another_clients_resize() {
+        let now = Instant::now();
+        let view = grid(120, 40);
+        let mut claim = HostSizeClaim::new(view);
+        assert!(!claim.needs_resize(view, false, false, now));
+        // `termy mux resize` made it 40x10; the view never resized it itself.
+        assert!(claim.wants_reassert(true));
+        assert!(claim.needs_resize(view, true, true, now));
+        claim.applied(view, true, now);
+        assert!(!claim.needs_resize(view, false, false, now));
+        // A layout change of this view is a plain resize, overridden or not.
+        assert!(claim.needs_resize(grid(100, 40), true, true, now));
+        assert!(!claim.needs_resize(grid(100, 40), false, true, now));
+    }
+
+    #[test]
+    fn two_views_of_one_pane_stop_resizing_it_back_and_forth() {
+        let start = Instant::now();
+        let view = grid(120, 40);
+        let mut claim = HostSizeClaim::new(view);
+        for step in 0..HostSizeClaim::MAX_REASSERTS {
+            let now = start + Duration::from_millis(step as u64 * 100);
+            assert!(
+                claim.needs_resize(view, true, true, now),
+                "re-assert {step}"
+            );
+            claim.applied(view, true, now);
+        }
+        // Out of re-asserts: the view keeps the other client's size.
+        let later = start + Duration::from_secs(1);
+        assert!(!claim.needs_resize(view, true, true, later));
+        assert!(!claim.wants_reassert(true));
+        assert!(
+            !claim.needs_resize(view, true, true, later + HostSizeClaim::REASSERT_WINDOW * 2),
+            "a yielded view does not resume the fight on its own"
+        );
+
+        // Once the host is back at this view's size, a later conflict is new.
+        assert!(!claim.needs_resize(view, false, false, later));
+        let much_later = later + HostSizeClaim::REASSERT_WINDOW * 2;
+        assert!(claim.needs_resize(view, true, true, much_later));
+
+        // So is one after a layout change of this view.
+        let mut claim = HostSizeClaim::new(view);
+        for _ in 0..=HostSizeClaim::MAX_REASSERTS {
+            claim.applied(view, true, start);
+        }
+        assert!(!claim.needs_resize(view, true, true, start));
+        claim.applied(grid(100, 40), true, start);
+        assert!(claim.needs_resize(grid(100, 40), true, true, start));
     }
 
     #[test]
@@ -707,6 +847,36 @@ mod tests {
 
         assert_eq!(single_pane, (77, 27));
         assert_eq!(split_pane, (80, 28));
+    }
+
+    #[test]
+    fn fullscreen_tui_preserves_configured_padding_on_entry_and_exit() {
+        for native in [true, false] {
+            let mut pane = test_pane("fullscreen-tui");
+            if native {
+                pane.terminal = Terminal::new_test_display(TerminalSize::default());
+            }
+            for (sequence, expected_padding, expected_size) in [
+                (b"".as_slice(), (12.0, 8.0), (77, 27)),
+                (b"\x1b[?1049h".as_slice(), (12.0, 8.0), (77, 27)),
+                (b"\x1b[?1049l".as_slice(), (12.0, 8.0), (77, 27)),
+            ] {
+                pane.terminal().hydrate_output(sequence);
+                pane.sync_alternate_screen_state();
+                let padding = TerminalView::terminal_padding_for_screen_mode(
+                    12.0,
+                    8.0,
+                    pane.last_alternate_screen.get(),
+                );
+                assert_eq!(padding, expected_padding);
+                assert_eq!(
+                    TerminalView::terminal_grid_size_for_pane_count(
+                        1, 800.0, 600.0, 0.0, 32.0, padding.0, padding.1, 10.0, 20.0,
+                    ),
+                    expected_size,
+                );
+            }
+        }
     }
 
     #[test]

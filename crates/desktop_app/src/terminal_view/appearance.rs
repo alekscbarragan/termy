@@ -5,7 +5,7 @@ use crate::colors::TerminalColors;
 #[cfg(test)]
 use crate::config;
 use crate::config::{AppConfig, PaneFocusEffect};
-use gpui::WindowBackgroundAppearance;
+use gpui_kit::WindowBackgroundAppearance;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct PaneFocusPreset {
@@ -20,6 +20,8 @@ pub(super) struct PaneFocusPreset {
 enum BackgroundPlatform {
     MacOs,
     Windows,
+    /// Windows 11 22H2 or later, where DWM provides system backdrops.
+    WindowsSystemBackdrop,
     Linux,
     Other,
 }
@@ -35,7 +37,14 @@ impl BackgroundSupportContext {
         #[cfg(target_os = "macos")]
         let platform = BackgroundPlatform::MacOs;
         #[cfg(target_os = "windows")]
-        let platform = BackgroundPlatform::Windows;
+        let platform =
+            if crate::native_sdk::win32_window::windows_build_number().is_some_and(|build| {
+                build >= crate::native_sdk::win32_window::WINDOWS_11_SYSTEM_BACKDROP_BUILD
+            }) {
+                BackgroundPlatform::WindowsSystemBackdrop
+            } else {
+                BackgroundPlatform::Windows
+            };
         #[cfg(target_os = "linux")]
         let platform = BackgroundPlatform::Linux;
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -94,6 +103,13 @@ pub(super) fn resolve_background_appearance(
             appearance: WindowBackgroundAppearance::Blurred,
             blur_fallback: BlurFallbackReason::None,
         },
+        // The DWM backdrop is smoother than the legacy acrylic accent (which
+        // lags while the window is dragged). Mica Alt is the variant meant
+        // for windows with tabs in the titlebar.
+        BackgroundPlatform::WindowsSystemBackdrop => ResolvedBackgroundAppearance {
+            appearance: WindowBackgroundAppearance::MicaAltBackdrop,
+            blur_fallback: BlurFallbackReason::None,
+        },
         BackgroundPlatform::Linux => {
             if context.linux_wayland_session {
                 ResolvedBackgroundAppearance {
@@ -146,10 +162,14 @@ fn adaptive_overlay_panel_alpha_with_floor_for_opacity(
     }
 }
 
-pub(super) fn blend_rgba(base: gpui::Rgba, tint: gpui::Rgba, tint_factor: f32) -> gpui::Rgba {
+pub(super) fn blend_rgba(
+    base: gpui_kit::Rgba,
+    tint: gpui_kit::Rgba,
+    tint_factor: f32,
+) -> gpui_kit::Rgba {
     let tint_factor = tint_factor.clamp(0.0, 1.0);
     let base_factor = 1.0 - tint_factor;
-    gpui::Rgba {
+    gpui_kit::Rgba {
         r: (base.r * base_factor) + (tint.r * tint_factor),
         g: (base.g * base_factor) + (tint.g * tint_factor),
         b: (base.b * base_factor) + (tint.b * tint_factor),
@@ -158,14 +178,14 @@ pub(super) fn blend_rgba(base: gpui::Rgba, tint: gpui::Rgba, tint_factor: f32) -
 }
 
 pub(super) fn resolve_chrome_stroke_color(
-    chrome_background: gpui::Rgba,
-    foreground: gpui::Rgba,
+    chrome_background: gpui_kit::Rgba,
+    foreground: gpui_kit::Rgba,
     foreground_mix: f32,
-) -> gpui::Rgba {
+) -> gpui_kit::Rgba {
     let mix = foreground_mix.clamp(0.0, 1.0);
     let inv_mix = 1.0 - mix;
 
-    gpui::Rgba {
+    gpui_kit::Rgba {
         r: (chrome_background.r * inv_mix) + (foreground.r * mix),
         g: (chrome_background.g * inv_mix) + (foreground.g * mix),
         b: (chrome_background.b * inv_mix) + (foreground.b * mix),
@@ -174,9 +194,9 @@ pub(super) fn resolve_chrome_stroke_color(
 }
 
 pub(super) fn pane_divider_color(
-    chrome_background: gpui::Rgba,
-    foreground: gpui::Rgba,
-) -> gpui::Rgba {
+    chrome_background: gpui_kit::Rgba,
+    foreground: gpui_kit::Rgba,
+) -> gpui_kit::Rgba {
     resolve_chrome_stroke_color(chrome_background, foreground, TAB_STROKE_FOREGROUND_MIX)
 }
 
@@ -228,22 +248,22 @@ impl<'a> OverlayStyleBuilder<'a> {
         }
     }
 
-    pub(super) fn panel_background(self, base_alpha: f32) -> gpui::Rgba {
+    pub(super) fn panel_background(self, base_alpha: f32) -> gpui_kit::Rgba {
         let alpha = adaptive_overlay_panel_alpha_for_opacity(base_alpha, self.background_opacity);
         self.with_alpha(self.colors.background, alpha)
     }
 
-    pub(super) fn panel_cursor(self, base_alpha: f32) -> gpui::Rgba {
+    pub(super) fn panel_cursor(self, base_alpha: f32) -> gpui_kit::Rgba {
         let alpha = adaptive_overlay_panel_alpha_for_opacity(base_alpha, self.background_opacity);
         self.with_alpha(self.colors.cursor, alpha)
     }
 
-    pub(super) fn panel_foreground(self, base_alpha: f32) -> gpui::Rgba {
+    pub(super) fn panel_foreground(self, base_alpha: f32) -> gpui_kit::Rgba {
         let alpha = adaptive_overlay_panel_alpha_for_opacity(base_alpha, self.background_opacity);
         self.with_alpha(self.colors.foreground, alpha)
     }
 
-    pub(super) fn chrome_panel_background(self, base_alpha: f32) -> gpui::Rgba {
+    pub(super) fn chrome_panel_background(self, base_alpha: f32) -> gpui_kit::Rgba {
         let alpha = adaptive_overlay_panel_alpha_for_opacity(
             self.contrast_profile.panel_surface_alpha(base_alpha),
             self.background_opacity,
@@ -255,7 +275,7 @@ impl<'a> OverlayStyleBuilder<'a> {
         self,
         base_alpha: f32,
         translucent_floor_alpha: f32,
-    ) -> gpui::Rgba {
+    ) -> gpui_kit::Rgba {
         let alpha = adaptive_overlay_panel_alpha_with_floor_for_opacity(
             self.contrast_profile.panel_surface_alpha(base_alpha),
             self.background_opacity,
@@ -265,7 +285,7 @@ impl<'a> OverlayStyleBuilder<'a> {
         self.with_alpha(self.colors.background, alpha)
     }
 
-    pub(super) fn chrome_panel_cursor(self, base_alpha: f32) -> gpui::Rgba {
+    pub(super) fn chrome_panel_cursor(self, base_alpha: f32) -> gpui_kit::Rgba {
         let alpha = adaptive_overlay_panel_alpha_for_opacity(
             self.contrast_profile.panel_accent_alpha(base_alpha),
             self.background_opacity,
@@ -273,7 +293,7 @@ impl<'a> OverlayStyleBuilder<'a> {
         self.with_alpha(self.colors.cursor, alpha)
     }
 
-    pub(super) fn chrome_panel_neutral(self, base_alpha: f32) -> gpui::Rgba {
+    pub(super) fn chrome_panel_neutral(self, base_alpha: f32) -> gpui_kit::Rgba {
         let alpha = adaptive_overlay_panel_alpha_for_opacity(
             self.contrast_profile.panel_neutral_alpha(base_alpha),
             self.background_opacity,
@@ -281,11 +301,11 @@ impl<'a> OverlayStyleBuilder<'a> {
         self.with_alpha(self.colors.foreground, alpha)
     }
 
-    pub(super) fn transparent_background(self) -> gpui::Rgba {
+    pub(super) fn transparent_background(self) -> gpui_kit::Rgba {
         self.with_alpha(self.colors.background, 0.0)
     }
 
-    fn with_alpha(self, mut color: gpui::Rgba, alpha: f32) -> gpui::Rgba {
+    fn with_alpha(self, mut color: gpui_kit::Rgba, alpha: f32) -> gpui_kit::Rgba {
         color.a = alpha.clamp(0.0, 1.0);
         color
     }
@@ -363,6 +383,49 @@ mod tests {
     }
 
     #[test]
+    fn resolve_background_appearance_blur_uses_mica_alt_on_windows_11() {
+        let resolved = resolve_background_appearance(
+            0.9,
+            true,
+            BackgroundSupportContext {
+                platform: BackgroundPlatform::WindowsSystemBackdrop,
+                linux_wayland_session: false,
+            },
+        );
+        assert_eq!(
+            resolved.appearance,
+            WindowBackgroundAppearance::MicaAltBackdrop
+        );
+        assert_eq!(resolved.blur_fallback, BlurFallbackReason::None);
+    }
+
+    #[test]
+    fn resolve_background_appearance_blur_keeps_acrylic_on_older_windows() {
+        let resolved = resolve_background_appearance(
+            0.9,
+            true,
+            BackgroundSupportContext {
+                platform: BackgroundPlatform::Windows,
+                linux_wayland_session: false,
+            },
+        );
+        assert_eq!(resolved.appearance, WindowBackgroundAppearance::Blurred);
+    }
+
+    #[test]
+    fn resolve_background_appearance_without_blur_skips_mica() {
+        let resolved = resolve_background_appearance(
+            0.9,
+            false,
+            BackgroundSupportContext {
+                platform: BackgroundPlatform::WindowsSystemBackdrop,
+                linux_wayland_session: false,
+            },
+        );
+        assert_eq!(resolved.appearance, WindowBackgroundAppearance::Transparent);
+    }
+
+    #[test]
     fn resolve_background_appearance_blur_is_enabled_on_macos() {
         let resolved = resolve_background_appearance(
             0.9,
@@ -395,13 +458,13 @@ mod tests {
 
     #[test]
     fn pane_divider_color_matches_shared_chrome_stroke_resolution() {
-        let chrome_surface_bg = gpui::Rgba {
+        let chrome_surface_bg = gpui_kit::Rgba {
             r: 0.04,
             g: 0.08,
             b: 0.13,
             a: 0.94,
         };
-        let foreground = gpui::Rgba {
+        let foreground = gpui_kit::Rgba {
             r: 0.82,
             g: 0.88,
             b: 0.93,
